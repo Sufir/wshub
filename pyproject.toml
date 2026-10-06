@@ -3,6 +3,7 @@ name = "wshub"
 version = "0.1.0"
 description = "Локальный MCP-сервер (stdio): доступ к папкам проектов по реестру ~/.config/wshub/workspaces.toml"
 readme = "README.md"
+license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     # 1.x проверена с нашим Claude Desktop — не повышать

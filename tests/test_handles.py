@@ -55,7 +55,7 @@ def test_self_protection(env, which):
         "state_parent": env.tmp,  # проект, внутри которого лежат state и реестр
         "config_dir": env.cfg.parent,
         "state_dir": env.state,
-        "repo": Path(wshub.__file__).resolve().parents[2],  # /home/sufir/wshub — только попытка открыть
+        "repo": Path(wshub.__file__).resolve().parents[2],  # корень репозитория — только попытка открыть
         "inside_state": env.state / "backup",
     }[which]
     target.mkdir(parents=True, exist_ok=True)

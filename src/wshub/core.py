@@ -74,6 +74,53 @@ def _is_binary(f: Path) -> bool:
         return b"\x00" in fh.read(8192)
 
 
+class _Deadline(Exception):
+    """Истёк таймаут обхода. Не TimeoutError: тот — подкласс OSError и смешался бы с ошибками доступа."""
+
+
+@contextmanager
+def _perm(rel: str, what: str = "чтение"):
+    """PermissionError → понятная ошибка без трассировки."""
+    try:
+        yield
+    except PermissionError:
+        raise WsError(f"нет прав на {what}: {rel}") from None
+
+
+def _plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    return few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
+
+
+class Skipped:
+    """Пути, пропущенные при обходе из-за ошибок доступа: счётчик и до 5 примеров.
+    Пути под deny не считаются — их обход пропускает молча."""
+
+    EXAMPLES = 5
+
+    def __init__(self, s: Session):
+        self.s, self.n, self.examples = s, 0, []
+
+    def add(self, p, err: OSError | str | None = None) -> None:
+        p = Path(p)
+        rel = p.relative_to(self.s.root).as_posix() if p.is_relative_to(self.s.root) else str(p)
+        if self.s.policy.denied(rel):
+            return
+        self.n += 1
+        if len(self.examples) < self.EXAMPLES:
+            if isinstance(err, OSError):
+                err = "нет прав" if isinstance(err, PermissionError) else (err.strerror or type(err).__name__)
+            self.examples.append(f"{rel} — {err}" if err else rel)
+
+    def note(self) -> str:
+        if not self.n:
+            return ""
+        word = _plural(self.n, "пропущен {} недоступный путь", "пропущено {} недоступных пути",
+                       "пропущено {} недоступных путей").format(self.n)
+        return f"\n({word}, например: {'; '.join(self.examples)})"
+
+
 class Hub:
     def __init__(self, config: Path = DEFAULT_CONFIG, state_dir: Path = DEFAULT_STATE, clock=time.time):
         self.registry = RegistryFile(config)
@@ -174,10 +221,12 @@ class Hub:
         try:
             yield rec
         except Exception as e:
+            if isinstance(e, PermissionError):  # запасной путь: места, где права не проверены явно
+                e = WsError(f"нет прав доступа: {e.filename or path}")
             rec["status"] = "error"
             rec["error"] = str(e)[:500]
             self._write_audit(rec)
-            raise
+            raise e from None
         else:
             rec["status"] = "ok"
             self._write_audit(rec)
@@ -248,11 +297,13 @@ class Hub:
             return "BRIEF: в реестре не задан."
         try:
             f, rel = self._resolve(s, b)
+            if not f.is_file():
+                return f"BRIEF ({b}): файла нет."
+            data = f.read_bytes()
         except WsError as e:
             return f"BRIEF ({b}): недоступен — {e}"
-        if not f.is_file():
-            return f"BRIEF ({b}): файла нет."
-        data = f.read_bytes()
+        except PermissionError:
+            return f"BRIEF ({b}): нет прав на чтение."
         text = data[:BRIEF_MAX].decode("utf-8", "replace")
         note = f"\n(BRIEF обрезан до {BRIEF_MAX // 1024} КБ из {len(data)} байт; остальное — read)" \
             if len(data) > BRIEF_MAX else ""
@@ -260,49 +311,95 @@ class Hub:
 
     # ---------- чтение ----------
 
+    @staticmethod
+    def _scandir(d: Path, skipped: Skipped) -> list[tuple[os.DirEntry, bool, bool]]:
+        """Содержимое каталога как (запись, это каталог, это симлинк), каталоги первыми.
+        Тип берётся из d_type без stat; запись, тип которой не узнать, уходит в skipped.
+        Симлинк считается каталогом, если ведёт на каталог, но по нему никто не спускается."""
+        out = []
+        with os.scandir(d) as it:
+            for e in it:
+                try:
+                    link = e.is_symlink()
+                    if link:
+                        try:
+                            is_dir = e.is_dir()
+                        except OSError:
+                            is_dir = False
+                    else:
+                        is_dir = e.is_dir(follow_symlinks=False)
+                except OSError as err:
+                    skipped.add(e.path, err)
+                    continue
+                out.append((e, is_dir, link))
+        out.sort(key=lambda t: (not t[1] or t[2], t[0].name.lower()))
+        return out
+
     def ls(self, ws: str, path: str = ".") -> str:
         with self._audit("ls", path) as rec:
             s = self._session(ws)
             rec["ws"] = s.ws.name
             d = self._dir(s, path)
-            entries = sorted(os.scandir(d), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+            skipped = Skipped(s)
+            with _perm(self._rel(s, d)):
+                entries = self._scandir(d, skipped)
             rows = []
-            for e in entries[:LS_MAX]:
+            for e, is_dir, link in entries[:LS_MAX]:
                 rel = self._rel(s, Path(e.path))
                 mark = "  [deny]" if s.policy.denied(rel) else ""
-                if e.is_symlink():
+                if link:
                     rows.append(f"l {'':>10} {e.name} -> {self._link_target(s, Path(e.path))}{mark}")
-                elif e.is_dir():
+                elif is_dir:
                     rows.append(f"d {'':>10} {e.name}/{mark}")
                 else:
-                    rows.append(f"- {e.stat(follow_symlinks=False).st_size:>10} {e.name}{mark}")
+                    try:
+                        size = e.stat(follow_symlinks=False).st_size
+                    except OSError as err:
+                        skipped.add(e.path, err)
+                        continue
+                    rows.append(f"- {size:>10} {e.name}{mark}")
             if len(entries) > LS_MAX:
                 rows.append(f"(обрезано: показано {LS_MAX} из {len(entries)}; сузь запрос через find)")
-            return "\n".join(rows) or "(пусто)"
+            return ("\n".join(rows) or "(пусто)") + skipped.note()
 
     def _dir(self, s: Session, path: str) -> Path:
         joined = self._check_input(s, path)
         d = joined.resolve()
         if not d.is_relative_to(s.root):
             raise WsError(f"путь вне проекта: {path}")
-        if not d.is_dir():
-            raise WsError(f"не каталог: {path}")
+        with _perm(self._rel(s, d)):
+            if not d.is_dir():
+                raise WsError(f"не каталог: {path}")
         return d
 
     def _link_target(self, s: Session, p: Path) -> str:
         t = p.resolve()
         return self._rel(s, t) if t.is_relative_to(s.root) else "(вне проекта)"
 
-    def _walk(self, s: Session, top: Path, deadline: float | None = None):
-        """os.walk без перехода по симлинкам; в .git и запрещённые каталоги не спускаемся."""
-        for dirpath, dirs, files in os.walk(top, followlinks=False):
+    def _walk(self, s: Session, top: Path, skipped: Skipped, deadline: float | None = None):
+        """Обход в глубину без перехода по симлинкам; в .git и запрещённые каталоги не спускаемся.
+        Недоступный каталог или запись не обрывают обход, а попадают в skipped.
+        Отдаёт (каталог, имена подкаталогов, имена остальных записей)."""
+        stack = [top]
+        while stack:
             if deadline and time.monotonic() > deadline:
-                raise TimeoutError
-            base = Path(dirpath)
-            all_dirs = sorted(dirs)
-            dirs[:] = [dn for dn in all_dirs if dn.lower() != ".git" and not (base / dn).is_symlink()
-                       and not s.policy.denied(self._rel(s, base / dn))]
-            yield base, all_dirs, sorted(files)
+                raise _Deadline
+            base = stack.pop()
+            try:
+                entries = self._scandir(base, skipped)
+            except OSError as e:
+                skipped.add(base, e)
+                continue
+            dirs, files, descend = [], [], []
+            for e, is_dir, link in sorted(entries, key=lambda t: t[0].name):
+                if is_dir:
+                    dirs.append(e.name)
+                    if not link and e.name.lower() != ".git" and not s.policy.denied(self._rel(s, Path(e.path))):
+                        descend.append(Path(e.path))
+                else:
+                    files.append(e.name)
+            yield base, dirs, files
+            stack.extend(reversed(descend))
 
     def tree(self, ws: str, path: str = ".", depth: int = 2) -> str:
         with self._audit("tree", path) as rec:
@@ -315,24 +412,25 @@ class Hub:
             depth = max(depth, 1)
             out: list[str] = [f"{self._rel(s, top)}/"]
             truncated = False
+            skipped = Skipped(s)
 
             def walk(d: Path, level: int):
                 nonlocal truncated
                 try:
-                    entries = sorted(os.scandir(d), key=lambda e: (not e.is_dir(follow_symlinks=False), e.name.lower()))
+                    entries = self._scandir(d, skipped)
                 except OSError as e:
-                    out.append("  " * level + f"(ошибка чтения: {e.strerror})")
+                    skipped.add(d, e)
                     return
-                for e in entries:
+                for e, is_dir, link in entries:
                     if len(out) >= TREE_MAX:
                         truncated = True
                         return
                     rel = self._rel(s, Path(e.path))
                     denied = s.policy.denied(rel)
                     pad = "  " * level
-                    if e.is_symlink():
+                    if link:
                         out.append(f"{pad}{e.name} -> {self._link_target(s, Path(e.path))}")
-                    elif e.is_dir():
+                    elif is_dir:
                         skip = denied or e.name.lower() == ".git"
                         out.append(f"{pad}{e.name}/" + ("  [deny]" if denied else "  [не раскрыт]" if skip else ""))
                         if not skip and level < depth:
@@ -345,7 +443,7 @@ class Hub:
                 out.append(f"(обрезано на {TREE_MAX} строках: уменьши depth или укажи подпапку в path)")
             if note:
                 out.append(note)
-            return "\n".join(out)
+            return "\n".join(out) + skipped.note()
 
     def find(self, ws: str, glob: str, path: str = ".") -> str:
         with self._audit("find", path) as rec:
@@ -354,8 +452,9 @@ class Hub:
             rec["glob"] = glob
             top = self._dir(s, path)
             hits, more, timeout = [], False, False
+            skipped = Skipped(s)
             try:
-                for base, dirs, files in self._walk(s, top, time.monotonic() + GREP_TIMEOUT):
+                for base, dirs, files in self._walk(s, top, skipped, time.monotonic() + GREP_TIMEOUT):
                     for n, slash in [(d, "/") for d in dirs] + [(f, "") for f in files]:
                         rel = self._rel(s, base / n)
                         if glob_match(glob, rel):
@@ -365,37 +464,41 @@ class Hub:
                             hits.append(rel + slash + ("  [deny]" if s.policy.denied(rel) else ""))
                     if more:
                         break
-            except TimeoutError:
+            except _Deadline:
                 timeout = True
             hits.sort()
             if more:
                 hits.append(f"(обрезано на {FIND_MAX}: уточни glob или path)")
             if timeout:
                 hits.append(f"(остановлено по таймауту {GREP_TIMEOUT} с, список неполный: сузь path)")
-            return "\n".join(hits) or "(ничего не найдено)"
+            return ("\n".join(hits) or "(ничего не найдено)") + skipped.note()
 
     def grep(self, ws: str, pattern: str, path: str = ".", glob: str = "*") -> str:
         with self._audit("grep", path) as rec:
             s = self._session(ws)
             rec["ws"] = s.ws.name
             rec["glob"] = glob
-            top, _ = self._resolve(s, path)
+            top, rel = self._resolve(s, path)
+            with _perm(rel):
+                top.stat()
             try:
                 rx = re.compile(pattern)
             except re.error as e:
                 raise WsError(f"неверное регулярное выражение: {e}") from None
+            skipped = Skipped(s)
             if self.rg:
-                hits, stop = self._grep_rg(s, top, pattern, glob)
+                hits, stop = self._grep_rg(s, top, pattern, glob, skipped)
             else:
-                hits, stop = self._grep_py(s, top, rx, glob)
+                hits, stop = self._grep_py(s, top, rx, glob, skipped)
             rec["engine"] = "rg" if self.rg else "python"
             rec["size"] = len(hits)
+            rec["skipped"] = skipped.n
             out = "\n".join(hits) or "(совпадений нет)"
             if stop == "max":
                 out += f"\n(обрезано на {GREP_MAX} совпадениях: сузь path или glob, уточни pattern)"
             elif stop == "timeout":
                 out += f"\n(остановлено по таймауту {GREP_TIMEOUT} с, результаты неполные: сузь path или glob)"
-            return out
+            return out + skipped.note()
 
     def _grep_ok(self, s: Session, f: Path, glob: str) -> str | None:
         """Можно ли показывать совпадения из файла f; возвращает путь от корня или None."""
@@ -418,40 +521,44 @@ class Hub:
             line = line[:LINE_MAX] + "…"
         return f"{rel}:{n}: {line}"
 
-    def _grep_py(self, s: Session, top: Path, rx: re.Pattern, glob: str):
+    def _grep_py(self, s: Session, top: Path, rx: re.Pattern, glob: str, skipped: Skipped):
         deadline = time.monotonic() + GREP_TIMEOUT
         hits: list[str] = []
         if top.is_file():
             files = iter([top])
         else:
-            files = (b / n for b, _d, fs in self._walk(s, top, deadline) for n in fs)
+            files = (b / n for b, _d, fs in self._walk(s, top, skipped, deadline) for n in fs)
         try:
             for f in files:
-                if (f.is_symlink() and f != top) or not f.is_file():  # как rg: симлинки при обходе не открываем
-                    continue
-                rel = self._grep_ok(s, f, glob)
-                if rel is None:
-                    continue
                 try:
+                    if (f.is_symlink() and f != top) or not f.is_file():  # как rg: симлинки при обходе не открываем
+                        continue
+                    rel = self._grep_ok(s, f, glob)
+                    if rel is None:
+                        continue
                     if f.stat().st_size > GREP_MAX_FILE or _is_binary(f):
                         continue
                     with f.open(encoding="utf-8", errors="replace") as fh:
                         for n, line in enumerate(fh, 1):
                             if n % 2000 == 0 and time.monotonic() > deadline:
-                                raise TimeoutError
+                                raise _Deadline
                             if rx.search(line):
                                 hits.append(self._fmt(rel, n, line))
                                 if len(hits) >= GREP_MAX:
                                     return hits, "max"
-                except OSError:
+                except OSError as e:
+                    skipped.add(f, e)
                     continue
                 if time.monotonic() > deadline:
-                    raise TimeoutError
-        except TimeoutError:
+                    raise _Deadline
+        except _Deadline:
             return hits, "timeout"
         return hits, None
 
-    def _grep_rg(self, s: Session, top: Path, pattern: str, glob: str):
+    # rg пишет ошибки в stderr: «rg: <путь>: Permission denied (os error 13)»
+    _RG_ERR = re.compile(r"^(?:rg: )?(.+?): ([^:]*\(os error \d+\))$")
+
+    def _grep_rg(self, s: Session, top: Path, pattern: str, glob: str, skipped: Skipped):
         cmd = [self.rg, "--no-config", "--null", "--line-number", "--no-heading", "--with-filename",
                "--color", "never", "--hidden", "--no-ignore", "--max-filesize", "50M",
                "--max-columns", "2000", "--max-columns-preview"]
@@ -461,13 +568,23 @@ class Hub:
         for m in s.policy.masks:  # чтобы rg вообще не открывал запрещённые файлы; итог всё равно фильтруем ниже
             cmd += ["--iglob", "!" + m]
         cmd += ["-e", pattern, "--", str(top)]
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL)
         timed_out = threading.Event()
 
         def kill():
             timed_out.set()
             proc.kill()
 
+        errors: list[tuple[str, str]] = []
+
+        def read_stderr():  # отдельный поток, иначе rg может встать на переполненном stderr
+            for raw in proc.stderr:
+                m = self._RG_ERR.match(raw.decode("utf-8", "replace").rstrip("\r\n"))
+                if m:
+                    errors.append((m.group(1), m.group(2)))
+
+        err_reader = threading.Thread(target=read_stderr, daemon=True)
+        err_reader.start()
         timer = threading.Timer(GREP_TIMEOUT, kill)
         timer.start()
         hits: list[str] = []
@@ -497,7 +614,11 @@ class Hub:
             if proc.poll() is None:
                 proc.kill()
             proc.wait()
+            err_reader.join(timeout=5)
             proc.stdout.close()
+            proc.stderr.close()
+        for p, msg in errors:
+            skipped.add(p, "нет прав" if "os error 13)" in msg or "os error 1)" in msg else msg)
         if timed_out.is_set() and stop is None:
             stop = "timeout"
         return hits, stop
@@ -507,61 +628,68 @@ class Hub:
             s = self._session(ws)
             rec["ws"] = s.ws.name
             f, rel = self._resolve(s, path)
-            if not f.is_file():
-                raise WsError(f"не файл: {path}")
-            rec["size"] = f.stat().st_size
-            if f.suffix.lower() in EXTRACTABLE or _is_binary(f):
-                hint = "используй extract" if f.suffix.lower() in EXTRACTABLE else \
-                    "текст умею извлекать только из PDF, DOCX, XLSX — через extract"
-                raise WsError(f"бинарный файл, read его не показывает: {rel}; {hint}")
-            offset = max(int(offset), 1)
-            limit = int(limit)
-            if limit < 1:
-                raise WsError("limit должен быть ≥ 1")
-            budget = s.max_read
-            out, used, last, why = [], 0, offset - 1, None
-            with f.open(encoding="utf-8", errors="replace", newline=None) as fh:
-                for n, line in enumerate(fh, 1):
-                    if n < offset:
-                        continue
-                    if n >= offset + limit:
-                        why = "limit"
-                        break
-                    row = f"{n}\t{line.rstrip(chr(10))}"
-                    size = len(row.encode("utf-8")) + 1
-                    if used + size > budget:
-                        if not out:  # одна строка больше лимита — показываем её начало
-                            room = max(budget - used - 64, 0)
-                            out.append(row.encode("utf-8")[:room].decode("utf-8", "ignore") + " …[строка обрезана]")
-                            last = n
-                        why = "size"
-                        break
-                    out.append(row)
-                    used += size
-                    last = n
-            head = f"=== содержимое файла {rel} ==="
-            if not out:
-                body = "(файл пуст)" if offset == 1 else f"(в файле меньше {offset} строк)"
-                return f"{head}\n{body}\n=== конец файла ==="
-            tail = "=== конец файла ===" if why is None else "=== конец фрагмента ==="
-            res = "\n".join([head, *out, tail])
-            if why == "size":
-                res += (f"\n(обрезано по лимиту {budget // 1024} КБ на строке {last}; "
-                        f"продолжи с offset={last + 1} или уменьши limit)")
-            elif why == "limit":
-                res += f"\n(показаны строки {offset}–{last}; дальше есть ещё — продолжи с offset={last + 1})"
-            return res
+            with _perm(rel):
+                return self._read(s, f, rel, offset, limit, rec)
+
+    def _read(self, s: Session, f: Path, rel: str, offset: int, limit: int, rec: dict) -> str:
+        if not f.is_file():
+            raise WsError(f"не файл: {rel}")
+        rec["size"] = f.stat().st_size
+        if f.suffix.lower() in EXTRACTABLE or _is_binary(f):
+            hint = "используй extract" if f.suffix.lower() in EXTRACTABLE else \
+                "текст умею извлекать только из PDF, DOCX, XLSX — через extract"
+            raise WsError(f"бинарный файл, read его не показывает: {rel}; {hint}")
+        offset = max(int(offset), 1)
+        limit = int(limit)
+        if limit < 1:
+            raise WsError("limit должен быть ≥ 1")
+        budget = s.max_read
+        out, used, last, why = [], 0, offset - 1, None
+        with f.open(encoding="utf-8", errors="replace", newline=None) as fh:
+            for n, line in enumerate(fh, 1):
+                if n < offset:
+                    continue
+                if n >= offset + limit:
+                    why = "limit"
+                    break
+                row = f"{n}\t{line.rstrip(chr(10))}"
+                size = len(row.encode("utf-8")) + 1
+                if used + size > budget:
+                    if not out:  # одна строка больше лимита — показываем её начало
+                        room = max(budget - used - 64, 0)
+                        out.append(row.encode("utf-8")[:room].decode("utf-8", "ignore") + " …[строка обрезана]")
+                        last = n
+                    why = "size"
+                    break
+                out.append(row)
+                used += size
+                last = n
+        head = f"=== содержимое файла {rel} ==="
+        if not out:
+            body = "(файл пуст)" if offset == 1 else f"(в файле меньше {offset} строк)"
+            return f"{head}\n{body}\n=== конец файла ==="
+        tail = "=== конец файла ===" if why is None else "=== конец фрагмента ==="
+        res = "\n".join([head, *out, tail])
+        if why == "size":
+            res += (f"\n(обрезано по лимиту {budget // 1024} КБ на строке {last}; "
+                    f"продолжи с offset={last + 1} или уменьши limit)")
+        elif why == "limit":
+            res += f"\n(показаны строки {offset}–{last}; дальше есть ещё — продолжи с offset={last + 1})"
+        return res
 
     def extract(self, ws: str, path: str) -> str:
         with self._audit("extract", path) as rec:
             s = self._session(ws)
             rec["ws"] = s.ws.name
             f, rel = self._resolve(s, path)
-            if not f.is_file():
-                raise WsError(f"не файл: {path}")
-            rec["size"] = f.stat().st_size
-            if f.suffix.lower() not in EXTRACTABLE:
-                raise WsError(f"extract поддерживает {', '.join(EXTRACTABLE)}; для текстовых файлов — read")
+            with _perm(rel):
+                if not f.is_file():
+                    raise WsError(f"не файл: {path}")
+                rec["size"] = f.stat().st_size
+                if f.suffix.lower() not in EXTRACTABLE:
+                    raise WsError(f"extract поддерживает {', '.join(EXTRACTABLE)}; для текстовых файлов — read")
+                with f.open("rb"):  # права проверяем здесь, а не по сообщению дочернего процесса
+                    pass
             try:
                 p = subprocess.run([sys.executable, "-m", "wshub.extract", str(f), str(s.max_read)],
                                    capture_output=True, timeout=EXTRACT_TIMEOUT, stdin=subprocess.DEVNULL)

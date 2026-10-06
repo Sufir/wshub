@@ -1,0 +1,29 @@
+[project]
+name = "wshub"
+version = "0.1.0"
+description = "Локальный MCP-сервер (stdio): доступ к папкам проектов по реестру ~/.config/wshub/workspaces.toml"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    # 1.x проверена с нашим Claude Desktop — не повышать
+    "mcp>=1.2,<2",
+    "pypdf>=4",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    # tomllib есть в стандартной библиотеке только с 3.11
+    "tomli>=2; python_version < '3.11'",
+]
+
+[project.scripts]
+wshub = "wshub.server:main"
+
+[dependency-groups]
+# ripgrep с PyPI нужен только тестам, чтобы проверить ветку grep через rg
+dev = ["pytest>=8", "ripgrep"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -114,6 +114,36 @@
     <div id="l-save-why" class="hint why" hidden></div>
     <div id="l-error" class="err" role="alert"></div>
   </form>
+  <h2>Перевалка (publish)</h2>
+  <div class="hint">Папка на диске Windows, куда publish копирует файлы, чтобы показать их в чате карточкой.
+    wshub трогает только свои каталоги вида 20261007-163000-abc123; чужие файлы в папке остаются.</div>
+  <div class="wrap"><table>
+    <thead><tr><th>Что</th><th>Сейчас</th></tr></thead>
+    <tbody id="outbox-rows"></tbody>
+  </table></div>
+  <div class="actions" style="margin-top:6px">
+    <button type="button" id="outbox-clean" class="danger">Очистить сейчас</button>
+    <button type="button" id="edit-outbox">Изменить перевалку</button>
+  </div>
+  <div id="outbox-clean-why" class="hint why" hidden></div>
+  <div id="outbox-why" class="hint why" hidden></div>
+  <form id="outbox-form" class="box" hidden autocomplete="off" onsubmit="return false">
+    <h3>Перевалка для publish</h3>
+    <div class="hint">Сохраняется в реестре, секция [outbox]. Путь — папка на диске Windows вида /mnt/c/Users/&lt;имя&gt;/ClaudeOutbox
+      (можно C:\Users\&lt;имя&gt;\ClaudeOutbox), вне проектов. Числа — целые больше 0.</div>
+    <div class="field">
+      <label for="o-path">Папка перевалки</label>
+      <input type="text" id="o-path" class="mono" autocomplete="off" spellcheck="false">
+      <div class="hint">ключ path в [outbox]</div>
+    </div>
+    <div id="o-fields"></div>
+    <div class="actions">
+      <button type="button" id="o-save" class="primary">Сохранить</button>
+      <button type="button" id="o-cancel">Отмена</button>
+    </div>
+    <div id="o-save-why" class="hint why" hidden></div>
+    <div id="o-error" class="err" role="alert"></div>
+  </form>
   <h2>Процессы сервера</h2>
   <div class="wrap"><table>
     <thead><tr><th>PID</th><th>Старт</th><th>Код (HEAD)</th><th>Хэндлов</th><th>Последний вызов</th></tr></thead>
@@ -518,6 +548,7 @@ function renderStorage() {
   $("edit-limits").disabled = !!data.registry_error;
   setWhy("limits-why", data.registry_error ? "в реестре ошибка — исправь файл, затем «Обновить»." : "");
   renderLimitsState();
+  renderOutbox();
 }
 
 const LIMIT_RE = /^\d+$/;
@@ -563,6 +594,102 @@ $("l-save").addEventListener("click", async () => {
   const res = await runMutation("panel_save_limits", { rev: data.rev, values }, null, $("l-error"));
   if (res) $("limits-form").hidden = true;
   else renderLimitsState();
+});
+
+// ----- перевалка -----
+
+function fmtAge(ts) {
+  if (!ts) return "—";
+  const m = Math.max(0, Math.floor((Date.now() / 1000 - ts) / 60));
+  return m < 60 ? `${m} мин` : `${Math.floor(m / 60)} ч ${m % 60} мин`;
+}
+
+function renderOutbox() {
+  const ob = data.outbox;
+  if (!ob) return;
+  const v = ob.values, lc = ob.last_cleanup;
+  const rows = [];
+  if (!ob.present) {
+    emptyRow($("outbox-rows"), 2, "Не настроена: секции [outbox] в реестре нет, publish отказывает. " +
+      "Нажми «Изменить перевалку» или выполни wshub outbox set /mnt/c/Users/<имя>/ClaudeOutbox.");
+  } else {
+    rows.push(el("tr", {}, td("Путь в WSL"), td(ob.path, "mono")));
+    rows.push(el("tr", {}, td("Путь в Windows"), td(ob.win_path, "mono")));
+    const probs = [...(ob.error ? [ob.error] : []), ...ob.problems, ...(ob.write_error ? ["запись не удалась: " + ob.write_error] : [])];
+    if (probs.length) rows.push(el("tr", { class: "changed" }, td("Проблемы"), el("td", { class: "err" }, probs.map((x) => el("div", { text: x })))));
+    if (ob.cloud) rows.push(el("tr", { class: "changed" }, td("Внимание"), td(`похоже на облачную папку (${ob.cloud}) — лучше перенести`)));
+    rows.push(el("tr", {}, td("Каталогов wshub"), td(`${ob.dirs}, ${fmtSize(ob.bytes)} из ${v.max_total_mb} МБ`)));
+    rows.push(el("tr", {}, td("Самый старый"), td(ob.oldest ? `${fmtAge(ob.oldest)} назад (живут ${v.ttl_minutes} мин)` : "каталогов нет")));
+    rows.push(el("tr", {}, td("Последняя очистка"), td(lc && lc.ts ? `${fmtTime(lc.ts)}, удалено каталогов: ${lc.deleted || 0}` +
+      (lc.busy ? `, занято: ${lc.busy}` : "") : "ещё не было")));
+    rows.push(el("tr", {}, td("Лимиты"), td(`файл ≤ ${v.max_file_mb} МБ, за вызов ≤ ${v.max_files_per_call} файлов`)));
+    $("outbox-rows").replaceChildren(...rows);
+  }
+  const usable = ob.present && !ob.error && !ob.problems.length;
+  let why = "";
+  if (!ob.present) why = "перевалка не настроена.";
+  else if (!usable) why = "путь перевалки не годится — исправь его.";
+  else if (!ob.dirs) why = "каталогов wshub в перевалке нет.";
+  $("outbox-clean").disabled = !!why;
+  setWhy("outbox-clean-why", why ? "«Очистить сейчас»: " + why : "");
+  $("edit-outbox").disabled = !!data.registry_error;
+  setWhy("outbox-why", data.registry_error ? "«Изменить перевалку»: в реестре ошибка — исправь файл, затем «Обновить»." : "");
+  renderOutboxState();
+}
+
+function openOutbox() {
+  const ob = data.outbox;
+  $("o-path").value = ob.path || "";
+  $("o-fields").replaceChildren(...Object.keys(ob.values).map((k) => el("div", { class: "field" },
+    el("label", { for: "o-" + k, text: ob.labels[k] }),
+    el("input", { type: "text", id: "o-" + k, inputmode: "numeric", class: "mono", value: String(ob.values[k]),
+      autocomplete: "off", spellcheck: "false", oninput: renderOutboxState }),
+    el("div", { class: "hint", text: `ключ ${k} в [outbox]` }))));
+  $("o-error").textContent = "";
+  $("outbox-form").hidden = false;
+  renderOutboxState();
+  $("outbox-form").scrollIntoView({ block: "nearest" });
+}
+
+function outboxValues() {
+  const out = { path: $("o-path").value.trim() };
+  for (const k of Object.keys(data.outbox.values)) { const i = $("o-" + k); out[k] = i ? i.value.trim() : ""; }
+  return out;
+}
+
+function renderOutboxState() {
+  if ($("outbox-form").hidden || !data || !data.outbox) return;
+  const v = outboxValues(), labels = data.outbox.labels;
+  // без пути числа ни к чему не применяются
+  for (const k of Object.keys(labels)) $("o-" + k).disabled = !v.path;
+  let why = v.path ? "" : "впиши папку перевалки.";
+  if (!why && !(v.path.startsWith("/") || /^[a-zA-Z]:[\\/]/.test(v.path))) why = "путь должен быть абсолютным: /mnt/c/… или C:\\….";
+  if (!why) {
+    const empty = Object.keys(labels).filter((k) => !v[k]).map((k) => labels[k]);
+    if (empty.length) why = `заполни: ${empty.join(", ")}.`;
+  }
+  if (!why) {
+    const bad = Object.keys(labels).find((k) => !LIMIT_RE.test(v[k]) || Number(v[k]) < 1);
+    if (bad) why = `${labels[bad]}: нужно целое число больше 0.`;
+  }
+  if (!why && data.registry_error) why = "в реестре ошибка — исправь файл вручную.";
+  $("o-save").disabled = !!why;
+  setWhy("o-save-why", why);
+}
+
+$("edit-outbox").addEventListener("click", openOutbox);
+$("o-path").addEventListener("input", renderOutboxState);
+$("o-cancel").addEventListener("click", () => { $("outbox-form").hidden = true; });
+$("o-save").addEventListener("click", async () => {
+  const values = outboxValues();
+  $("o-save").disabled = true;
+  const res = await runMutation("panel_save_outbox", { rev: data.rev, values }, null, $("o-error"));
+  if (res) $("outbox-form").hidden = true;
+  else renderOutboxState();
+});
+$("outbox-clean").addEventListener("click", async () => {
+  $("outbox-clean").disabled = true;
+  await runMutation("panel_outbox_clean", {}, null, null);
 });
 
 // ---------- Проекты ----------
@@ -858,6 +985,7 @@ function fillSelect(sel, allLabel, values) {
 function auditResult(r) {
   if (r.status === "error") return "ошибка: " + (r.error || "");
   if (r.tool === "backup_cleanup") return `ok, удалено копий: ${r.deleted}`;
+  if (r.tool === "publish") return `ok, ${fmtSize(r.size || 0)} → перевалка ${r.outbox_id}`;
   if (r.changes && r.changes.length) return "ok: " + r.changes.join("; ");
   return "ok";
 }

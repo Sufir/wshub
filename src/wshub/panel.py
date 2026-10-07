@@ -37,11 +37,14 @@ CODES_MAX = 50
 AUDIT_PAGE = 100
 AUDIT_PAGE_MAX = 500
 # «Только изменения»: запись, восстановление, правки реестра, отзывы, очистка копий
+# publish сюда не входит: это экспорт копии, как чтение
 CHANGE_TOOLS = {"write", "edit", "panel_restore", "panel_save", "panel_delete", "panel_limits", "panel_revoke",
-                "panel_block", "panel_unblock", "backup_cleanup"}
-AUDIT_TOOLS = ["workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "read", "extract", "write", "edit",
-               "panel_save", "panel_delete", "panel_limits", "panel_revoke", "panel_block", "panel_unblock",
-               "panel_restore", "backup_cleanup"]
+                "panel_block", "panel_unblock", "backup_cleanup", "panel_outbox", "panel_outbox_clean",
+                "outbox_set", "outbox_clean"}
+AUDIT_TOOLS = ["workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "read", "extract", "publish",
+               "write", "edit", "panel_save", "panel_delete", "panel_limits", "panel_outbox", "panel_outbox_clean",
+               "panel_revoke", "panel_block", "panel_unblock", "panel_restore", "backup_cleanup", "outbox_set",
+               "outbox_clean"]
 BROWSE_MAX = 1000
 PREVIEW_SAMPLE = 50
 PREVIEW_TIMEOUT = 5.0
@@ -57,7 +60,7 @@ class Panel:
         self.roots = [Path(r) for r in (roots if roots is not None else [HOME, Path("/mnt/c")])]
         self.editor = RegistryEditor(hub.registry.path, hub.state_dir / "registry-history", hub.protected_overlap)
         self.doctor_ctx = doctor_ctx or Ctx(config=hub.registry.path, state=hub.state_dir,
-                                            protected_overlap=hub.protected_overlap)
+                                            protected_overlap=hub.protected_overlap, mnt_root=hub.mnt_root)
         self._nonces: dict[str, float] = {}  # код → срок
         self._keys: dict[str, float] = {}
 
@@ -154,6 +157,7 @@ class Panel:
             "blocked_error": (f"файл запретов {self.hub.runtime.blocked_path} повреждён — проекты не открываются; "
                               "исправь или удали его вручную") if self.hub.runtime.blocked_broken else None,
             "storage": doc_res["storage"],
+            "outbox": doc_res["outbox"],
             "roots": [str(r) for r in self.roots],
             "pid": os.getpid(),
         }
@@ -439,6 +443,19 @@ class Panel:
                 raise WsError(str(e)) from None
             rec["changes"] = changes
             return {"changes": changes}
+
+    def save_outbox(self, nonce, *, values, rev) -> dict:
+        with self._mutation("panel_outbox", nonce) as rec:
+            try:
+                changes = self.editor.save_outbox(values=values, rev=rev, check_path=self.hub.outbox_path_problems)
+            except EditError as e:
+                raise WsError(str(e)) from None
+            rec["changes"] = changes
+            return {"changes": changes}
+
+    def outbox_clean(self, nonce) -> dict:
+        with self._mutation("panel_outbox_clean", nonce) as rec:
+            return {"changes": self.hub.outbox_clean_all(rec)}
 
     def delete_workspace(self, nonce, *, name, rev) -> dict:
         with self._mutation("panel_delete", nonce) as rec:

@@ -11,8 +11,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from .outbox import from_windows
 from .policy import glob_regex
-from .registry import LIMITS, MODES, RegistryError, is_limit, parse
+from .registry import LIMITS, MODES, OUTBOX, RegistryError, is_limit, parse
 
 NEW_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 DESC_MAX = 300
@@ -237,6 +238,60 @@ class RegistryEditor:
                 doc["limits"] = t
             t[k] = clean[k]
             changes.append(f"лимиты: {label}: {old} → {clean[k]}")
+        if not changes:
+            return ["изменений нет"]
+        self._commit(old_text, tomlkit.dumps(doc))
+        return changes
+
+    def save_outbox(self, *, values, rev, check_path: Callable[[str, dict], list[str]]) -> list[str]:
+        """Секция [outbox]: path проверяется check_path(путь, корни проектов), числа — целые больше 0.
+        Ключей нет в values — остаются прежними (или по умолчанию, если секции не было)."""
+        tomlkit, doc, old_text = self._load(rev)
+        if not isinstance(values, dict):
+            raise EditError("перевалка не задана — заполни форму")
+        errs, clean = [], {}
+        for k in set(values) - set(OUTBOX) - {"path"}:
+            errs.append(f"неизвестный ключ {k}")
+        path = values.get("path")
+        if isinstance(path, str) and path.strip():
+            path = os.path.normpath(from_windows(path.strip()))
+        roots = {n: Path(w.get("path", "")) for n, w in (doc.get("workspace") or {}).items()
+                 if isinstance(w, dict) and isinstance(w.get("path"), str)}
+        errs += check_path(path, roots)
+        t = doc.get("outbox")
+        for k, (default, label) in OUTBOX.items():
+            if k not in values:
+                old = t.get(k, default) if t is not None else default
+                clean[k] = int(old) if is_limit(old) else default
+                continue
+            v = values[k]
+            if isinstance(v, str) and re.fullmatch(r"\s*\d+\s*", v):
+                v = int(v)
+            if v is None or v == "":
+                errs.append(f"{label}: не заполнено — впиши целое число больше 0")
+            elif not is_limit(v):
+                errs.append(f"{label}: «{v}» — нужно целое число больше 0")
+            else:
+                clean[k] = v
+        if errs:
+            raise EditError("; ".join(errs))
+        changes = []
+        if t is None:
+            t = tomlkit.table()
+            doc["outbox"] = t
+            changes.append("добавлена секция [outbox]")
+        old_path = str(t.get("path", ""))
+        if old_path != path:
+            t["path"] = path
+            changes.append(f"перевалка: путь: {old_path or '(нет)'} → {path}")
+        created = changes[:1] == ["добавлена секция [outbox]"]
+        for k, (default, label) in OUTBOX.items():
+            old = t.get(k)
+            if old == clean[k] or (old is None and not created and clean[k] == default):
+                continue
+            t[k] = clean[k]
+            if not created:
+                changes.append(f"перевалка: {label}: {old if old is not None else default} → {clean[k]}")
         if not changes:
             return ["изменений нет"]
         self._commit(old_text, tomlkit.dumps(doc))

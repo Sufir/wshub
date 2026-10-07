@@ -8,12 +8,14 @@ import json
 import os
 import shutil
 import sys
+import tempfile
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from . import housekeeping
-from .registry import LIMITS, Limits, RegistryError, parse
+from . import housekeeping, outbox
+from .registry import LIMITS, OUTBOX, Limits, Outbox, RegistryError, parse
 from .runtime import git_head, live_processes, pid_alive, proc_start, repo_dir
 
 BACKUP_WARN = 1024 * 1024 * 1024
@@ -36,6 +38,7 @@ class Ctx:
     distro: str | None = field(default_factory=lambda: os.environ.get("WSL_DISTRO_NAME"))
     self_pid: int = field(default_factory=os.getpid)
     protected_overlap: object = None  # Hub.protected_overlap, если есть
+    mnt_root: Path = outbox.MNT  # где смонтированы диски Windows
 
 
 def _check(id_, title, status, detail, fix=""):
@@ -370,13 +373,79 @@ def check_storage(st: dict) -> list[dict]:
     return res
 
 
+# ---------- перевалка (publish) ----------
+
+def _writable(d: Path) -> str | None:
+    """None — запись есть; иначе причина. Пробный файл не совпадает с шаблоном каталогов и сразу удаляется."""
+    try:
+        fd, tmp = tempfile.mkstemp(dir=d, prefix=".wshub-probe-")
+        os.close(fd)
+        os.unlink(tmp)
+        return None
+    except OSError as e:
+        return e.strerror or str(e)
+
+
+def outbox_info(ctx: Ctx, reg) -> dict:
+    """Состояние перевалки для doctor и блока «Перевалка» на «Обзоре»."""
+    ob = reg.outbox if reg is not None else Outbox()
+    info = {"present": ob.present, "error": ob.error, "path": str(ob.path) if ob.path else None,
+            "win_path": outbox.win_path(ob.path, ctx.mnt_root) if ob.path else None,
+            "values": {k: getattr(ob, k) for k in OUTBOX}, "labels": {k: lab for k, (_d, lab) in OUTBOX.items()},
+            "problems": [], "write_error": None, "cloud": None, "dirs": 0, "bytes": 0, "oldest": None,
+            "last_cleanup": outbox.last_cleanup(ctx.state), "registry_ok": reg is not None}
+    if ob.path is None:
+        return info
+    roots = {w.name: w.path for w in reg.workspaces.values()}
+    info["problems"] = outbox.path_problems(str(ob.path), roots, ctx.mnt_root, ctx.protected_overlap)
+    info["cloud"] = outbox.cloud_synced(ob.path)
+    if ob.path.is_dir() and not ob.path.is_symlink():
+        info["write_error"] = _writable(ob.path)
+        info.update(outbox.stats(ob.path))
+    return info
+
+
+def check_outbox(info: dict, now: float | None = None) -> dict:
+    title = "Перевалка (publish)"
+    how = "wshub outbox set /mnt/c/Users/<имя>/ClaudeOutbox — или поля «Перевалка» на «Обзоре» панели"
+    if not info["registry_ok"]:
+        return _check("outbox", title, "info", "не проверена: реестр не прочитан", "сначала исправь реестр")
+    if not info["present"]:
+        return _check("outbox", title, "info", "секции [outbox] в реестре нет: publish отказывает", how)
+    if info["error"]:
+        return _check("outbox", title, "fail", f"ошибка в [outbox]: {info['error']}", how)
+    now = time.time() if now is None else now
+    v = info["values"]
+    lines = [f"{info['path']} → {info['win_path'] or '(не диск Windows)'}"]
+    if info["problems"]:
+        return _check("outbox", title, "fail", lines + info["problems"], "исправь путь: " + how)
+    if info["write_error"]:
+        return _check("outbox", title, "fail", lines + [f"запись в папку не удалась: {info['write_error']}"],
+                      "проверь права на папку в Windows")
+    age = f", самый старый — {int((now - info['oldest']) // 60)} мин назад" if info["oldest"] else ""
+    lc = info["last_cleanup"]
+    when = datetime.fromtimestamp(lc["ts"]).strftime("%Y-%m-%d %H:%M") if lc and isinstance(
+        lc.get("ts"), (int, float)) else "ещё не было"
+    lines += ["на диске Windows (drvfs), вне проектов, запись есть",
+              f"каталогов wshub: {info['dirs']}, {human_size(info['bytes'])} из {v['max_total_mb']} МБ{age}",
+              f"копии живут {v['ttl_minutes']} мин; файл ≤ {v['max_file_mb']} МБ; "
+              f"≤ {v['max_files_per_call']} файлов за вызов",
+              f"последняя очистка: {when}"]
+    if info["cloud"]:
+        return _check("outbox", title, "warn", lines + [f"путь похож на облачную папку ({info['cloud']}): "
+                                                        "синхронизация будет копировать и держать файлы"],
+                      "перенеси перевалку в папку вне OneDrive/YandexDisk/Dropbox")
+    return _check("outbox", title, "ok", lines)
+
+
 def run(ctx: Ctx) -> dict:
     reg_check, reg = check_registry(ctx)
     procs = processes(ctx)
     st = storage(ctx, reg)
+    ob = outbox_info(ctx, reg)
     checks = [check_rg(), check_tomlkit(), reg_check, check_paths(ctx, reg), check_desktop(ctx),
-              check_processes(ctx, procs), *check_storage(st)]
-    return {"checks": checks, "processes": procs, "storage": st}
+              check_processes(ctx, procs), *check_storage(st), check_outbox(ob)]
+    return {"checks": checks, "processes": procs, "storage": st, "outbox": ob}
 
 
 STATUS = {"ok": "OK  ", "warn": "ВНИМ", "fail": "ОШИБ", "info": "инфо"}
@@ -399,6 +468,7 @@ def main(config: Path, state: Path) -> int:
     from .core import Hub
 
     hub = Hub(config, state)
-    res = run(Ctx(config=Path(config), state=Path(state), protected_overlap=hub.protected_overlap))
+    res = run(Ctx(config=Path(config), state=Path(state), protected_overlap=hub.protected_overlap,
+                  mnt_root=hub.mnt_root))
     print(format_report(res))
     return 1 if any(c["status"] == "fail" for c in res["checks"]) else 0

@@ -10,7 +10,7 @@ TOOLS = {"workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "rea
          "panel", "panel_data", "panel_browse", "panel_brief_check", "panel_mask_preview", "panel_audit",
          "panel_backups", "panel_backup_diff", "panel_save_workspace", "panel_delete_workspace", "panel_save_limits", "panel_revoke",
          "panel_unblock",
-         "panel_restore"}
+         "panel_restore", "publish", "panel_save_outbox", "panel_outbox_clean"}
 
 
 def test_stdio_roundtrip(env):

@@ -20,8 +20,8 @@ from pathlib import Path
 
 from .extract import EXTRACTABLE
 from .policy import Policy, glob_match
-from . import housekeeping
-from .registry import MODES, Limits, RegistryError, RegistryFile, Workspace
+from . import housekeeping, outbox
+from .registry import MODES, Limits, Outbox, RegistryError, RegistryFile, Workspace
 from .runtime import Runtime, handle_id
 
 HOME = Path.home()
@@ -44,6 +44,10 @@ REOPEN = "хэндл ws неизвестен или истёк — вызови 
 REVOKED = ("хэндл ws отозван пользователем в панели wshub; не открывай проект заново, "
            "пока пользователь не попросит")
 BLOCKED = "проект заблокирован пользователем в панели wshub; не пытайся открыть его снова"
+NO_OUTBOX = ("перевалка для publish не настроена (в реестре нет секции [outbox]); настраивает пользователь: "
+             "wshub outbox set /mnt/c/Users/<имя>/ClaudeOutbox или поля «Перевалка» в панели wshub. "
+             "Пока показать файл карточкой нельзя")
+COPY_CHUNK = 1024 * 1024
 
 _UMASK = os.umask(0)
 os.umask(_UMASK)
@@ -140,6 +144,7 @@ class Hub:
         self.protected = self._protected_paths(Path(config).parent)
         self.runtime = Runtime(self.state_dir, clock=clock)
         self._next_cleanup = 0.0  # раньше этого времени очистку копий не проверяем
+        self.mnt_root = outbox.MNT  # тесты подменяют: «диск Windows» во временной папке
 
     # ---------- самозащита, хэндлы, пути ----------
 
@@ -254,22 +259,28 @@ class Hub:
 
     # ---------- журнал ----------
 
+    @staticmethod
+    def _new_rec(tool: str, path: str | None = None) -> dict:
+        return {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "tool": tool, "ws": None, "path": path}
+
     @contextmanager
     def _audit(self, tool: str, path: str | None = None):
-        rec = {"ts": datetime.now().astimezone().isoformat(timespec="seconds"), "tool": tool,
-               "ws": None, "path": path}
+        """Запись журнала о вызове. rec["_logged"] = True — вызов сам записал свои строки (publish: по файлу)."""
+        rec = self._new_rec(tool, path)
         try:
             yield rec
         except Exception as e:
             if isinstance(e, PermissionError):  # запасной путь: места, где права не проверены явно
                 e = WsError(f"нет прав доступа: {e.filename or path}")
-            rec["status"] = "error"
-            rec["error"] = str(e)[:500]
-            self._write_audit(rec)
+            if not rec.pop("_logged", False):
+                rec["status"] = "error"
+                rec["error"] = str(e)[:500]
+                self._write_audit(rec)
             raise e from None
         else:
-            rec["status"] = "ok"
-            self._write_audit(rec)
+            if not rec.pop("_logged", False):
+                rec["status"] = "ok"
+                self._write_audit(rec)
 
     def _write_audit(self, rec: dict) -> None:
         self.runtime.last_call = {k: rec.get(k) for k in ("ts", "tool", "ws", "status")}
@@ -875,3 +886,154 @@ class Hub:
                 raise WsError(f"фрагмент old найден {n} раз, нужен ровно один")
             note = self._store(s, target, rel, text.replace(old, new, 1).encode("utf-8"), before, rec)
             return f"изменено: {rel}{note}"
+
+    # ---------- publish: перевалка для показа файла человеку ----------
+
+    def outbox_config(self) -> tuple[Outbox, Path, str]:
+        """Секция [outbox] и её проверенный путь (WSL и Windows). Не настроена или путь не годится — WsError."""
+        reg = self.registry.get()
+        ob = reg.outbox
+        if not ob.present:
+            raise WsError(NO_OUTBOX)
+        if ob.error:
+            raise WsError(f"ошибка в секции [outbox] реестра: {ob.error}; исправляет пользователь "
+                          "(wshub outbox set или панель wshub)")
+        errs = self.outbox_path_problems(str(ob.path), {w.name: w.path for w in reg.workspaces.values()})
+        if errs:
+            raise WsError("перевалка [outbox] не годится: " + "; ".join(errs) + "; исправляет пользователь "
+                          "(wshub doctor покажет, что не так)")
+        return ob, ob.path, outbox.win_path(ob.path, self.mnt_root)
+
+    def outbox_path_problems(self, path, roots: dict[str, Path] | None = None) -> list[str]:
+        """Проверка пути перевалки; roots — корни проектов (по умолчанию из реестра)."""
+        if roots is None:
+            try:
+                roots = {w.name: w.path for w in self.registry.get().workspaces.values()}
+            except (RegistryError, OSError):
+                roots = {}
+        return outbox.path_problems(path, roots, self.mnt_root, self.protected_overlap)
+
+    def _outbox_sweep(self, ob: Outbox, root: Path, incoming: int = 0, everything: bool = False) -> dict:
+        now = self.clock()
+        res = outbox.cleanup(root, ob.ttl_minutes * 60, now, None if everything else ob.max_total_mb * 1024 * 1024,
+                             incoming, everything)
+        outbox.write_mark(self.state_dir, res, now)
+        return res
+
+    def outbox_cleanup(self) -> dict | None:
+        """Очистка перевалки по сроку и объёму — при старте сервера. Не настроена — ничего не делает."""
+        try:
+            ob, root, _win = self.outbox_config()
+            return self._outbox_sweep(ob, root)
+        except (WsError, RegistryError, OSError):
+            return None
+
+    def outbox_clean_all(self, rec: dict) -> list[str]:
+        """Удалить все каталоги перевалки wshub независимо от срока (кнопка панели, wshub outbox clean)."""
+        ob, root, win = self.outbox_config()
+        res = self._outbox_sweep(ob, root, everything=True)
+        rec.update(deleted=res["deleted"], freed=res["freed"], busy=res["busy"])
+        msg = f"перевалка {win}: удалено каталогов {res['deleted']}, освобождено {res['freed']} байт"
+        if res["busy"]:
+            msg += f"; заняты и удалятся при следующей очистке: {res['busy']}"
+        rec["changes"] = [msg]
+        return rec["changes"]
+
+    def _publish_check(self, s: Session, path: str, max_bytes: int) -> tuple[Path, str, int]:
+        """Те же проверки, что у read: путь внутри корня, симлинки, deny; плюс обычный файл и размер."""
+        f, rel = self._resolve(s, path)
+        try:
+            with _perm(rel):
+                st = f.stat()
+        except FileNotFoundError:
+            raise WsError(f"файла нет: {rel}") from None
+        if not stat.S_ISREG(st.st_mode):
+            raise WsError(f"не обычный файл: {rel}")
+        if st.st_size > max_bytes:
+            raise WsError(f"файл {st.st_size} байт — больше лимита {max_bytes // 1024 // 1024} МБ: {rel}")
+        return f, rel, st.st_size
+
+    @staticmethod
+    def _stage_copy(src: Path, stage: Path, name: str, max_bytes: int) -> tuple[int, str]:
+        """Копия потоком во временное имя .partial и rename; при ошибке .partial удаляется."""
+        part = stage / (name + outbox.PARTIAL)
+        h, size = hashlib.sha256(), 0
+        try:
+            fd = os.open(src, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+            with os.fdopen(fd, "rb") as fi, open(part, "xb") as fo:
+                if not stat.S_ISREG(os.fstat(fi.fileno()).st_mode):
+                    raise WsError("файл подменён на время копирования — повтори")
+                while chunk := fi.read(COPY_CHUNK):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        raise WsError(f"файл вырос при копировании больше лимита {max_bytes // 1024 // 1024} МБ")
+                    h.update(chunk)
+                    fo.write(chunk)
+            os.rename(part, stage / name)
+        except BaseException:
+            try:
+                os.unlink(part)
+            except OSError:
+                pass
+            raise
+        return size, h.hexdigest()
+
+    def publish_files(self, ws: str, paths: list[str]) -> str:
+        with self._audit("publish") as call:
+            s = self._session(ws)
+            call["ws"] = s.ws.name
+            ob, root, win_root = self.outbox_config()
+            if isinstance(paths, str):
+                paths = [paths]
+            if not isinstance(paths, list) or not paths or not all(isinstance(p, str) for p in paths):
+                raise WsError("paths — непустой список путей от корня проекта")
+            if len(paths) > ob.max_files_per_call:
+                raise WsError(f"не больше {ob.max_files_per_call} файлов за вызов, передано {len(paths)} — "
+                              "раздели на несколько вызовов")
+            max_bytes = ob.max_file_mb * 1024 * 1024
+            ok, refused = [], []
+            for p in paths:
+                try:
+                    ok.append((p, *self._publish_check(s, p, max_bytes)))
+                    continue
+                except WsError as e:
+                    msg = str(e)
+                except OSError as e:
+                    msg = f"не удалось прочитать: {e.strerror or e}"
+                refused.append((p, msg))
+                self._write_audit({**self._new_rec("publish", p), "ws": s.ws.name, "status": "error", "error": msg[:500]})
+            stage = None
+            if ok:
+                incoming = sum(x[3] for x in ok)
+                res = self._outbox_sweep(ob, root, incoming)
+                if not res["fits"]:
+                    busy = f"; занятых каталогов: {res['busy']}" if res["busy"] else ""
+                    raise WsError(f"перевалка переполнена: занято {res['total']} байт, нужно ещё {incoming}, "
+                                  f"лимит max_total_mb = {ob.max_total_mb}{busy}; попроси пользователя нажать "
+                                  "«Очистить сейчас» в панели wshub или увеличить лимит")
+                with _perm(win_root, "запись в перевалку"):
+                    stage = outbox.make_stage(root, self.clock())
+            call["_logged"] = True  # дальше журнал — по строке на файл; отказы проверки уже записаны
+            # имя — как его запросили (у симлинка — имя ссылки, а не цели)
+            names = outbox.unique_names([outbox.ntfs_name(Path(os.path.normpath(p)).name or Path(rel).name)
+                                         for p, _f, rel, _size in ok])
+            lines = []
+            for (p, f, rel, _size), name in zip(ok, names):
+                rec = {**self._new_rec("publish", rel), "ws": s.ws.name, "outbox_id": stage.name}
+                try:
+                    with _perm(rel, "чтение или запись копии"):
+                        size, sha = self._stage_copy(f, stage, name, max_bytes)
+                except (WsError, OSError) as e:
+                    msg = str(e) if isinstance(e, WsError) else f"не удалось скопировать: {e.strerror or e}"
+                    refused.append((p, msg))
+                    self._write_audit({**rec, "status": "error", "error": msg[:500]})
+                    continue
+                self._write_audit({**rec, "status": "ok", "size": size, "sha256": sha, "name": name})
+                lines.append(f"{win_root}\\{stage.name}\\{name} — {size} байт")
+            if stage is not None and not lines:
+                outbox._remove(stage)
+            out = [f"отказ: {p} — {msg}" for p, msg in refused]
+            if not lines:
+                raise WsError("ни один файл не скопирован:\n" + "\n".join(out))
+            head = f"перевалка {win_root}; копии удаляются через {ob.ttl_minutes} мин"
+            return "\n".join([head, *lines, *out])

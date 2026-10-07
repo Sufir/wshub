@@ -30,3 +30,14 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "wsl: нужен настоящий WSL (wsl.exe, диски Windows в /mnt); вне WSL тест пропускается",
+    "nonroot: нужен обычный пользователь (chmod); от root тест пропускается",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

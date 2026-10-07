@@ -16,8 +16,8 @@ from wshub.panel import Panel
 from wshub.registry_edit import revision
 from wshub.server import APP_ONLY_META, MUTATING, build_server
 
-BASE_TOOLS = {"workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "read", "extract", "write", "edit", "publish",
-              "panel"}
+BASE_TOOLS = {"workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "read", "extract", "write", "edit",
+              "publish", "panel"}
 
 
 def make_panel(env, hub=None, proc=None) -> Panel:

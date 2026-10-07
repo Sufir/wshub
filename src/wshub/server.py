@@ -216,7 +216,8 @@ def main(argv: list[str] | None = None) -> None:
     if argv == ["doctor"]:
         from .doctor import main as doctor
         sys.exit(doctor(config, state))
-    if argv[:1] == ["outbox"] and (argv[1:2] == ["clean"] and len(argv) == 2 or argv[1:2] == ["set"] and len(argv) == 3):
+    if argv[:1] == ["outbox"] and (argv[1:2] == ["clean"] and len(argv) == 2
+                                   or argv[1:2] == ["set"] and len(argv) == 3):
         sys.exit(outbox_cli(config, state, argv[1:]))
     if argv:
         print(USAGE, file=sys.stderr)

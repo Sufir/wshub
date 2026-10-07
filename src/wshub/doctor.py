@@ -321,7 +321,8 @@ def check_processes(ctx: Ctx, procs: dict) -> dict:
     lines.append(f"HEAD на диске: {head[:8] if head else 'неизвестен (не git-checkout)'}")
     if any(r["stale"] for r in procs["registered"]) or procs["legacy"]:
         return _check("procs", title, "warn", lines,
-                      "код новее запущенного — перезапусти Desktop (полностью, из трея), чтобы процессы взяли новый код")
+                      "код новее запущенного — перезапусти Desktop (полностью, из трея), "
+                      "чтобы процессы взяли новый код")
     if not procs["registered"]:
         return _check("procs", title, "info", lines + ["живых процессов нет: Desktop не запущен или wshub отключён"],
                       "")

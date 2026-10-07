@@ -127,7 +127,8 @@ def test_processes_and_stale_head(fake, env):
 
     write_json(run / f"{pid}.json", {"pid": pid, "proc_start": "777", "started": 1.0, "head": "b" * 40})
     assert by_id(doctor.run(ctx))["procs"]["status"] == "ok"
-    write_json(run / f"{pid}.json", {"pid": pid, "proc_start": "778", "started": 1.0, "head": "b" * 40})  # pid занят другим
+    # pid занят другим процессом
+    write_json(run / f"{pid}.json", {"pid": pid, "proc_start": "778", "started": 1.0, "head": "b" * 40})
     res = doctor.run(ctx)
     assert res["processes"]["registered"] == []
     # процесс wshub без run-файла — старая версия

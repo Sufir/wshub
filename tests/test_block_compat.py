@@ -9,12 +9,11 @@ from pathlib import Path
 import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from test_panel_ops import make_panel
 
 from wshub import doctor
 from wshub.core import BLOCKED, REVOKED, Hub, WsError
 from wshub.registry import RegistryError, parse
-
-from test_panel_ops import make_panel
 
 
 def other_process(env) -> Hub:

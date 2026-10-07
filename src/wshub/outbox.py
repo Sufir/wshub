@@ -13,10 +13,10 @@ import re
 import secrets
 import shutil
 import string
+from collections.abc import Callable
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable
 
 from .runtime import atomic_write_text
 
@@ -232,8 +232,8 @@ def cleanup(root: Path, ttl_s: float, now: float, max_total: int | None = None, 
 
 def write_mark(state: Path, res: dict, now: float) -> None:
     try:
-        atomic_write_text(Path(state) / CLEAN_MARK,
-                          json.dumps({"ts": now, "deleted": res["deleted"], "freed": res["freed"], "busy": res["busy"]}))
+        mark = {"ts": now, "deleted": res["deleted"], "freed": res["freed"], "busy": res["busy"]}
+        atomic_write_text(Path(state) / CLEAN_MARK, json.dumps(mark))
     except OSError:
         pass
 

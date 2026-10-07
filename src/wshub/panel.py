@@ -20,7 +20,8 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .core import HOME, Hub, Session, WsError
-from .doctor import Ctx, run as run_doctor
+from .doctor import Ctx
+from .doctor import run as run_doctor
 from .housekeeping import journal_files, orig_rel, read_journal
 from .policy import Policy
 from .registry import NAME_RE, RegistryError, parse

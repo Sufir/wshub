@@ -30,7 +30,8 @@ APP_MIME = "text/html;profile=mcp-app"
 PANEL_META = {"ui": {"resourceUri": PANEL_URI}, "ui/resourceUri": PANEL_URI}
 APP_ONLY_META = {"ui": {"visibility": ["app"]}}
 # Изменяют реестр или состояние: только для панели и только с одноразовым кодом из panel_data
-MUTATING = {"panel_save_workspace", "panel_delete_workspace", "panel_save_limits", "panel_revoke", "panel_restore"}
+MUTATING = {"panel_save_workspace", "panel_delete_workspace", "panel_save_limits", "panel_revoke", "panel_unblock",
+            "panel_restore"}
 
 
 def build_server(hub: Hub, panel: Panel | None = None) -> FastMCP:
@@ -159,9 +160,15 @@ def build_server(hub: Hub, panel: Panel | None = None) -> FastMCP:
         return ops.delete_workspace(nonce, name=name, rev=rev)
 
     @app_tool
-    def panel_revoke(nonce: str, hid: str) -> dict[str, Any]:
-        """Отозвать хэндл во всех процессах wshub. Только для панели, с одноразовым кодом."""
-        return ops.revoke(nonce, hid)
+    def panel_revoke(nonce: str, hid: str, block: bool = False) -> dict[str, Any]:
+        """Отозвать хэндл во всех процессах wshub; block — ещё и запретить открывать проект до снятия запрета.
+        Только для панели, с одноразовым кодом."""
+        return ops.revoke(nonce, hid, bool(block))
+
+    @app_tool
+    def panel_unblock(nonce: str, name: str) -> dict[str, Any]:
+        """Снять запрет открывать проект. Только для панели, с одноразовым кодом."""
+        return ops.unblock(nonce, name)
 
     @app_tool
     def panel_restore(nonce: str, project: str, backup: str) -> dict[str, Any]:

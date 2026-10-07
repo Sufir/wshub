@@ -38,9 +38,10 @@ AUDIT_PAGE = 100
 AUDIT_PAGE_MAX = 500
 # «Только изменения»: запись, восстановление, правки реестра, отзывы, очистка копий
 CHANGE_TOOLS = {"write", "edit", "panel_restore", "panel_save", "panel_delete", "panel_limits", "panel_revoke",
-                "backup_cleanup"}
+                "panel_block", "panel_unblock", "backup_cleanup"}
 AUDIT_TOOLS = ["workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "read", "extract", "write", "edit",
-               "panel_save", "panel_delete", "panel_limits", "panel_revoke", "panel_restore", "backup_cleanup"]
+               "panel_save", "panel_delete", "panel_limits", "panel_revoke", "panel_block", "panel_unblock",
+               "panel_restore", "backup_cleanup"]
 BROWSE_MAX = 1000
 PREVIEW_SAMPLE = 50
 PREVIEW_TIMEOUT = 5.0
@@ -128,6 +129,8 @@ class Panel:
                     "deny": list(w.get("deny", [])), "path_ok": p.is_dir()})
         doc_res = run_doctor(self.doctor_ctx)
         revoked = self.hub.runtime.revoked()
+        blocked = sorted(({"name": n, "ts": v.get("ts")} for n, v in self.hub.runtime.blocked().items()),
+                         key=lambda b: b["name"])
         sessions = []
         for proc in live_processes(self.hub.state_dir, self.doctor_ctx.proc):
             for h in proc.get("handles") or []:
@@ -147,6 +150,9 @@ class Panel:
             "doctor": doc_res["checks"],
             "processes": doc_res["processes"],
             "sessions": sorted(sessions, key=lambda s: s.get("opened", 0)),
+            "blocked": blocked,
+            "blocked_error": (f"файл запретов {self.hub.runtime.blocked_path} повреждён — проекты не открываются; "
+                              "исправь или удали его вручную") if self.hub.runtime.blocked_broken else None,
             "storage": doc_res["storage"],
             "roots": [str(r) for r in self.roots],
             "pid": os.getpid(),
@@ -443,7 +449,8 @@ class Panel:
                 raise WsError(str(e)) from None
             return {"changes": changes}
 
-    def revoke(self, nonce, hid: str) -> dict:
+    def revoke(self, nonce, hid: str, block: bool = False) -> dict:
+        """Отозвать хэндл; block — ещё и запретить открывать проект (во всех процессах, до снятия запрета)."""
         with self._mutation("panel_revoke", nonce) as rec:
             if not isinstance(hid, str) or not HID_RE.match(hid):
                 raise WsError("хэндл не выбран — нажми «Отозвать» в строке хэндла")
@@ -462,5 +469,36 @@ class Panel:
             for t in mine:
                 del self.hub.handles[t]
             pid = found[0] if found else os.getpid()
-            return {"changes": [f"отозван хэндл {(found[1]['prefix'] if found else mine[0][:4])}… "
-                                f"проекта {name} (процесс {pid})"]}
+            rec["changes"] = [f"отозван хэндл {(found[1]['prefix'] if found else mine[0][:4])}… "
+                              f"проекта {name} (процесс {pid})"]
+        changes = list(rec["changes"])
+        if block:
+            changes += self._block(name)
+        return {"changes": changes}
+
+    def _block(self, name: str) -> list[str]:
+        """Отдельная запись panel_block: в журнале запрет виден и фильтруется сам по себе.
+        Код уже проверен в revoke — второй не нужен."""
+        with self.hub._audit("panel_block") as rec:
+            rec["ws"] = name
+            try:
+                changed = self.hub.runtime.block(name)
+            except OSError as e:
+                raise WsError(f"хэндл отозван, но запрет не записан: {e}") from None
+            rec["changes"] = [f"проект {name} заблокирован: workspace_open отказывает до снятия запрета"
+                              if changed else f"проект {name} уже был заблокирован"]
+            return rec["changes"]
+
+    def unblock(self, nonce, name: str) -> dict:
+        with self._mutation("panel_unblock", nonce) as rec:
+            if not isinstance(name, str) or not name:
+                raise WsError("проект не выбран — нажми «Снять запрет» в строке проекта")
+            rec["ws"] = name
+            try:
+                changed = self.hub.runtime.unblock(name)
+            except OSError as e:
+                raise WsError(str(e)) from None
+            if not changed:
+                raise WsError(f"проект {name} не заблокирован — нажми «Обновить»")
+            rec["changes"] = [f"с проекта {name} снят запрет: его снова можно открыть"]
+            return {"changes": rec["changes"]}

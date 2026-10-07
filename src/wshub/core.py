@@ -43,6 +43,7 @@ NTFS_ROOT = Path("/mnt")  # под ним «:» в имени — это пот�
 REOPEN = "хэндл ws неизвестен или истёк — вызови workspace_open заново"
 REVOKED = ("хэндл ws отозван пользователем в панели wshub; не открывай проект заново, "
            "пока пользователь не попросит")
+BLOCKED = "проект заблокирован пользователем в панели wshub; не пытайся открыть его снова"
 
 _UMASK = os.umask(0)
 os.umask(_UMASK)
@@ -179,6 +180,7 @@ class Hub:
         if h.hid in self.runtime.revoked():
             del self.handles[token]
             raise WsError(REVOKED)
+        self._check_blocked(h.name, token)
         reg = self.registry.get()
         ws = reg.workspaces.get(h.name)
         # проект убрали из реестра или сменили ему путь — старый хэндл больше не действует
@@ -187,6 +189,17 @@ class Hub:
             raise WsError(REOPEN)
         mode = "rw" if h.mode == "rw" and ws.mode == "rw" else "ro"
         return Session(ws, h.root, mode, Policy(ws.deny), reg.max_read_kb * 1024)
+
+    def _check_blocked(self, name: str, token: str | None = None) -> None:
+        """Запрет из панели действует на все процессы: и на workspace_open, и на уже выданные хэндлы."""
+        blocked = self.runtime.blocked()
+        if self.runtime.blocked_broken:
+            raise WsError(f"файл запретов {self.runtime.blocked_path} повреждён — проекты не открываются, "
+                          "пока пользователь его не исправит")
+        if name in blocked:
+            if token is not None:
+                self.handles.pop(token, None)
+            raise WsError(BLOCKED)
 
     def _rel(self, s: Session, p: Path) -> str:
         r = p.relative_to(s.root).as_posix()
@@ -312,7 +325,9 @@ class Hub:
             reg = self.registry.get()
             if not reg.workspaces:
                 return "(реестр пуст)"
+            blocked = self.runtime.blocked()
             return "\n".join(f"{w.name} [{w.mode}] — {w.description or '(без описания)'}"
+                             + (" — заблокирован пользователем, не открывать" if w.name in blocked else "")
                              for w in reg.workspaces.values())
 
     def panel_data(self) -> dict:
@@ -334,6 +349,7 @@ class Hub:
             ws = reg.workspaces.get(name)
             if ws is None:
                 raise WsError(f"нет проекта «{name}»; есть: {', '.join(reg.workspaces) or '(пусто)'}")
+            self._check_blocked(name)
             if mode not in MODES:
                 raise WsError("mode — \"ro\" или \"rw\"")
             if mode == "rw" and ws.mode != "rw":

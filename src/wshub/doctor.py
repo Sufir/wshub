@@ -97,7 +97,11 @@ def check_registry(ctx: Ctx) -> tuple[dict, dict | None]:
     except RegistryError as e:
         return _check("registry", title, "fail", [f"{ctx.config}: {e}", "пока ошибка не исправлена, все вызовы "
                                                   "инструментов отказывают"], "исправь файл реестра"), None
-    return _check("registry", title, "ok", f"{ctx.config}: проектов {len(reg.workspaces)}"), reg
+    head = f"{ctx.config}: проектов {len(reg.workspaces)}"
+    if reg.warnings:
+        return _check("registry", title, "warn", [head, *reg.warnings],
+                      "ключ из более новой версии wshub или опечатка: исправь имя или удали ключ"), reg
+    return _check("registry", title, "ok", head), reg
 
 
 def check_paths(ctx: Ctx, reg) -> dict:

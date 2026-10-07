@@ -260,9 +260,11 @@ def test_limits_parse():
     assert parse("").limits == Limits(5, 5, 30, 10)
     assert parse("[limits]\njournal_max_mb = 2\n").limits == Limits(2, 5, 30, 10)
     for bad in ("journal_max_mb = 0", "journal_max_mb = -1", "journal_max_mb = 1.5", 'journal_max_mb = "5"',
-                "journal_max_mb = true", "unknown = 1"):
+                "journal_max_mb = true"):
         with pytest.raises(RegistryError):
             parse(f"[limits]\n{bad}\n")
+    reg = parse("[limits]\nunknown = 1\njournal_max_mb = 2\n")
+    assert reg.limits == Limits(2, 5, 30, 10) and reg.warnings == ("неизвестный ключ limits.unknown — пропущен",)
 
 
 def test_limits_default_when_registry_broken(env):

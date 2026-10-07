@@ -52,6 +52,8 @@ class Registry:
     max_read_kb: int
     ttl_hours: float
     limits: Limits = Limits()
+    # неизвестные разделы и ключи: сервер их пропускает, doctor и «Обзор» показывают
+    warnings: tuple[str, ...] = ()
 
 
 def is_limit(v) -> bool:
@@ -64,18 +66,27 @@ def _str_list(v, where: str) -> tuple[str, ...]:
     return tuple(v)
 
 
+def unknown_key(name: str) -> str:
+    return f"неизвестный ключ {name} — пропущен"
+
+
+def _table(v, where: str) -> dict:
+    if not isinstance(v, dict):
+        raise RegistryError(f"{where}: ожидается таблица")
+    return v
+
+
 def parse(text: str) -> Registry:
+    """Ошибка — только битый TOML и неверные значения известных ключей. Неизвестные разделы и ключи
+    (например, из более новой версии wshub) пропускаются с предупреждением в Registry.warnings."""
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise RegistryError(f"синтаксис TOML: {e}") from None
-    unknown = set(data) - {"defaults", "workspace", "limits"}
-    if unknown:
-        raise RegistryError(f"неизвестные разделы: {sorted(unknown)}")
+    warnings = [unknown_key(k) for k in data if k not in ("defaults", "workspace", "limits")]
 
-    d = data.get("defaults", {})
-    if set(d) - DEFAULT_KEYS:
-        raise RegistryError(f"[defaults]: неизвестные ключи {sorted(set(d) - DEFAULT_KEYS)}")
+    d = _table(data.get("defaults", {}), "[defaults]")
+    warnings += [unknown_key(f"defaults.{k}") for k in d if k not in DEFAULT_KEYS]
     deny = _str_list(d.get("deny", []), "defaults.deny")
     max_kb = d.get("max_read_kb", 512)
     ttl = d.get("ttl_hours", 8)
@@ -84,25 +95,22 @@ def parse(text: str) -> Registry:
     if not isinstance(ttl, (int, float)) or isinstance(ttl, bool) or ttl <= 0:
         raise RegistryError("defaults.ttl_hours: нужно число > 0")
 
-    lim = data.get("limits", {})
-    if not isinstance(lim, dict):
-        raise RegistryError("[limits]: ожидается таблица")
-    if set(lim) - set(LIMITS):
-        raise RegistryError(f"[limits]: неизвестные ключи {sorted(set(lim) - set(LIMITS))}")
+    lim = _table(data.get("limits", {}), "[limits]")
+    warnings += [unknown_key(f"limits.{k}") for k in lim if k not in LIMITS]
+    lim = {k: v for k, v in lim.items() if k in LIMITS}
     for k, v in lim.items():
         if not is_limit(v):
             raise RegistryError(f"limits.{k}: нужно целое число больше 0")
     limits = Limits(**lim)
 
     wss: dict[str, Workspace] = {}
-    for name, w in data.get("workspace", {}).items():
+    for name, w in _table(data.get("workspace", {}), "[workspace]").items():
         where = f"[workspace.{name}]"
         if not NAME_RE.match(name):
             raise RegistryError(f"{where}: имя — только латиница, цифры, _ и -")
         if not isinstance(w, dict):
             raise RegistryError(f"{where}: ожидается таблица")
-        if set(w) - WS_KEYS:
-            raise RegistryError(f"{where}: неизвестные ключи {sorted(set(w) - WS_KEYS)}")
+        warnings += [unknown_key(f"workspace.{name}.{k}") for k in w if k not in WS_KEYS]
         path = w.get("path")
         if not isinstance(path, str) or not Path(path).is_absolute():
             raise RegistryError(f"{where}: path — абсолютный путь")
@@ -117,7 +125,7 @@ def parse(text: str) -> Registry:
             raise RegistryError(f"{where}: description — строка")
         own = _str_list(w.get("deny", []), f"{where} deny")
         wss[name] = Workspace(name, Path(path), mode, desc, brief, deny + own)
-    return Registry(wss, max_kb, float(ttl), limits)
+    return Registry(wss, max_kb, float(ttl), limits, tuple(warnings))
 
 
 class RegistryFile:

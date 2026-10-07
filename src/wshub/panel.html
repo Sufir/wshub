@@ -201,6 +201,14 @@
     <tbody id="session-rows"></tbody>
   </table></div>
   <div id="confirm-revoke" class="box warn" hidden></div>
+  <h2>Заблокированные проекты</h2>
+  <p class="hint">Заблокированный проект не открывается ни в одном процессе wshub: workspace_open отказывает, пока ты не снимешь запрет.</p>
+  <div id="blocked-error" class="box err" hidden></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Проект</th><th>Заблокирован</th><th>Действие</th></tr></thead>
+    <tbody id="blocked-rows"></tbody>
+  </table></div>
+  <div id="confirm-unblock" class="box warn" hidden></div>
 </section>
 
 <section id="tab-audit" role="tabpanel" hidden>
@@ -208,7 +216,7 @@
     <div><label for="a-ws">Проект</label><select id="a-ws"></select></div>
     <div><label for="a-tool">Инструмент</label><select id="a-tool"></select></div>
     <div><label class="inline" style="margin-bottom:4px"><input type="checkbox" id="a-err"> только ошибки</label></div>
-    <div><label class="inline" style="margin-bottom:4px" title="write, edit, восстановление, правки реестра, отзывы хэндлов, очистка копий"><input type="checkbox" id="a-changes"> только изменения</label></div>
+    <div><label class="inline" style="margin-bottom:4px" title="write, edit, восстановление, правки реестра, отзывы хэндлов, запреты проектов, очистка копий"><input type="checkbox" id="a-changes"> только изменения</label></div>
     <button type="button" id="a-reload">Загрузить заново</button>
   </div>
   <div class="hint" id="a-count"></div>
@@ -378,6 +386,9 @@ function dataDiff(a, b) {
     else if (s.revoked && !sa.get(h).revoked) out.push(`сессия ${s.name} (${s.prefix}…) отозвана`);
   }
   for (const [h, s] of sa) if (!sb.has(h)) out.push(`сессия ${s.name} (${s.prefix}…) закрыта`);
+  const ba = new Set(a.blocked.map((x) => x.name)), bb = new Set(b.blocked.map((x) => x.name));
+  for (const n of bb) if (!ba.has(n)) out.push(`проект ${n} заблокирован`);
+  for (const n of ba) if (!bb.has(n)) out.push(`с проекта ${n} снят запрет`);
   const pa = new Set(a.processes.registered.map((p) => p.pid)), pb = new Set(b.processes.registered.map((p) => p.pid));
   for (const p of pb) if (!pa.has(p)) out.push(`новый процесс сервера: pid ${p}`);
   for (const p of pa) if (!pb.has(p)) out.push(`процесс pid ${p} завершился`);
@@ -439,6 +450,7 @@ function renderAll() {
   renderStorage();
   renderProjects();
   renderSessions();
+  renderBlocked();
   renderFormState();
 }
 
@@ -774,15 +786,43 @@ function renderSessions() {
 
 function askRevoke(s) {
   const box = $("confirm-revoke");
+  const block = el("input", { type: "checkbox", id: "revoke-block" });
   box.replaceChildren(el("h3", { text: `Отозвать хэндл ${s.prefix}… проекта ${s.name}?` }),
     el("div", { text: "Следующий вызов с этим хэндлом получит отказ. Модель не должна открывать проект заново без твоей просьбы." }),
+    el("label", { class: "inline", for: "revoke-block", style: "margin-top:6px" }, block,
+      "Запретить открывать этот проект, пока я не сниму запрет"),
+    el("div", { class: "hint", text: "Без флажка модель может снова вызвать workspace_open. С флажком отказ получат и новые, и все уже открытые хэндлы проекта во всех процессах; снять запрет — ниже, в списке заблокированных." }),
     el("div", { class: "actions", style: "margin-top:6px" },
       el("button", { type: "button", class: "danger", text: "Да, отозвать", onclick: async () => {
         box.hidden = true;
-        await runMutation("panel_revoke", { hid: s.hid });
+        await runMutation("panel_revoke", { hid: s.hid, block: block.checked });
       } }),
       el("button", { type: "button", text: "Отмена", onclick: () => { box.hidden = true; } })));
   box.hidden = false;
+}
+
+function renderBlocked() {
+  setWhyBox($("blocked-error"), data.blocked_error);
+  if (!data.blocked.length) { emptyRow($("blocked-rows"), 3, "Заблокированных проектов нет."); return; }
+  $("blocked-rows").replaceChildren(...data.blocked.map((b) => el("tr", {},
+    td(b.name), td(fmtTime(b.ts)),
+    el("td", {}, el("button", { type: "button", text: "Снять запрет", onclick: () => askUnblock(b) })))));
+}
+
+function setWhyBox(box, text) { box.hidden = !text; box.textContent = text || ""; }
+
+function askUnblock(b) {
+  const box = $("confirm-unblock");
+  box.replaceChildren(el("h3", { text: `Снять запрет с проекта ${b.name}?` }),
+    el("div", { text: "Модель снова сможет открыть проект через workspace_open." }),
+    el("div", { class: "actions", style: "margin-top:6px" },
+      el("button", { type: "button", text: `Да, снять запрет с ${b.name}`, onclick: async () => {
+        box.hidden = true;
+        await runMutation("panel_unblock", { name: b.name });
+      } }),
+      el("button", { type: "button", text: "Отмена", onclick: () => { box.hidden = true; } })));
+  box.hidden = false;
+  box.scrollIntoView({ block: "nearest" });
 }
 
 // ---------- Журнал ----------

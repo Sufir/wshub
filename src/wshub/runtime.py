@@ -3,10 +3,12 @@
 Каждый процесс пишет run/<pid>.json: время старта, git HEAD кода при старте, открытые хэндлы
 (без токенов: первые 4 символа и hid — хэш токена) и последний вызов. Мёртвые pid читатели пропускают.
 Отзыв хэндла — строка с hid в файле revoked; его проверяет каждый процесс на каждом вызове.
+Запрет проекта — запись в blocked.json: пока она есть, workspace_open и старые хэндлы проекта отказывают.
 """
 from __future__ import annotations
 
 import atexit
+import contextlib
 import hashlib
 import json
 import os
@@ -114,6 +116,7 @@ class Runtime:
         self.state_dir = Path(state_dir)
         self.run_dir = self.state_dir / "run"
         self.revoked_path = self.state_dir / "revoked"
+        self.blocked_path = self.state_dir / "blocked.json"
         self.clock = clock
         self.pid = pid or os.getpid()
         self.started = clock()
@@ -123,6 +126,9 @@ class Runtime:
         self.enabled = False  # run-файл пишет только процесс сервера, не тесты и не doctor
         self._rev_stamp = None
         self._revoked: set[str] = set()
+        self._blk_stamp = None
+        self._blocked: dict[str, dict] = {}
+        self.blocked_broken = False
 
     @property
     def run_file(self) -> Path:
@@ -193,3 +199,66 @@ class Runtime:
         rows = [r for r in self._revoked_rows() if now - r.get("ts", now) < REVOKED_KEEP and r["hid"] != hid]
         rows.append({"hid": hid, "ts": now})
         atomic_write_text(self.revoked_path, "".join(json.dumps(r) + "\n" for r in rows))
+
+    # ---------- запрет проектов ----------
+
+    def blocked(self) -> dict[str, dict]:
+        """Заблокированные проекты: имя → {"ts": время запрета}; файл перечитывается, только если изменился.
+        Файл есть, но не разбирается — blocked_broken = True (Hub тогда отказывает в открытии любого проекта)."""
+        try:
+            st = self.blocked_path.stat()
+        except FileNotFoundError:
+            self._blk_stamp, self._blocked, self.blocked_broken = None, {}, False
+            return self._blocked
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        if stamp != self._blk_stamp:
+            rows = self._blocked_rows()
+            self.blocked_broken = rows is None
+            self._blocked, self._blk_stamp = rows or {}, stamp
+        return self._blocked
+
+    def _blocked_rows(self) -> dict[str, dict] | None:
+        try:
+            data = json.loads(self.blocked_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            return None
+        projects = data.get("projects") if isinstance(data, dict) else None
+        if not isinstance(projects, dict):
+            return None
+        return {k: v if isinstance(v, dict) else {} for k, v in projects.items() if isinstance(k, str)}
+
+    @contextlib.contextmanager
+    def _blocked_lock(self):
+        """Чтение-изменение-запись blocked.json под flock: панели в разных процессах не затирают друг друга."""
+        self.state_dir.mkdir(parents=True, exist_ok=True)
+        with open(self.state_dir / "blocked.lock", "a") as fh:
+            try:
+                import fcntl
+                fcntl.flock(fh, fcntl.LOCK_EX)
+            except ImportError:  # pragma: no cover — не POSIX
+                pass
+            yield
+
+    def _set_blocked(self, name: str, on: bool) -> bool:
+        """True, если состояние изменилось."""
+        with self._blocked_lock():
+            rows = self._blocked_rows()
+            if rows is None:
+                raise OSError(f"{self.blocked_path} повреждён — исправь или удали файл вручную")
+            if (name in rows) == on:
+                return False
+            if on:
+                rows[name] = {"ts": self.clock()}
+            else:
+                del rows[name]
+            atomic_write_text(self.blocked_path,
+                              json.dumps({"projects": rows}, ensure_ascii=False, indent=1) + "\n")
+            return True
+
+    def block(self, name: str) -> bool:
+        return self._set_blocked(name, True)
+
+    def unblock(self, name: str) -> bool:
+        return self._set_blocked(name, False)

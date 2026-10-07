@@ -6,7 +6,8 @@ import sys
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 
-TOOLS = {"workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "read", "extract", "write", "edit"}
+TOOLS = {"workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "read", "extract", "write", "edit",
+         "panel", "panel_data"}
 
 
 def test_stdio_roundtrip(env):

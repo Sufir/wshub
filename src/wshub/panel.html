@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Панель wshub</title>
+<style>
+  :root { color-scheme: light dark; --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --bg: transparent; --accent: #0969da; }
+  :root[data-theme="dark"] { --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --accent: #4493f8; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --accent: #4493f8; } }
+  body { margin: 0; padding: 12px 16px; font: 14px/1.4 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  h1 { font-size: 15px; margin: 0; flex: 1; }
+  button { font: inherit; padding: 4px 12px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--fg); cursor: pointer; }
+  button:disabled { opacity: .6; cursor: default; }
+  #status { color: var(--muted); font-size: 12px; }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.path { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+  .err { color: #cf222e; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Проекты wshub</h1>
+  <span id="status">загрузка…</span>
+  <button id="refresh" type="button" title="Перечитать реестр и хэндлы">Обновить</button>
+</header>
+<div class="wrap">
+  <table>
+    <thead><tr><th>Имя</th><th>Режим</th><th>Путь</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+<script>
+// Минимальный клиент MCP Apps (SEP-1865, протокол 2026-01-26): JSON-RPC 2.0 поверх postMessage к хосту.
+// Встроен вместо @modelcontextprotocol/ext-apps, чтобы файл не делал внешних загрузок.
+const PROTOCOL = "2026-01-26";
+const host = window.parent;
+const pending = new Map();
+let nextId = 1;
+
+function request(method, params) {
+  const id = nextId++;
+  host.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    setTimeout(() => { if (pending.delete(id)) reject(new Error("нет ответа от хоста: " + method)); }, 15000);
+  });
+}
+
+function notify(method, params) {
+  host.postMessage({ jsonrpc: "2.0", method, params }, "*");
+}
+
+window.addEventListener("message", (ev) => {
+  if (ev.source !== host) return;
+  const m = ev.data;
+  if (!m || m.jsonrpc !== "2.0") return;
+  if (m.id !== undefined && pending.has(m.id) && !m.method) {
+    const p = pending.get(m.id); pending.delete(m.id);
+    m.error ? p.reject(new Error(m.error.message || "ошибка хоста")) : p.resolve(m.result);
+  } else if (m.method === "ui/notifications/host-context-changed") {
+    applyContext(m.params);
+  } else if (m.method === "ui/resource-teardown" && m.id !== undefined) {
+    host.postMessage({ jsonrpc: "2.0", id: m.id, result: {} }, "*");
+  }
+});
+
+function applyContext(ctx) {
+  if (ctx && (ctx.theme === "light" || ctx.theme === "dark")) document.documentElement.dataset.theme = ctx.theme;
+}
+
+// ---------- панель ----------
+
+const rowsEl = document.getElementById("rows");
+const statusEl = document.getElementById("status");
+const btn = document.getElementById("refresh");
+
+function render(data) {
+  rowsEl.replaceChildren(...data.workspaces.map((w) => {
+    const tr = document.createElement("tr");
+    for (const [v, cls] of [[w.name], [w.mode], [w.path, "path"]]) {
+      const td = document.createElement("td");
+      td.textContent = v;
+      if (cls) td.className = cls;
+      tr.append(td);
+    }
+    return tr;
+  }));
+  if (!data.workspaces.length) rowsEl.innerHTML = '<tr><td colspan="3">(реестр пуст)</td></tr>';
+}
+
+function parseResult(res) {
+  if (res.isError) throw new Error((res.content || []).map((c) => c.text).join("\n") || "ошибка инструмента");
+  if (res.structuredContent && res.structuredContent.workspaces) return res.structuredContent;
+  // FastMCP кладёт тот же dict и в текстовый блок как JSON
+  return JSON.parse(res.content[0].text);
+}
+
+async function refresh() {
+  btn.disabled = true;
+  statusEl.className = "";
+  statusEl.textContent = "обновление…";
+  try {
+    const data = parseResult(await request("tools/call", { name: "panel_data", arguments: {} }));
+    render(data);
+    statusEl.textContent = `хэндлов открыто: ${data.open_handles} · обновлено ${new Date().toLocaleTimeString()}`;
+  } catch (e) {
+    statusEl.className = "err";
+    statusEl.textContent = "не удалось обновить: " + e.message;
+  } finally {
+    btn.disabled = false;
+    notify("ui/notifications/size-changed", { height: document.documentElement.scrollHeight });
+  }
+}
+
+btn.addEventListener("click", refresh);
+
+(async () => {
+  try {
+    const init = await request("ui/initialize", {
+      protocolVersion: PROTOCOL,
+      appInfo: { name: "wshub-panel", version: "0.1.0" },
+      appCapabilities: {},
+    });
+    applyContext(init && init.hostContext);
+    notify("ui/notifications/initialized", {});
+  } catch (e) {
+    statusEl.className = "err";
+    statusEl.textContent = "хост не ответил на ui/initialize: " + e.message;
+    return;
+  }
+  refresh();
+})();
+</script>
+</body>
+</html>

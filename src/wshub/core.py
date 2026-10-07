@@ -249,6 +249,17 @@ class Hub:
             return "\n".join(f"{w.name} [{w.mode}] — {w.description or '(без описания)'}"
                              for w in reg.workspaces.values())
 
+    def panel_data(self) -> dict:
+        """Данные для панели: проекты из реестра и число живых хэндлов. Ничего не меняет."""
+        with self._audit("panel_data"):
+            reg = self.registry.get()
+            now = self.clock()
+            return {
+                "workspaces": [{"name": w.name, "mode": w.mode, "path": str(w.path)}
+                               for w in reg.workspaces.values()],
+                "open_handles": sum(1 for h in self.handles.values() if now < h.expires),
+            }
+
     def workspace_open(self, name: str, mode: str = "ro") -> str:
         with self._audit("workspace_open") as rec:
             rec["ws"] = name

@@ -13,6 +13,8 @@ dependencies = [
     "openpyxl>=3.1",
     # tomllib есть в стандартной библиотеке только с 3.11
     "tomli>=2; python_version < '3.11'",
+    # правка реестра из панели с сохранением комментариев и порядка
+    "tomlkit>=0.12",
 ]
 
 [project.scripts]

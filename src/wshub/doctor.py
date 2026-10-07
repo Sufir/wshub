@@ -1,0 +1,369 @@
+"""Проверки окружения wshub: общий модуль для `wshub doctor` и вкладки «Обзор» панели.
+
+Каждая проверка — словарь: id, title, status (ok | warn | fail | info), detail (строки), fix (что сделать).
+"""
+from __future__ import annotations
+
+import json
+import os
+import shutil
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+from .registry import RegistryError, parse
+from .runtime import git_head, live_processes, pid_alive, proc_start, repo_dir
+
+AUDIT_WARN = 50 * 1024 * 1024
+BACKUP_WARN = 1024 * 1024 * 1024
+SKIP_USERS = {"Default", "Default User", "Public", "All Users", "WsiAccount", "desktop.ini"}
+
+
+@dataclass
+class Ctx:
+    config: Path
+    state: Path
+    home: Path = field(default_factory=Path.home)
+    win_users: Path = Path("/mnt/c/Users")
+    proc: Path = Path("/proc")
+    repo: Path | None = field(default_factory=repo_dir)
+    distro: str | None = field(default_factory=lambda: os.environ.get("WSL_DISTRO_NAME"))
+    self_pid: int = field(default_factory=os.getpid)
+    protected_overlap: object = None  # Hub.protected_overlap, если есть
+
+
+def _check(id_, title, status, detail, fix=""):
+    if isinstance(detail, str):
+        detail = [detail]
+    return {"id": id_, "title": title, "status": status, "detail": detail, "fix": fix}
+
+
+def human_size(n: int) -> str:
+    for unit in ("байт", "КБ", "МБ", "ГБ"):
+        if n < 1024 or unit == "ГБ":
+            return f"{n:.0f} {unit}" if unit == "байт" else f"{n:.1f} {unit}"
+        n /= 1024
+    return str(n)
+
+
+def _tree_size(d: Path) -> tuple[int, int]:
+    total = count = 0
+    for base, _dirs, files in os.walk(d):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(base, f)).st_size
+                count += 1
+            except OSError:
+                pass
+    return total, count
+
+
+# ---------- отдельные проверки ----------
+
+def check_rg() -> dict:
+    rg = shutil.which("rg")
+    if rg:
+        return _check("rg", "ripgrep", "ok", f"rg: {rg}")
+    return _check("rg", "ripgrep", "warn", "rg нет в PATH: grep работает медленнее, обходом на Python",
+                  "установи ripgrep: sudo apt install ripgrep")
+
+
+def check_tomlkit() -> dict:
+    try:
+        import tomlkit
+    except ImportError:
+        return _check("tomlkit", "tomlkit", "fail", "tomlkit не установлен: панель не может сохранять реестр",
+                      "переустанови wshub: uv tool install --editable --reinstall <папка репозитория wshub>")
+    return _check("tomlkit", "tomlkit", "ok", f"tomlkit {getattr(tomlkit, '__version__', '?')}")
+
+
+def check_registry(ctx: Ctx) -> tuple[dict, dict | None]:
+    title = "Реестр"
+    try:
+        text = ctx.config.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return _check("registry", title, "fail", f"реестра нет: {ctx.config}",
+                      "создай файл по образцу из README или добавь проект в панели"), None
+    except OSError as e:
+        return _check("registry", title, "fail", f"не читается: {ctx.config}: {e}", "проверь права на файл"), None
+    try:
+        reg = parse(text)
+    except RegistryError as e:
+        return _check("registry", title, "fail", [f"{ctx.config}: {e}", "пока ошибка не исправлена, все вызовы "
+                                                  "инструментов отказывают"], "исправь файл реестра"), None
+    return _check("registry", title, "ok", f"{ctx.config}: проектов {len(reg.workspaces)}"), reg
+
+
+def check_paths(ctx: Ctx, reg) -> dict:
+    title = "Пути проектов"
+    if reg is None:
+        return _check("paths", title, "info", "не проверены: реестр не прочитан", "сначала исправь реестр")
+    lines, bad = [], []
+    for w in reg.workspaces.values():
+        if not w.path.is_dir():
+            bad.append(w.name)
+            lines.append(f"{w.name}: папки нет — {w.path}")
+            continue
+        overlap = ctx.protected_overlap(w.path.resolve()) if ctx.protected_overlap else None
+        if overlap is not None:
+            bad.append(w.name)
+            lines.append(f"{w.name}: пересекается со служебным каталогом wshub {overlap} — не откроется")
+            continue
+        brief = ""
+        if w.brief:
+            brief = ", BRIEF есть" if (w.path / w.brief).is_file() else f", BRIEF {w.brief} — файла нет"
+        lines.append(f"{w.name}: {w.path}{brief}")
+    if not reg.workspaces:
+        return _check("paths", title, "info", "реестр пуст", "добавь проект на вкладке «Проекты»")
+    if bad:
+        return _check("paths", title, "fail", lines,
+                      f"исправь путь или удали проект: {', '.join(bad)} (вкладка «Проекты»)")
+    return _check("paths", title, "ok", lines)
+
+
+# ---------- Claude Desktop ----------
+
+def desktop_candidates(ctx: Ctx) -> list[dict]:
+    """Все файлы, откуда Desktop может брать конфиг, с пометкой, читает ли его установленная версия."""
+    out = []
+    if ctx.win_users.is_dir():
+        try:
+            users = sorted(p for p in ctx.win_users.iterdir() if p.name not in SKIP_USERS)
+        except OSError:
+            users = []
+        for u in users:
+            appdata = u / "AppData"
+            try:
+                if not appdata.is_dir():
+                    continue
+                pkgs = sorted((appdata / "Local/Packages").glob("Claude_*"))
+            except OSError:
+                continue
+            classic_install = (appdata / "Local/AnthropicClaude").is_dir()
+            for pkg in pkgs:
+                out.append({"kind": "msix", "path": pkg / "LocalCache/Roaming/Claude/claude_desktop_config.json",
+                            "used": True,
+                            "why": f"Desktop из MSIX-пакета {pkg.name} читает свою копию в LocalCache пакета"})
+            classic = appdata / "Roaming/Claude/claude_desktop_config.json"
+            if classic_install:
+                used, why = True, "классическая установка (AnthropicClaude) читает этот файл"
+            elif pkgs:
+                used, why = False, ("установлен только MSIX-Desktop: он читает копию в пакете, а этот файл виден "
+                                    "лишь процессам вне пакета (WSL, Проводник)")
+            else:
+                used, why = False, "Desktop для этого пользователя не найден"
+            out.append({"kind": "classic", "path": classic, "used": used, "why": why})
+    for p, why in ((ctx.home / ".config/Claude/claude_desktop_config.json", "Desktop под Linux"),
+                   (ctx.home / "Library/Application Support/Claude/claude_desktop_config.json", "Desktop под macOS")):
+        if p.parent.is_dir():
+            out.append({"kind": "native", "path": p, "used": True, "why": why})
+    for c in out:
+        c.update(_read_entry(ctx, c["path"]))
+    return out
+
+
+def _read_entry(ctx: Ctx, path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except FileNotFoundError:
+        return {"exists": False}
+    except (OSError, ValueError) as e:
+        return {"exists": True, "error": f"не читается как JSON: {e}"}
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    servers = servers if isinstance(servers, dict) else {}
+    res = {"exists": True, "servers": sorted(servers)}
+    entry = servers.get("wshub")
+    if isinstance(entry, dict):
+        res["entry"] = _describe_entry(ctx, entry)
+    return res
+
+
+def _describe_entry(ctx: Ctx, e: dict) -> dict:
+    cmd = str(e.get("command", ""))
+    args = [str(a) for a in e.get("args", []) if isinstance(a, (str, int))]
+    distro, target = None, cmd
+    if Path(cmd.replace("\\", "/")).name.lower() in ("wsl.exe", "wsl"):
+        target = None
+        for i, a in enumerate(args):
+            if a in ("-d", "--distribution") and i + 1 < len(args):
+                distro = args[i + 1]
+            if a in ("--", "-e", "--exec") and i + 1 < len(args):
+                target = args[i + 1]
+                break
+    info = {"command": " ".join([cmd, *args]), "distro": distro, "target": target}
+    problems = []
+    if distro and ctx.distro and distro != ctx.distro:
+        problems.append(f"дистрибутив {distro}, а этот doctor запущен в {ctx.distro}")
+    if target:
+        t = Path(target)
+        if not t.exists():
+            problems.append(f"{target} не существует")
+        else:
+            real = t.resolve()
+            info["resolved"] = str(real)
+            if not os.access(real, os.X_OK):
+                problems.append(f"{real} не исполняемый")
+    else:
+        problems.append("не удалось разобрать, какой файл запускается")
+    info["problems"] = problems
+    return info
+
+
+def check_desktop(ctx: Ctx) -> dict:
+    title = "Запись wshub в Claude Desktop"
+    cands = desktop_candidates(ctx)
+    if not cands:
+        return _check("desktop", title, "info", "конфигов Claude Desktop не найдено (не Windows/WSL и не Linux/macOS "
+                      "Desktop)", "добавь запись wshub в claude_desktop_config.json, см. README")
+    lines, active = [], []
+    for c in cands:
+        mark = "читается Desktop" if c["used"] else "не читается"
+        head = f"[{mark}] {c['path']}"
+        if not c["exists"]:
+            lines.append(f"{head} — файла нет")
+        elif "error" in c:
+            lines.append(f"{head} — {c['error']}")
+        elif "entry" in c:
+            e = c["entry"]
+            where = e.get("resolved") or e.get("target") or "?"
+            dist = f" в {e['distro']}" if e.get("distro") else ""
+            lines.append(f"{head} — wshub → {e['command']} (файл {where}{dist})"
+                         + (f"; проблемы: {'; '.join(e['problems'])}" if e["problems"] else ""))
+        else:
+            lines.append(f"{head} — записи wshub нет (серверы: {', '.join(c['servers']) or 'нет'})")
+        lines.append(f"    {c['why']}")
+        if c["used"] and c.get("entry"):
+            active.append(c)
+    stale = [c for c in cands if not c["used"] and c.get("entry")]
+    if not active:
+        return _check("desktop", title, "fail", lines,
+                      "добавь запись wshub в файл с пометкой «читается Desktop» при закрытом Desktop (README)")
+    broken = [c for c in active if c["entry"]["problems"]]
+    if broken:
+        return _check("desktop", title, "fail", lines, "исправь command/args записи wshub при закрытом Desktop")
+    if stale:
+        return _check("desktop", title, "warn", lines,
+                      "запись в нечитаемом файле ни на что не влияет — её можно удалить, чтобы не путаться")
+    return _check("desktop", title, "ok", lines)
+
+
+# ---------- процессы ----------
+
+def _is_wshub_cmd(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    rest = argv[1:]
+    if Path(argv[0]).name == "wshub":
+        return not rest or rest[0] != "doctor"
+    for i, a in enumerate(rest):
+        if Path(a).name == "wshub" and Path(argv[0]).name.startswith("python"):
+            return rest[i + 1:i + 2] != ["doctor"]
+        if a == "-m" and rest[i + 1:i + 2] == ["wshub"]:
+            return rest[i + 2:i + 3] != ["doctor"]
+    return False
+
+
+def processes(ctx: Ctx) -> dict:
+    """Живые процессы сервера: с run-файлом и без него (запущены версией до панели)."""
+    head_disk = git_head(ctx.repo)
+    reg = live_processes(ctx.state, ctx.proc)
+    known = {int(d["pid"]) for d in reg}
+    rows = []
+    for d in reg:
+        rows.append({"pid": d["pid"], "started": d.get("started"), "head": d.get("head"),
+                     "stale": bool(head_disk and d.get("head") and d["head"] != head_disk),
+                     "handles": len(d.get("handles") or []), "last_call": d.get("last_call"),
+                     "current": int(d["pid"]) == ctx.self_pid})
+    legacy = []
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    try:
+        entries = list(ctx.proc.iterdir()) if ctx.proc.is_dir() else []
+    except OSError:
+        entries = []
+    for p in entries:
+        if not p.name.isdigit() or int(p.name) in known or int(p.name) == ctx.self_pid:
+            continue
+        try:
+            if uid is not None and p.stat().st_uid != uid:
+                continue
+            argv = [a for a in (p / "cmdline").read_bytes().decode("utf-8", "replace").split("\0") if a]
+        except OSError:
+            continue
+        if _is_wshub_cmd(argv) and pid_alive(int(p.name), proc_start(int(p.name), ctx.proc), ctx.proc):
+            legacy.append({"pid": int(p.name), "cmd": " ".join(argv)})
+    return {"head_disk": head_disk, "registered": rows, "legacy": sorted(legacy, key=lambda r: r["pid"])}
+
+
+def check_processes(ctx: Ctx, procs: dict) -> dict:
+    title = "Процессы сервера"
+    lines = []
+    for r in procs["registered"]:
+        started = datetime.fromtimestamp(r["started"]).strftime("%Y-%m-%d %H:%M") if r["started"] else "?"
+        code = (r["head"] or "?")[:8]
+        lines.append(f"pid {r['pid']}: старт {started}, код {code}{' (устарел)' if r['stale'] else ''}, "
+                     f"хэндлов {r['handles']}")
+    for r in procs["legacy"]:
+        lines.append(f"pid {r['pid']}: без run-файла — запущен версией wshub до панели ({r['cmd']})")
+    head = procs["head_disk"]
+    lines.append(f"HEAD на диске: {head[:8] if head else 'неизвестен (не git-checkout)'}")
+    if any(r["stale"] for r in procs["registered"]) or procs["legacy"]:
+        return _check("procs", title, "warn", lines,
+                      "код новее запущенного — перезапусти Desktop (полностью, из трея), чтобы процессы взяли новый код")
+    if not procs["registered"]:
+        return _check("procs", title, "info", lines + ["живых процессов нет: Desktop не запущен или wshub отключён"],
+                      "")
+    return _check("procs", title, "ok", lines)
+
+
+def check_storage(ctx: Ctx) -> list[dict]:
+    audit = ctx.state / "audit.jsonl"
+    try:
+        size = audit.stat().st_size
+    except FileNotFoundError:
+        res = [_check("audit", "Журнал", "info", f"журнала ещё нет: {audit}")]
+    else:
+        st = "warn" if size > AUDIT_WARN else "ok"
+        res = [_check("audit", "Журнал", st, f"{audit}: {human_size(size)}",
+                      "журнал большой — перенеси audit.jsonl в архив, сервер начнёт новый" if st == "warn" else "")]
+    backup = ctx.state / "backup"
+    if backup.is_dir():
+        size, count = _tree_size(backup)
+        st = "warn" if size > BACKUP_WARN else "ok"
+        res.append(_check("backup", "Копии", st, f"{backup}: {human_size(size)}, файлов {count}",
+                          "копий много — удали старые папки в backup/<проект>/" if st == "warn" else ""))
+    else:
+        res.append(_check("backup", "Копии", "info", f"копий ещё нет: {backup}"))
+    return res
+
+
+def run(ctx: Ctx) -> dict:
+    reg_check, reg = check_registry(ctx)
+    procs = processes(ctx)
+    checks = [check_rg(), check_tomlkit(), reg_check, check_paths(ctx, reg), check_desktop(ctx),
+              check_processes(ctx, procs), *check_storage(ctx)]
+    return {"checks": checks, "processes": procs}
+
+
+STATUS = {"ok": "OK  ", "warn": "ВНИМ", "fail": "ОШИБ", "info": "инфо"}
+
+
+def format_report(res: dict) -> str:
+    out = []
+    for c in res["checks"]:
+        out.append(f"[{STATUS[c['status']]}] {c['title']}")
+        out += [f"       {line}" for line in c["detail"]]
+        if c["fix"]:
+            out.append(f"       → {c['fix']}")
+    worst = {s: sum(c["status"] == s for c in res["checks"]) for s in STATUS}
+    out.append("")
+    out.append(f"итог: ok {worst['ok']}, внимание {worst['warn']}, ошибки {worst['fail']}, инфо {worst['info']}")
+    return "\n".join(out)
+
+
+def main(config: Path, state: Path) -> int:
+    from .core import Hub
+
+    hub = Hub(config, state)
+    res = run(Ctx(config=Path(config), state=Path(state), protected_overlap=hub.protected_overlap))
+    print(format_report(res))
+    return 1 if any(c["status"] == "fail" for c in res["checks"]) else 0

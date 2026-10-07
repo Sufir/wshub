@@ -1,0 +1,34 @@
+name: Release
+
+# Тег vX.Y.Z → проверки, сборка и GitHub Release с колесом и исходниками.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: ripgrep
+        run: command -v rg || { sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep; }
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - name: тег совпадает с версией в pyproject.toml
+        run: |
+          version=$(uv version --short)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::тег $GITHUB_REF_NAME, а в pyproject.toml версия $version"
+            exit 1
+          fi
+      - run: uv run --frozen ruff check .
+      - run: uv run --frozen pytest -rs
+      - run: uv build
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "wshub $GITHUB_REF_NAME" --generate-notes --verify-tag

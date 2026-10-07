@@ -1,0 +1,837 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Панель wshub</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --bg: transparent; --panel: rgba(127,127,127,.06);
+    --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --fail: #cf222e; --info: #656d76;
+    --add: rgba(46,160,67,.15); --del: rgba(248,81,73,.15); --hl: rgba(9,105,218,.12);
+  }
+  :root[data-theme="dark"] {
+    --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --accent: #4493f8;
+    --ok: #3fb950; --warn: #d29922; --fail: #f85149; --info: #8d96a0; --hl: rgba(68,147,248,.15);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --accent: #4493f8;
+      --ok: #3fb950; --warn: #d29922; --fail: #f85149; --info: #8d96a0; --hl: rgba(68,147,248,.15);
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 12px 16px; font: 14px/1.4 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  header { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 8px; }
+  h1 { font-size: 15px; margin: 0; flex: 1; }
+  h2 { font-size: 14px; margin: 16px 0 6px; }
+  button { font: inherit; padding: 4px 12px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--fg); cursor: pointer; }
+  button.primary { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  button.danger { border-color: var(--fail); color: var(--fail); }
+  button:disabled { opacity: .5; cursor: default; }
+  input[type=text], select { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--fg); min-width: 0; }
+  input:disabled, select:disabled { opacity: .55; }
+  select option { color: #1f2328; background: #fff; }
+  label { display: block; font-size: 12px; font-weight: 600; margin-bottom: 2px; }
+  label.inline { display: inline-flex; align-items: center; gap: 6px; font-weight: 400; font-size: 14px; margin: 0 12px 0 0; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .hint.why::before { content: "Неактивно: "; font-weight: 600; }
+  #status { color: var(--muted); font-size: 12px; }
+  nav { display: flex; gap: 4px; flex-wrap: wrap; border-bottom: 1px solid var(--line); margin-bottom: 10px; }
+  nav button { border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 6px 10px; }
+  nav button[aria-selected="true"] { border-bottom-color: var(--accent); font-weight: 600; }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.mono, .mono { font-family: ui-monospace, monospace; font-size: 12px; word-break: break-all; }
+  tr.changed td { background: var(--hl); }
+  .box { border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; background: var(--panel); }
+  .box.err { border-color: var(--fail); }
+  .box.warn { border-color: var(--warn); }
+  .box.done { border-color: var(--ok); }
+  .box h3 { font-size: 13px; margin: 0 0 4px; }
+  .box ul { margin: 4px 0 0; padding-left: 18px; }
+  .row { display: flex; gap: 8px; align-items: flex-end; flex-wrap: wrap; }
+  .field { margin: 8px 0; }
+  .field > input[type=text] { width: 100%; }
+  .grow { flex: 1; min-width: 160px; }
+  .st { font-weight: 600; white-space: nowrap; }
+  .st-ok { color: var(--ok); } .st-warn { color: var(--warn); } .st-fail, .err { color: var(--fail); } .st-info { color: var(--info); }
+  .actions { display: flex; gap: 6px; flex-wrap: wrap; }
+  .dirlist { max-height: 260px; overflow: auto; border: 1px solid var(--line); border-radius: 6px; margin-top: 6px; }
+  .dirlist button { display: block; width: 100%; text-align: left; border: none; border-bottom: 1px solid var(--line); border-radius: 0; }
+  pre.diff { font: 12px/1.35 ui-monospace, monospace; overflow: auto; max-height: 420px; border: 1px solid var(--line); border-radius: 6px; padding: 6px 0; margin: 6px 0; }
+  pre.diff span { display: block; padding: 0 8px; white-space: pre; }
+  pre.diff .a { background: var(--add); } pre.diff .d { background: var(--del); } pre.diff .h { color: var(--muted); }
+  details summary { cursor: pointer; }
+  .mask-row { display: flex; gap: 6px; align-items: flex-end; margin: 4px 0; }
+  .mask-row .field { margin: 0; flex: 1; }
+  .mask-row input { width: 100%; }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Панель wshub</h1>
+  <span id="status">загрузка…</span>
+  <button id="refresh" type="button" title="Перечитать реестр, процессы и сессии">Обновить</button>
+</header>
+<div id="error" class="box err" hidden role="alert"></div>
+<div id="changes" class="box done" hidden role="status"></div>
+<nav role="tablist" id="tabs">
+  <button role="tab" data-tab="overview" aria-selected="true">Обзор</button>
+  <button role="tab" data-tab="projects" aria-selected="false">Проекты</button>
+  <button role="tab" data-tab="sessions" aria-selected="false">Сессии</button>
+  <button role="tab" data-tab="audit" aria-selected="false">Журнал</button>
+  <button role="tab" data-tab="backups" aria-selected="false">Копии</button>
+</nav>
+
+<section id="tab-overview" role="tabpanel">
+  <div id="stale" class="box warn" hidden></div>
+  <h2>Проверки</h2>
+  <div class="wrap"><table>
+    <thead><tr><th>Проверка</th><th>Статус</th><th>Подробности</th><th>Что сделать</th></tr></thead>
+    <tbody id="doctor-rows"></tbody>
+  </table></div>
+  <h2>Процессы сервера</h2>
+  <div class="wrap"><table>
+    <thead><tr><th>PID</th><th>Старт</th><th>Код (HEAD)</th><th>Хэндлов</th><th>Последний вызов</th></tr></thead>
+    <tbody id="proc-rows"></tbody>
+  </table></div>
+</section>
+
+<section id="tab-projects" role="tabpanel" hidden>
+  <div id="reg-error" class="box err" hidden></div>
+  <div class="row"><div class="grow hint" id="reg-path"></div>
+    <button id="add-project" type="button" class="primary">Добавить проект</button></div>
+  <div id="add-why" class="hint why" hidden></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Имя</th><th>Режим</th><th>Путь</th><th>Описание</th><th>BRIEF</th><th>Свои маски deny</th><th>Действия</th></tr></thead>
+    <tbody id="project-rows"></tbody>
+  </table></div>
+  <div id="defaults" class="hint"></div>
+  <div id="confirm-delete" class="box warn" hidden></div>
+
+  <form id="form" class="box" hidden autocomplete="off" onsubmit="return false">
+    <h3 id="form-title"></h3>
+    <div class="field">
+      <label for="f-name">Имя *</label>
+      <input type="text" id="f-name" autocomplete="off" spellcheck="false">
+      <div class="hint" id="f-name-hint">Латиница, цифры и дефис; первый символ — буква или цифра.</div>
+    </div>
+    <div class="field">
+      <label for="f-path">Путь к папке проекта *</label>
+      <div class="row">
+        <input type="text" id="f-path" class="grow mono" autocomplete="off" spellcheck="false">
+        <button type="button" id="f-browse">Выбрать папку…</button>
+      </div>
+      <div class="hint">Абсолютный путь. Кнопка показывает папки внутри <span id="roots"></span>.</div>
+      <div id="picker" class="box" hidden>
+        <div class="row">
+          <div class="grow"><label>Текущая папка</label><div class="mono" id="pk-path"></div></div>
+          <button type="button" id="pk-up">Вверх</button>
+          <button type="button" id="pk-choose" class="primary">Выбрать эту папку</button>
+          <button type="button" id="pk-close">Закрыть</button>
+        </div>
+        <div id="pk-why" class="hint why" hidden></div>
+        <div id="pk-msg" class="hint"></div>
+        <div class="dirlist" id="pk-list"></div>
+      </div>
+    </div>
+    <fieldset class="field" style="border:none;padding:0;margin:8px 0">
+      <legend style="font-size:12px;font-weight:600;margin-bottom:2px">Режим *</legend>
+      <label class="inline"><input type="radio" name="f-mode" value="ro"> ro — только чтение</label>
+      <label class="inline"><input type="radio" name="f-mode" value="rw"> rw — чтение и запись</label>
+    </fieldset>
+    <div class="field">
+      <label for="f-desc">Описание</label>
+      <input type="text" id="f-desc" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="f-brief">Путь BRIEF от корня проекта</label>
+      <input type="text" id="f-brief" class="mono" autocomplete="off" spellcheck="false">
+      <div id="f-brief-why" class="hint why" hidden>сначала укажи путь к папке проекта.</div>
+      <div id="f-brief-state" class="hint"></div>
+    </div>
+    <div class="field">
+      <label>Свои маски deny</label>
+      <div id="f-masks"></div>
+      <div class="actions">
+        <button type="button" id="f-add-mask">Добавить маску</button>
+        <button type="button" id="f-preview">Предпросмотр масок</button>
+      </div>
+      <div id="f-preview-why" class="hint why" hidden></div>
+      <div class="hint" id="f-defaults"></div>
+      <div id="f-preview-out"></div>
+    </div>
+    <div class="actions">
+      <button type="button" id="f-save" class="primary">Сохранить</button>
+      <button type="button" id="f-cancel">Отмена</button>
+    </div>
+    <div id="f-save-why" class="hint why" hidden></div>
+    <div id="f-error" class="err" role="alert"></div>
+  </form>
+</section>
+
+<section id="tab-sessions" role="tabpanel" hidden>
+  <p class="hint">Открытые хэндлы во всех живых процессах wshub. Отзыв действует сразу: процесс проверяет его на каждом вызове.</p>
+  <div class="wrap"><table>
+    <thead><tr><th>Проект</th><th>Режим</th><th>Хэндл</th><th>Процесс</th><th>Открыт</th><th>Действует до</th><th>Статус</th><th>Действие</th></tr></thead>
+    <tbody id="session-rows"></tbody>
+  </table></div>
+  <div id="confirm-revoke" class="box warn" hidden></div>
+</section>
+
+<section id="tab-audit" role="tabpanel" hidden>
+  <div class="row">
+    <div><label for="a-ws">Проект</label><select id="a-ws"></select></div>
+    <div><label for="a-tool">Инструмент</label><select id="a-tool"></select></div>
+    <div><label class="inline" style="margin-bottom:4px"><input type="checkbox" id="a-err"> только ошибки</label></div>
+    <button type="button" id="a-reload">Загрузить заново</button>
+  </div>
+  <div class="hint" id="a-count"></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Время</th><th>Инструмент</th><th>Проект</th><th>Путь</th><th>Результат</th></tr></thead>
+    <tbody id="audit-rows"></tbody>
+  </table></div>
+</section>
+
+<section id="tab-backups" role="tabpanel" hidden>
+  <div class="row">
+    <div><label for="b-ws">Проект</label><select id="b-ws"></select></div>
+    <div class="grow"><label for="b-file">Файл (часть пути)</label><input type="text" id="b-file" autocomplete="off" spellcheck="false"></div>
+    <button type="button" id="b-reload">Загрузить заново</button>
+  </div>
+  <div id="b-file-why" class="hint why" hidden>сначала выбери проект.</div>
+  <div id="b-note" class="hint"></div>
+  <div id="confirm-restore" class="box warn" hidden></div>
+  <div id="b-diff"></div>
+  <div class="wrap"><table>
+    <thead><tr><th>Файл</th><th>Копия от</th><th>Размер</th><th>Действия</th></tr></thead>
+    <tbody id="backup-rows"></tbody>
+  </table></div>
+</section>
+
+<script>
+"use strict";
+// Минимальный клиент MCP Apps (SEP-1865, протокол 2026-01-26): JSON-RPC 2.0 поверх postMessage к хосту.
+// Встроен вместо @modelcontextprotocol/ext-apps, чтобы файл не делал внешних загрузок.
+const PROTOCOL = "2026-01-26";
+const host = window.parent;
+const pending = new Map();
+let nextId = 1;
+
+function request(method, params) {
+  const id = nextId++;
+  host.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    setTimeout(() => { if (pending.delete(id)) reject(new Error("хост не ответил — нажми «Обновить»; если не помогает, открой панель заново")); }, 30000);
+  });
+}
+
+function notify(method, params) {
+  host.postMessage({ jsonrpc: "2.0", method, params }, "*");
+}
+
+window.addEventListener("message", (ev) => {
+  if (ev.source !== host) return;
+  const m = ev.data;
+  if (!m || m.jsonrpc !== "2.0") return;
+  if (m.id !== undefined && pending.has(m.id) && !m.method) {
+    const p = pending.get(m.id); pending.delete(m.id);
+    m.error ? p.reject(new Error(m.error.message || "ошибка хоста")) : p.resolve(m.result);
+  } else if (m.method === "ui/notifications/host-context-changed") {
+    applyContext(m.params);
+  } else if (m.method === "ui/resource-teardown" && m.id !== undefined) {
+    host.postMessage({ jsonrpc: "2.0", id: m.id, result: {} }, "*");
+  }
+});
+
+function applyContext(ctx) {
+  if (ctx && (ctx.theme === "light" || ctx.theme === "dark")) document.documentElement.dataset.theme = ctx.theme;
+}
+
+// ---------- вызовы инструментов ----------
+
+async function call(name, args) {
+  const res = await request("tools/call", { name, arguments: args || {} });
+  const text = (res.content || []).map((c) => c.text || "").join("\n");
+  if (res.isError) throw new Error(text.replace(/^Error executing tool \S+: /, "") || "ошибка инструмента " + name);
+  if (res.structuredContent) return res.structuredContent.result !== undefined && Object.keys(res.structuredContent).length === 1
+    ? res.structuredContent.result : res.structuredContent;
+  return JSON.parse(text);
+}
+
+let data = null;          // последний ответ panel_data
+let nonce = null, nonceAt = 0, keyAt = 0;
+const SAFETY = 60 * 1000; // обновляем код за минуту до истечения
+
+async function readTool(name, args) {
+  if (!data || Date.now() - keyAt > data.code_ttl * 1000 - SAFETY) await refresh({ quiet: true });
+  const r = await call(name, { key: data.key, ...args });
+  keyAt = Date.now();
+  return r;
+}
+
+async function mutate(name, args) {
+  if (!nonce || Date.now() - nonceAt > data.code_ttl * 1000 - SAFETY) await refresh({ quiet: true });
+  const code = nonce;
+  nonce = null; // код одноразовый — даже при ошибке берём новый
+  try {
+    return await call(name, { nonce: code, ...args });
+  } finally {
+    await refresh({ quiet: true, keepChanges: true }).catch(() => {});
+  }
+}
+
+// ---------- мелочи ----------
+
+const $ = (id) => document.getElementById(id);
+
+function el(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v === undefined || v === null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else if (k in e && typeof v !== "string") e[k] = v;
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const k of kids.flat()) if (k !== null && k !== undefined && k !== false) e.append(k instanceof Node ? k : String(k));
+  return e;
+}
+
+function td(v, cls) { return el("td", { class: cls, text: v === undefined || v === null || v === "" ? "—" : String(v) }); }
+function fmtTime(ts) { return ts ? new Date(ts * 1000).toLocaleString("ru-RU") : "—"; }
+function fmtSize(n) {
+  if (n < 1024) return n + " Б";
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " КБ";
+  return (n / 1024 / 1024).toFixed(1) + " МБ";
+}
+function setWhy(id, text) { const e = $(id); e.hidden = !text; e.textContent = text || ""; }
+function emptyRow(tbody, cols, text) { tbody.replaceChildren(el("tr", {}, el("td", { colspan: cols, class: "hint", text }))); }
+
+function showError(e) {
+  const box = $("error");
+  box.replaceChildren(el("h3", { text: "Не получилось" }), el("div", { text: e.message || String(e) }),
+    el("button", { type: "button", text: "Скрыть", onclick: () => { box.hidden = true; } }));
+  box.hidden = false;
+}
+
+function showChanges(done, diffLines) {
+  const box = $("changes");
+  const kids = [el("h3", { text: "Изменено" })];
+  if (done && done.length) kids.push(el("ul", {}, done.map((c) => el("li", { text: c }))));
+  if (diffLines && diffLines.length) {
+    kids.push(el("div", { class: "hint", text: "После перечитывания данных:" }));
+    kids.push(el("ul", {}, diffLines.map((c) => el("li", { text: c }))));
+  }
+  kids.push(el("button", { type: "button", text: "Скрыть", onclick: () => { box.hidden = true; } }));
+  box.replaceChildren(...kids);
+  box.hidden = false;
+}
+
+// Что поменялось между двумя ответами panel_data — для сообщения после изменения
+function dataDiff(a, b) {
+  const out = [];
+  if (!a || !b) return out;
+  const wa = new Map(a.workspaces.map((w) => [w.name, w])), wb = new Map(b.workspaces.map((w) => [w.name, w]));
+  for (const [n, w] of wb) {
+    const o = wa.get(n);
+    if (!o) { out.push(`проект ${n} добавлен`); changedNames.add(n); continue; }
+    const f = [];
+    for (const [k, label] of [["path", "путь"], ["mode", "режим"], ["description", "описание"], ["brief", "BRIEF"]])
+      if (o[k] !== w[k]) f.push(`${label}: ${o[k] || "(пусто)"} → ${w[k] || "(пусто)"}`);
+    if (JSON.stringify(o.deny) !== JSON.stringify(w.deny)) f.push(`маски: ${o.deny.length} → ${w.deny.length}`);
+    if (f.length) { out.push(`проект ${n}: ${f.join("; ")}`); changedNames.add(n); }
+  }
+  for (const n of wa.keys()) if (!wb.has(n)) out.push(`проект ${n} удалён из реестра`);
+  const sa = new Map(a.sessions.map((s) => [s.hid, s])), sb = new Map(b.sessions.map((s) => [s.hid, s]));
+  for (const [h, s] of sb) {
+    if (!sa.has(h)) out.push(`новая сессия: ${s.name} (${s.prefix}…)`);
+    else if (s.revoked && !sa.get(h).revoked) out.push(`сессия ${s.name} (${s.prefix}…) отозвана`);
+  }
+  for (const [h, s] of sa) if (!sb.has(h)) out.push(`сессия ${s.name} (${s.prefix}…) закрыта`);
+  const pa = new Set(a.processes.registered.map((p) => p.pid)), pb = new Set(b.processes.registered.map((p) => p.pid));
+  for (const p of pb) if (!pa.has(p)) out.push(`новый процесс сервера: pid ${p}`);
+  for (const p of pa) if (!pb.has(p)) out.push(`процесс pid ${p} завершился`);
+  return out;
+}
+const changedNames = new Set();
+
+// ---------- обновление ----------
+
+const statusEl = $("status"), refreshBtn = $("refresh");
+
+async function refresh(opts = {}) {
+  refreshBtn.disabled = true;
+  if (!opts.quiet) statusEl.textContent = "обновление…";
+  try {
+    const prev = data;
+    const next = await call("panel_data", {});
+    data = next;
+    nonce = next.nonce; nonceAt = Date.now(); keyAt = Date.now();
+    if (!opts.keepChanges) changedNames.clear();
+    const diff = dataDiff(prev, next);
+    lastDiff = diff;
+    if (prev && diff.length && !opts.keepChanges) showChanges([], diff);
+    renderAll();
+    statusEl.className = "";
+    statusEl.textContent = `обновлено ${new Date().toLocaleTimeString("ru-RU")}`;
+  } catch (e) {
+    statusEl.className = "err";
+    statusEl.textContent = "не удалось обновить";
+    showError(e);
+    throw e;
+  } finally {
+    refreshBtn.disabled = false;
+  }
+}
+let lastDiff = [];
+
+// Ошибку показываем в errorEl (например, под формой), иначе — общим блоком сверху
+async function runMutation(name, args, after, errorEl) {
+  $("error").hidden = true;
+  if (errorEl) errorEl.textContent = "";
+  try {
+    const before = data;
+    const res = await mutate(name, args);
+    auditLoaded = false;
+    showChanges(res.changes, dataDiff(before, data));
+    if (after) await after();
+    return res;
+  } catch (e) {
+    auditLoaded = false;
+    if (errorEl) errorEl.textContent = e.message; else showError(e);
+    renderAll();
+    return null;
+  }
+}
+
+function renderAll() {
+  renderOverview();
+  renderProjects();
+  renderSessions();
+  renderFormState();
+}
+
+// ---------- вкладки ----------
+
+let currentTab = "overview";
+for (const b of document.querySelectorAll("#tabs button")) {
+  b.addEventListener("click", () => {
+    currentTab = b.dataset.tab;
+    for (const x of document.querySelectorAll("#tabs button")) x.setAttribute("aria-selected", String(x === b));
+    for (const s of document.querySelectorAll("section[role=tabpanel]")) s.hidden = s.id !== "tab-" + currentTab;
+    if (currentTab === "audit" && !auditLoaded) loadAudit();
+    if (currentTab === "backups" && !backupProjects) loadBackups();
+  });
+}
+
+// ---------- Обзор ----------
+
+const ST = { ok: "OK", warn: "внимание", fail: "ошибка", info: "инфо" };
+
+function renderOverview() {
+  const rows = data.doctor.map((c) => el("tr", {},
+    td(c.title),
+    el("td", { class: "st st-" + c.status, text: ST[c.status] || c.status }),
+    el("td", { class: "mono" }, c.detail.map((l) => el("div", { text: l }))),
+    td(c.fix)));
+  $("doctor-rows").replaceChildren(...rows);
+
+  const pr = data.processes;
+  const procRows = pr.registered.map((p) => el("tr", { class: p.stale ? "changed" : null },
+    td(p.pid + (p.pid === data.pid ? " (эта панель)" : "")),
+    td(fmtTime(p.started)),
+    el("td", { class: "mono", text: (p.head || "?").slice(0, 8) + (p.stale ? " — устарел" : "") }),
+    td(p.handles),
+    td(p.last_call ? `${p.last_call.tool} · ${p.last_call.ts}${p.last_call.status === "error" ? " · ошибка" : ""}` : "")));
+  for (const p of pr.legacy)
+    procRows.push(el("tr", { class: "changed" }, td(p.pid), td(""), el("td", { text: "без run-файла — старая версия" }), td(""), td("")));
+  if (!procRows.length) emptyRow($("proc-rows"), 5, "Живых процессов wshub нет.");
+  else $("proc-rows").replaceChildren(...procRows);
+
+  const stale = pr.registered.filter((p) => p.stale).length + pr.legacy.length;
+  const box = $("stale");
+  box.hidden = !stale;
+  if (stale) box.replaceChildren(el("h3", { text: "Код новее запущенного — перезапусти Desktop" }),
+    el("div", { text: `Процессов со старым кодом: ${stale}. HEAD на диске: ${(pr.head_disk || "?").slice(0, 8)}. ` +
+      "Закрой Claude Desktop полностью (из трея) и запусти снова — процессы возьмут новый код." }));
+}
+
+// ---------- Проекты ----------
+
+function renderProjects() {
+  $("reg-path").textContent = "Реестр: " + data.registry_path;
+  const err = $("reg-error");
+  err.hidden = !data.registry_error;
+  err.textContent = data.registry_error || "";
+  $("add-project").disabled = !!data.registry_error;
+  setWhy("add-why", data.registry_error ? "в реестре ошибка — исправь файл, затем «Обновить»." : "");
+  const d = data.defaults || {};
+  $("defaults").textContent = d.deny ? `Общие маски из [defaults] (действуют во всех проектах): ${d.deny.join(", ") || "нет"} · ` +
+    `чтение ≤ ${d.max_read_kb} КБ · хэндл живёт ${d.ttl_hours} ч` : "";
+  if (!data.workspaces.length) { emptyRow($("project-rows"), 7, "Реестр пуст. Нажми «Добавить проект»."); return; }
+  $("project-rows").replaceChildren(...data.workspaces.map((w) => el("tr", { class: changedNames.has(w.name) ? "changed" : null },
+    td(w.name),
+    td(w.mode),
+    el("td", { class: "mono" }, w.path, w.path_ok ? null : el("div", { class: "err", text: "папки нет — исправь путь или удали проект" })),
+    td(w.description),
+    el("td", { class: "mono" }, w.brief || "—", w.brief ? el("div", { class: "hint", text: w.brief_exists ? "файл есть" : "файла нет" }) : null),
+    el("td", { class: "mono", text: w.deny.join(", ") || "—" }),
+    el("td", {}, el("div", { class: "actions" },
+      el("button", { type: "button", text: "Изменить", onclick: () => openForm(w) }),
+      el("button", { type: "button", class: "danger", text: "Удалить", onclick: () => askDelete(w) }))))));
+}
+
+function askDelete(w) {
+  const box = $("confirm-delete");
+  box.replaceChildren(
+    el("h3", { text: `Удалить проект ${w.name} из реестра?` }),
+    el("div", { text: `Папка ${w.path} и файлы не трогаются. Открытые хэндлы проекта перестанут работать. Прежняя версия реестра сохранится в registry-history.` }),
+    el("div", { class: "actions", style: "margin-top:6px" },
+      el("button", { type: "button", class: "danger", text: `Да, удалить ${w.name}`, onclick: async () => {
+        box.hidden = true;
+        if (form.editing === w.name) closeForm();
+        await runMutation("panel_delete_workspace", { rev: data.rev, name: w.name });
+      } }),
+      el("button", { type: "button", text: "Отмена", onclick: () => { box.hidden = true; } })));
+  box.hidden = false;
+  box.scrollIntoView({ block: "nearest" });
+}
+
+// ----- форма проекта -----
+
+const form = { editing: null, masks: [] };
+const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
+
+function openForm(w) {
+  form.editing = w ? w.name : null;
+  $("form-title").textContent = w ? `Изменить проект ${w.name}` : "Новый проект";
+  $("f-name").value = w ? w.name : "";
+  $("f-path").value = w ? w.path : "";
+  for (const r of document.querySelectorAll("input[name=f-mode]")) r.checked = !!w && r.value === w.mode;
+  $("f-desc").value = w ? w.description : "";
+  $("f-brief").value = w ? w.brief : "";
+  form.masks = w ? [...w.deny] : [];
+  $("f-error").textContent = "";
+  $("f-preview-out").replaceChildren();
+  $("f-brief-state").textContent = "";
+  $("picker").hidden = true;
+  $("form").hidden = false;
+  renderMasks();
+  renderFormState();
+  checkBrief();
+  $("form").scrollIntoView({ block: "nearest" });
+}
+
+function closeForm() { $("form").hidden = true; form.editing = null; }
+
+function renderMasks() {
+  const box = $("f-masks");
+  if (!form.masks.length) { box.replaceChildren(el("div", { class: "hint", text: "Своих масок нет." })); return; }
+  box.replaceChildren(...form.masks.map((m, i) => el("div", { class: "mask-row" },
+    el("div", { class: "field" },
+      el("label", { for: "f-mask-" + i, text: `Маска ${i + 1}` }),
+      el("input", { type: "text", id: "f-mask-" + i, class: "mono", value: m, autocomplete: "off", spellcheck: "false",
+        oninput: (e) => { form.masks[i] = e.target.value; renderFormState(); } })),
+    el("button", { type: "button", text: "Убрать", "aria-label": `Убрать маску ${i + 1}`,
+      onclick: () => { form.masks.splice(i, 1); renderMasks(); renderFormState(); } }))));
+}
+
+function formValues() {
+  const mode = document.querySelector("input[name=f-mode]:checked");
+  return {
+    name: $("f-name").value.trim(), path: $("f-path").value.trim(), mode: mode ? mode.value : "",
+    description: $("f-desc").value.trim(), brief: $("f-brief").value.trim(), deny: form.masks.map((m) => m.trim()),
+  };
+}
+
+function renderFormState() {
+  if ($("form").hidden || !data) return;
+  const v = formValues();
+  const nameInput = $("f-name");
+  nameInput.disabled = !!form.editing;
+  $("f-name-hint").textContent = form.editing
+    ? "Неактивно: имя не меняется — к нему привязаны копии и журнал. Чтобы переименовать, удали проект и добавь заново."
+    : "Латиница, цифры и дефис; первый символ — буква или цифра.";
+  const brief = $("f-brief");
+  brief.disabled = !v.path;
+  $("f-brief-why").hidden = !!v.path;
+  $("roots").textContent = data.roots.join(" и ");
+  $("f-defaults").textContent = data.defaults && data.defaults.deny
+    ? `Плюс общие маски, они действуют всегда: ${data.defaults.deny.join(", ")}` : "";
+
+  const pv = !v.path ? "сначала укажи путь к папке проекта." : !v.deny.length ? "добавь хотя бы одну маску." : "";
+  $("f-preview").disabled = !!pv;
+  setWhy("f-preview-why", pv);
+
+  const missing = [];
+  if (!v.name) missing.push("имя");
+  if (!v.path) missing.push("путь");
+  if (!v.mode) missing.push("режим");
+  let why = missing.length ? `заполни: ${missing.join(", ")}.` : "";
+  if (!why && !form.editing && !NAME_RE.test(v.name)) why = "имя: только латиница, цифры и дефис, первый символ — буква или цифра.";
+  if (!why && v.deny.some((m) => !m)) why = "есть пустая маска — впиши её или нажми «Убрать».";
+  if (!why && data.registry_error) why = "в реестре ошибка — исправь файл вручную.";
+  $("f-save").disabled = !!why;
+  setWhy("f-save-why", why);
+}
+
+for (const id of ["f-name", "f-path", "f-desc"]) $(id).addEventListener("input", renderFormState);
+for (const r of document.querySelectorAll("input[name=f-mode]")) r.addEventListener("change", renderFormState);
+let briefTimer = null;
+for (const id of ["f-path", "f-brief"]) $(id).addEventListener("input", () => {
+  clearTimeout(briefTimer);
+  briefTimer = setTimeout(checkBrief, 400);
+});
+
+async function checkBrief() {
+  const v = formValues();
+  const out = $("f-brief-state");
+  if (!v.path || !v.brief) { out.textContent = v.path ? "BRIEF не задан — модель его не получит." : ""; out.className = "hint"; return; }
+  try {
+    const r = await readTool("panel_brief_check", { path: v.path, brief: v.brief });
+    out.textContent = r.text;
+    out.className = r.status === "ok" ? "hint st-ok" : r.status === "missing" ? "hint st-warn" : "hint err";
+  } catch (e) { out.textContent = e.message; out.className = "hint err"; }
+}
+
+$("add-project").addEventListener("click", () => openForm(null));
+$("f-cancel").addEventListener("click", closeForm);
+$("f-add-mask").addEventListener("click", () => {
+  form.masks.push("");
+  renderMasks(); renderFormState();
+  const last = $("f-mask-" + (form.masks.length - 1));
+  if (last) last.focus();
+});
+
+$("f-preview").addEventListener("click", async () => {
+  const v = formValues();
+  const out = $("f-preview-out");
+  out.replaceChildren(el("div", { class: "hint", text: "считаю…" }));
+  try {
+    const r = await readTool("panel_mask_preview", { path: v.path, masks: v.deny });
+    const kids = r.masks.map((m) => m.error
+      ? el("div", { class: "err", text: `Маска ${m.error}` })
+      : el("details", { open: true }, el("summary", { class: "mono", text: `${m.mask} — закрывает ${m.count}` + (m.count > m.sample.length ? `, показаны первые ${m.sample.length}` : "") }),
+        m.sample.length ? el("ul", { class: "mono" }, m.sample.map((s) => el("li", { text: s }))) : el("div", { class: "hint", text: "ни один файл не подходит — проверь маску" })));
+    if (r.stopped) kids.push(el("div", { class: "hint st-warn", text: r.stopped === "timeout"
+      ? "Обход остановлен по времени (5 с) — числа неполные." : "Обход остановлен на 200 000 записях — числа неполные." }));
+    kids.push(el("div", { class: "hint", text: `Просмотрено записей: ${r.scanned}. Каталог под маской показан одной строкой «папка/».` }));
+    out.replaceChildren(...kids);
+  } catch (e) { out.replaceChildren(el("div", { class: "err", text: e.message })); }
+});
+
+$("f-save").addEventListener("click", async () => {
+  const v = formValues();
+  $("f-save").disabled = true;
+  const res = await runMutation("panel_save_workspace", { rev: data.rev, create: !form.editing, ...v,
+    name: form.editing || v.name }, null, $("f-error"));
+  if (res) { changedNames.add(form.editing || v.name); closeForm(); renderProjects(); }
+  else renderFormState();
+});
+
+// ----- выбор папки -----
+
+const picker = { path: "", parent: null };
+
+async function browse(path) {
+  $("pk-msg").textContent = "загрузка…";
+  try {
+    const r = await readTool("panel_browse", { path });
+    picker.path = r.path; picker.parent = r.parent;
+    $("pk-path").textContent = r.path || "(корни)";
+    $("pk-up").disabled = !r.parent;
+    $("pk-choose").disabled = !r.path || !!r.protected;
+    setWhy("pk-why", !r.path ? "выбери один из корней ниже." : r.protected ? `папка пересекается со служебным каталогом wshub ${r.protected}.` : "");
+    $("pk-msg").textContent = r.truncated ? "Показаны первые 1000 папок." : (r.dirs.length ? "" : "Вложенных папок нет.");
+    $("pk-list").replaceChildren(...(r.path && !r.parent ? [el("button", { type: "button", text: "↑ к списку корней", onclick: () => browse("") })] : []),
+      ...r.dirs.map((d) => el("button", { type: "button", class: "mono", text: d.name + "/", onclick: () => browse(d.path) })));
+  } catch (e) { $("pk-msg").textContent = e.message; $("pk-msg").className = "hint err"; return; }
+  $("pk-msg").className = "hint";
+}
+
+$("f-browse").addEventListener("click", () => {
+  $("picker").hidden = false;
+  const cur = $("f-path").value.trim();
+  browse(cur && data.roots.some((r) => cur === r || cur.startsWith(r.replace(/\/$/, "") + "/")) ? cur : "");
+});
+$("pk-up").addEventListener("click", () => picker.parent && browse(picker.parent));
+$("pk-close").addEventListener("click", () => { $("picker").hidden = true; });
+$("pk-choose").addEventListener("click", () => {
+  $("f-path").value = picker.path;
+  $("picker").hidden = true;
+  renderFormState();
+  checkBrief();
+});
+
+// ---------- Сессии ----------
+
+function renderSessions() {
+  if (!data.sessions.length) { emptyRow($("session-rows"), 8, "Открытых хэндлов нет."); return; }
+  $("session-rows").replaceChildren(...data.sessions.map((s) => el("tr", {},
+    td(s.name), td(s.mode), td(s.prefix + "…", "mono"), td(s.pid), td(fmtTime(s.opened)), td(fmtTime(s.expires)),
+    td(s.revoked ? "отозван, процесс ещё не обработал" : "действует"),
+    el("td", {}, el("button", { type: "button", class: "danger", text: "Отозвать", disabled: s.revoked,
+      title: s.revoked ? "Уже отозван" : null, onclick: () => askRevoke(s) }),
+      s.revoked ? el("div", { class: "hint why", text: "уже отозван." }) : null))));
+}
+
+function askRevoke(s) {
+  const box = $("confirm-revoke");
+  box.replaceChildren(el("h3", { text: `Отозвать хэндл ${s.prefix}… проекта ${s.name}?` }),
+    el("div", { text: "Следующий вызов с этим хэндлом получит отказ. Модель не должна открывать проект заново без твоей просьбы." }),
+    el("div", { class: "actions", style: "margin-top:6px" },
+      el("button", { type: "button", class: "danger", text: "Да, отозвать", onclick: async () => {
+        box.hidden = true;
+        await runMutation("panel_revoke", { hid: s.hid });
+      } }),
+      el("button", { type: "button", text: "Отмена", onclick: () => { box.hidden = true; } })));
+  box.hidden = false;
+}
+
+// ---------- Журнал ----------
+
+let auditLoaded = false, auditRecs = [];
+
+async function loadAudit() {
+  $("a-count").textContent = "загрузка…";
+  try {
+    const r = await readTool("panel_audit", {});
+    auditRecs = r.records; auditLoaded = true;
+    fillSelect($("a-ws"), "все проекты", [...new Set(auditRecs.map((x) => x.ws).filter(Boolean))].sort());
+    fillSelect($("a-tool"), "все инструменты", [...new Set(auditRecs.map((x) => x.tool).filter(Boolean))].sort());
+    renderAudit();
+  } catch (e) { $("a-count").textContent = e.message; }
+}
+
+function fillSelect(sel, allLabel, values) {
+  const cur = sel.value;
+  sel.replaceChildren(el("option", { value: "", text: allLabel }), ...values.map((v) => el("option", { value: v, text: v })));
+  if (values.includes(cur)) sel.value = cur;
+}
+
+function renderAudit() {
+  const ws = $("a-ws").value, tool = $("a-tool").value, onlyErr = $("a-err").checked;
+  const rows = auditRecs.filter((r) => (!ws || r.ws === ws) && (!tool || r.tool === tool) && (!onlyErr || r.status === "error"));
+  $("a-count").textContent = `Показано ${rows.length} из ${auditRecs.length} последних записей.`;
+  if (!rows.length) { emptyRow($("audit-rows"), 5, "Записей нет."); return; }
+  $("audit-rows").replaceChildren(...rows.map((r) => el("tr", {},
+    td((r.ts || "").replace("T", " ")), td(r.tool), td(r.ws), td(r.path, "mono"),
+    el("td", { class: r.status === "error" ? "err" : null, text: r.status === "error" ? "ошибка: " + (r.error || "") : "ok" }))));
+}
+
+for (const id of ["a-ws", "a-tool", "a-err"]) $(id).addEventListener("change", renderAudit);
+$("a-reload").addEventListener("click", loadAudit);
+
+// ---------- Копии ----------
+
+let backupProjects = null, backupItems = [], backupInfo = null;
+
+async function loadBackups() {
+  const project = $("b-ws").value;
+  $("b-note").textContent = "загрузка…";
+  try {
+    const r = await readTool("panel_backups", { project });
+    backupProjects = r.projects;
+    const sel = $("b-ws");
+    sel.replaceChildren(el("option", { value: "", text: "— выбери проект —", disabled: true }),
+      ...r.projects.map((p) => el("option", { value: p, text: p })));
+    sel.value = r.projects.includes(project) ? project : "";
+    backupItems = r.items; backupInfo = r;
+    renderBackups();
+  } catch (e) { $("b-note").textContent = e.message; $("b-note").className = "hint err"; return; }
+  $("b-note").className = "hint";
+}
+
+function renderBackups() {
+  const project = $("b-ws").value;
+  $("b-file").disabled = !project;
+  $("b-file-why").hidden = !!project;
+  if (!project) { $("b-note").textContent = backupProjects && !backupProjects.length ? "Копий пока нет." : ""; emptyRow($("backup-rows"), 4, "Выбери проект."); return; }
+  const q = $("b-file").value.trim().toLowerCase();
+  const items = backupItems.filter((b) => !q || b.rel.toLowerCase().includes(q));
+  const noReg = backupInfo && backupInfo.in_registry === false;
+  $("b-note").textContent = noReg ? `Проекта ${project} нет в реестре: копии видны, но сравнивать и восстанавливать не с чем.` :
+    `Копий: ${backupItems.length}. Восстановление сначала копирует текущую версию и пишется в журнал.`;
+  if (!items.length) { emptyRow($("backup-rows"), 4, backupItems.length ? "Нет файлов по фильтру." : "Копий нет."); return; }
+  const why = (b) => b.denied ? "файл под deny — не открывается." : noReg ? "проекта нет в реестре." : "";
+  $("backup-rows").replaceChildren(...items.map((b) => el("tr", {},
+    td(b.rel, "mono"), td(b.stamp.replace(/^(\d{4})(\d\d)(\d\d)-(\d\d)(\d\d)(\d\d)$/, "$3.$2.$1 $4:$5:$6")), td(fmtSize(b.size)),
+    el("td", {}, el("div", { class: "actions" },
+      el("button", { type: "button", text: "Сравнить с текущей", disabled: !!why(b), onclick: () => showDiff(project, b) }),
+      el("button", { type: "button", class: "danger", text: "Восстановить", disabled: !!why(b), onclick: () => askRestore(project, b) })),
+      why(b) ? el("div", { class: "hint why", text: why(b) }) : null))));
+}
+
+async function showDiff(project, b) {
+  const out = $("b-diff");
+  out.replaceChildren(el("div", { class: "hint", text: "сравниваю…" }));
+  try {
+    const r = await readTool("panel_backup_diff", { project, backup: b.id });
+    const head = el("h3", { text: `${r.rel}: копия ${b.stamp} → ${r.current_exists ? "текущая версия" : "файла сейчас нет"}` });
+    const kids = [head];
+    if (r.note) kids.push(el("div", { class: "hint", text: r.note }));
+    if (r.same) kids.push(el("div", { class: "st-ok", text: "Копия совпадает с текущей версией." }));
+    else if (r.diff !== null && r.diff !== undefined) kids.push(el("pre", { class: "diff" }, r.diff.split("\n").map((l) =>
+      el("span", { class: l.startsWith("@@") || l.startsWith("---") || l.startsWith("+++") ? "h" : l.startsWith("+") ? "a" : l.startsWith("-") ? "d" : null, text: l || " " }))));
+    kids.push(el("button", { type: "button", text: "Закрыть сравнение", onclick: () => out.replaceChildren() }));
+    out.replaceChildren(el("div", { class: "box" }, kids));
+  } catch (e) { out.replaceChildren(el("div", { class: "box err", text: e.message })); }
+}
+
+function askRestore(project, b) {
+  const box = $("confirm-restore");
+  box.replaceChildren(el("h3", { text: `Восстановить ${b.rel} из копии ${b.stamp}?` }),
+    el("div", { text: "Текущая версия файла сначала будет скопирована (её тоже можно будет восстановить). Действие попадёт в журнал." }),
+    el("div", { class: "actions", style: "margin-top:6px" },
+      el("button", { type: "button", class: "danger", text: "Да, восстановить", onclick: async () => {
+        box.hidden = true;
+        await runMutation("panel_restore", { project, backup: b.id }, async () => { await loadBackups(); auditLoaded = false; });
+      } }),
+      el("button", { type: "button", text: "Отмена", onclick: () => { box.hidden = true; } })));
+  box.hidden = false;
+}
+
+$("b-ws").addEventListener("change", () => { $("b-file").value = ""; $("b-diff").replaceChildren(); loadBackups(); });
+$("b-file").addEventListener("input", renderBackups);
+$("b-reload").addEventListener("click", loadBackups);
+
+// ---------- старт ----------
+
+refreshBtn.addEventListener("click", () => {
+  $("changes").hidden = true;
+  refresh().then(() => {
+    if (currentTab === "audit") loadAudit(); else auditLoaded = false;
+    if (currentTab === "backups") loadBackups();
+  }).catch(() => {});
+});
+
+new ResizeObserver(() => notify("ui/notifications/size-changed", { height: document.documentElement.scrollHeight }))
+  .observe(document.body);
+
+(async () => {
+  try {
+    const init = await request("ui/initialize", {
+      protocolVersion: PROTOCOL,
+      appInfo: { name: "wshub-panel", version: "0.2.0" },
+      appCapabilities: {},
+    });
+    applyContext(init && init.hostContext);
+    notify("ui/notifications/initialized", {});
+  } catch (e) {
+    statusEl.className = "err";
+    statusEl.textContent = "хост не ответил на ui/initialize — закрой и снова открой панель";
+    return;
+  }
+  refresh().catch(() => {});
+})();
+</script>
+</body>
+</html>

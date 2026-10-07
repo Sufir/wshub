@@ -21,6 +21,7 @@ from pathlib import Path
 from .extract import EXTRACTABLE
 from .policy import Policy, glob_match
 from .registry import MODES, RegistryFile, Workspace
+from .runtime import Runtime, handle_id
 
 HOME = Path.home()
 DEFAULT_CONFIG = HOME / ".config/wshub/workspaces.toml"
@@ -39,6 +40,8 @@ LINE_MAX = 300  # длина строки в выдаче grep
 NTFS_ROOT = Path("/mnt")  # под ним «:» в имени — это поток NTFS
 
 REOPEN = "хэндл ws неизвестен или истёк — вызови workspace_open заново"
+REVOKED = ("хэндл ws отозван пользователем в панели wshub; не открывай проект заново, "
+           "пока пользователь не попросит")
 
 _UMASK = os.umask(0)
 os.umask(_UMASK)
@@ -54,6 +57,8 @@ class Handle:
     mode: str
     root: Path
     expires: float
+    hid: str = ""
+    opened: float = 0.0
 
 
 @dataclass
@@ -131,6 +136,7 @@ class Hub:
         self.clock = clock
         self.rg = shutil.which("rg")  # None → питоновский обход
         self.protected = self._protected_paths(Path(config).parent)
+        self.runtime = Runtime(self.state_dir, clock=clock)
 
     # ---------- самозащита, хэндлы, пути ----------
 
@@ -145,6 +151,22 @@ class Hub:
             ps.append(Path(sys.prefix))
         return [p.resolve() for p in ps]
 
+    def protected_overlap(self, root: Path) -> Path | None:
+        """Служебный каталог wshub, с которым пересекается root (внутри или снаружи), или None."""
+        for p in self.protected:
+            if p.is_relative_to(root) or root.is_relative_to(p):
+                return p
+        return None
+
+    def handles_info(self) -> list[dict]:
+        """Живые хэндлы без токенов — для run-файла и панели."""
+        now = self.clock()
+        return [{"hid": h.hid, "prefix": t[:4], "name": h.name, "mode": h.mode, "opened": h.opened,
+                 "expires": h.expires} for t, h in self.handles.items() if now < h.expires]
+
+    def publish(self) -> None:
+        self.runtime.publish(self.handles_info())
+
     def _session(self, token: str) -> Session:
         h = self.handles.get(token) if isinstance(token, str) else None
         if h is None:
@@ -152,6 +174,9 @@ class Hub:
         if self.clock() >= h.expires:
             del self.handles[token]
             raise WsError(REOPEN)
+        if h.hid in self.runtime.revoked():
+            del self.handles[token]
+            raise WsError(REVOKED)
         reg = self.registry.get()
         ws = reg.workspaces.get(h.name)
         # проект убрали из реестра или сменили ему путь — старый хэндл больше не действует
@@ -232,6 +257,8 @@ class Hub:
             self._write_audit(rec)
 
     def _write_audit(self, rec: dict) -> None:
+        self.runtime.last_call = {k: rec.get(k) for k in ("ts", "tool", "ws", "status")}
+        self.publish()
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             with self.audit_path.open("a", encoding="utf-8") as f:
@@ -249,6 +276,17 @@ class Hub:
             return "\n".join(f"{w.name} [{w.mode}] — {w.description or '(без описания)'}"
                              for w in reg.workspaces.values())
 
+    def panel_data(self) -> dict:
+        """Данные для панели: проекты из реестра и число живых хэндлов. Ничего не меняет."""
+        with self._audit("panel_data"):
+            reg = self.registry.get()
+            now = self.clock()
+            return {
+                "workspaces": [{"name": w.name, "mode": w.mode, "path": str(w.path)}
+                               for w in reg.workspaces.values()],
+                "open_handles": sum(1 for h in self.handles.values() if now < h.expires),
+            }
+
     def workspace_open(self, name: str, mode: str = "ro") -> str:
         with self._audit("workspace_open") as rec:
             rec["ws"] = name
@@ -264,14 +302,14 @@ class Hub:
             root = ws.path.resolve()
             if not root.is_dir():
                 raise WsError(f"папка проекта не найдена: {ws.path}")
-            for p in self.protected:
-                if p.is_relative_to(root) or root.is_relative_to(p):
-                    raise WsError(f"отказ: проект {root} пересекается со служебным каталогом wshub {p}")
+            p = self.protected_overlap(root)
+            if p is not None:
+                raise WsError(f"отказ: проект {root} пересекается со служебным каталогом wshub {p}")
             now = self.clock()
             for t in [t for t, h in self.handles.items() if now >= h.expires]:
                 del self.handles[t]
             token = secrets.token_urlsafe(18)
-            h = Handle(name, mode, root, now + reg.ttl_hours * 3600)
+            h = Handle(name, mode, root, now + reg.ttl_hours * 3600, handle_id(token), now)
             self.handles[token] = h
             s = Session(ws, root, mode, Policy(ws.deny), reg.max_read_kb * 1024)
             until = datetime.fromtimestamp(h.expires).strftime("%Y-%m-%d %H:%M")

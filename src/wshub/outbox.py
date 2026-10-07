@@ -20,7 +20,8 @@ from pathlib import Path
 
 from .runtime import atomic_write_text
 
-MNT = Path("/mnt")
+# где смонтированы диски Windows; WSHUB_MNT — только для тестов и нестандартного automount.root
+MNT = Path(os.environ.get("WSHUB_MNT") or "/mnt")
 STAGE_RE = re.compile(r"^\d{8}-\d{6}-[a-z0-9]{6}$")
 STAGE_ALPHABET = string.ascii_lowercase + string.digits
 PARTIAL = ".partial"

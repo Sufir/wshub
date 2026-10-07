@@ -146,7 +146,7 @@
   </form>
   <h2>Процессы сервера</h2>
   <div class="wrap"><table>
-    <thead><tr><th>PID</th><th>Старт</th><th>Код (HEAD)</th><th>Хэндлов</th><th>Последний вызов</th></tr></thead>
+    <thead><tr><th>PID</th><th>Старт</th><th>Код</th><th>Хэндлов</th><th>Последний вызов</th></tr></thead>
     <tbody id="proc-rows"></tbody>
   </table></div>
 </section>
@@ -525,7 +525,7 @@ function renderOverview() {
   const box = $("stale");
   box.hidden = !stale;
   if (stale) box.replaceChildren(el("h3", { text: "Код новее запущенного — перезапусти Desktop" }),
-    el("div", { text: `Процессов со старым кодом: ${stale}. HEAD на диске: ${(pr.head_disk || "?").slice(0, 8)}. ` +
+    el("div", { text: `Процессов со старым кодом: ${stale}. Код на диске: ${(pr.head_disk || "?").slice(0, 8)}. ` +
       "Закрой Claude Desktop полностью (из трея) и запусти снова — процессы возьмут новый код." }));
 }
 

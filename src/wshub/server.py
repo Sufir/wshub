@@ -30,7 +30,7 @@ APP_MIME = "text/html;profile=mcp-app"
 PANEL_META = {"ui": {"resourceUri": PANEL_URI}, "ui/resourceUri": PANEL_URI}
 APP_ONLY_META = {"ui": {"visibility": ["app"]}}
 # Изменяют реестр или состояние: только для панели и только с одноразовым кодом из panel_data
-MUTATING = {"panel_save_workspace", "panel_delete_workspace", "panel_revoke", "panel_restore"}
+MUTATING = {"panel_save_workspace", "panel_delete_workspace", "panel_save_limits", "panel_revoke", "panel_restore"}
 
 
 def build_server(hub: Hub, panel: Panel | None = None) -> FastMCP:
@@ -126,9 +126,10 @@ def build_server(hub: Hub, panel: Panel | None = None) -> FastMCP:
         return ops.mask_preview(key, path, masks)
 
     @app_tool
-    def panel_audit(key: str) -> dict[str, Any]:
-        """Последние 500 записей журнала. Только для панели."""
-        return ops.audit(key)
+    def panel_audit(key: str, cursor: str = "", limit: int = 100, ws: str = "", tool: str = "",
+                    only_errors: bool = False, only_changes: bool = False) -> dict[str, Any]:
+        """Страница журнала (текущий файл и архивы), новые первыми; cursor — для «Показать ещё». Только для панели."""
+        return ops.audit(key, cursor, limit, ws, tool, only_errors, only_changes)
 
     @app_tool
     def panel_backups(key: str, project: str = "") -> dict[str, Any]:
@@ -146,6 +147,11 @@ def build_server(hub: Hub, panel: Panel | None = None) -> FastMCP:
         """Добавить или изменить проект в реестре. Только для панели, с одноразовым кодом."""
         return ops.save_workspace(nonce, name=name, path=path, mode=mode, description=description,
                                     brief=brief, deny=deny, rev=rev, create=create)
+
+    @app_tool
+    def panel_save_limits(nonce: str, rev: str, values: dict[str, Any]) -> dict[str, Any]:
+        """Изменить лимиты журнала и копий ([limits] в реестре). Только для панели, с одноразовым кодом."""
+        return ops.save_limits(nonce, values=values, rev=rev)
 
     @app_tool
     def panel_delete_workspace(nonce: str, rev: str, name: str) -> dict[str, Any]:
@@ -188,6 +194,7 @@ def main(argv: list[str] | None = None) -> None:
     hub = Hub(config, state)
     hub.runtime.start()
     hub.publish()
+    hub.maybe_cleanup()  # старые копии: при старте и не чаще раза в сутки
     build_server(hub).run()
 
 

@@ -7,15 +7,21 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from .registry import RegistryError, parse
+from . import housekeeping
+from .registry import LIMITS, Limits, RegistryError, parse
 from .runtime import git_head, live_processes, pid_alive, proc_start, repo_dir
 
-AUDIT_WARN = 50 * 1024 * 1024
 BACKUP_WARN = 1024 * 1024 * 1024
+if sys.version_info >= (3, 11):
+    import tomllib
+else:  # pragma: no cover
+    import tomli as tomllib
+
 SKIP_USERS = {"Default", "Default User", "Public", "All Users", "WsiAccount", "desktop.ini"}
 
 
@@ -315,33 +321,58 @@ def check_processes(ctx: Ctx, procs: dict) -> dict:
     return _check("procs", title, "ok", lines)
 
 
-def check_storage(ctx: Ctx) -> list[dict]:
-    audit = ctx.state / "audit.jsonl"
-    try:
-        size = audit.stat().st_size
-    except FileNotFoundError:
-        res = [_check("audit", "Журнал", "info", f"журнала ещё нет: {audit}")]
-    else:
-        st = "warn" if size > AUDIT_WARN else "ok"
-        res = [_check("audit", "Журнал", st, f"{audit}: {human_size(size)}",
-                      "журнал большой — перенеси audit.jsonl в архив, сервер начнёт новый" if st == "warn" else "")]
+def storage(ctx: Ctx, reg) -> dict:
+    """Размеры журнала и копий и действующие лимиты — для doctor и вкладки «Обзор»."""
+    has_section = False
+    if reg is not None:
+        try:
+            has_section = "limits" in tomllib.loads(ctx.config.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+    lim = reg.limits if reg is not None else Limits()
     backup = ctx.state / "backup"
-    if backup.is_dir():
-        size, count = _tree_size(backup)
-        st = "warn" if size > BACKUP_WARN else "ok"
-        res.append(_check("backup", "Копии", st, f"{backup}: {human_size(size)}, файлов {count}",
-                          "копий много — удали старые папки в backup/<проект>/" if st == "warn" else ""))
+    size, count = _tree_size(backup) if backup.is_dir() else (0, 0)
+    return {"limits": {k: getattr(lim, k) for k in LIMITS},
+            "limit_labels": {k: label for k, (_d, label) in LIMITS.items()},
+            "limits_source": "реестр, [limits]" if has_section else
+            ("по умолчанию: секции [limits] нет" if reg is not None else "по умолчанию: реестр не прочитан"),
+            "journal": housekeeping.journal_stats(ctx.state),
+            "backup": {"path": str(backup), "exists": backup.is_dir(), "bytes": size, "files": count},
+            "last_cleanup": housekeeping.last_cleanup(ctx.state)}
+
+
+def check_storage(st: dict) -> list[dict]:
+    lim, j, b = st["limits"], st["journal"], st["backup"]
+    lines = [f"{j['path']}: {human_size(j['current_bytes'])} из {lim['journal_max_mb']} МБ — больше уходит в архив",
+             f"архивов: {j['archives']} из {lim['journal_keep_files']}"
+             + (f", {human_size(j['archives_bytes'])}" if j["archives"] else "")]
+    st_j = "ok" if j["current_bytes"] or j["archives"] else "info"
+    res = [_check("audit", "Журнал", st_j, lines if st_j == "ok" else [f"журнала ещё нет: {j['path']}"] + lines[1:])]
+    lc = st["last_cleanup"]
+    when = (datetime.fromtimestamp(lc["ts"]).strftime("%Y-%m-%d %H:%M") + f", удалено копий: {lc.get('deleted', 0)}"
+            if lc and isinstance(lc.get("ts"), (int, float)) else "ещё не было")
+    rule = (f"хранение: копия удаляется, если она старше {lim['backup_keep_days']} дн. и у файла есть "
+            f"≥ {lim['backup_keep_per_file']} более новых копий; последняя не удаляется никогда")
+    if b["exists"]:
+        warn = b["bytes"] > BACKUP_WARN
+        res.append(_check("backup", "Копии", "warn" if warn else "ok",
+                          [f"{b['path']}: {human_size(b['bytes'])}, файлов {b['files']}", rule,
+                           f"последняя очистка: {when}"],
+                          "копий много — уменьши лимиты хранения на вкладке «Обзор»" if warn else ""))
     else:
-        res.append(_check("backup", "Копии", "info", f"копий ещё нет: {backup}"))
+        res.append(_check("backup", "Копии", "info", [f"копий ещё нет: {b['path']}", rule]))
+    res.append(_check("limits", "Лимиты", "ok" if st["limits_source"].startswith("реестр") else "info",
+                      [f"{k} = {v} ({LIMITS[k][1]})" for k, v in lim.items()] + [f"источник: {st['limits_source']}"]))
     return res
 
 
 def run(ctx: Ctx) -> dict:
     reg_check, reg = check_registry(ctx)
     procs = processes(ctx)
+    st = storage(ctx, reg)
     checks = [check_rg(), check_tomlkit(), reg_check, check_paths(ctx, reg), check_desktop(ctx),
-              check_processes(ctx, procs), *check_storage(ctx)]
-    return {"checks": checks, "processes": procs}
+              check_processes(ctx, procs), *check_storage(st)]
+    return {"checks": checks, "processes": procs, "storage": st}
 
 
 STATUS = {"ok": "OK  ", "warn": "ВНИМ", "fail": "ОШИБ", "info": "инфо"}

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Callable
 
 from .policy import glob_regex
-from .registry import MODES, RegistryError, parse
+from .registry import LIMITS, MODES, RegistryError, is_limit, parse
 
 NEW_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9-]*$")
 DESC_MAX = 300
@@ -205,6 +205,42 @@ class RegistryEditor:
                     arr[i] = m
         out = [f"deny +{m}" for m in added] + [f"deny −{m}" for m in removed]
         return out or ["deny: порядок масок"]
+
+    def save_limits(self, *, values, rev) -> list[str]:
+        """Секция [limits]: каждое значение — целое число больше 0. Ключи, равные текущим, не трогаются."""
+        tomlkit, doc, old_text = self._load(rev)
+        if not isinstance(values, dict):
+            raise EditError("лимиты не заданы — заполни форму")
+        errs, clean = [], {}
+        for k in set(values) - set(LIMITS):
+            errs.append(f"неизвестный лимит {k}")
+        for k, (_default, label) in LIMITS.items():
+            v = values.get(k)
+            if isinstance(v, str) and re.fullmatch(r"\s*\d+\s*", v):
+                v = int(v)
+            if v is None or v == "":
+                errs.append(f"{label}: не заполнено — впиши целое число больше 0")
+            elif not is_limit(v):
+                errs.append(f"{label}: «{v}» — нужно целое число больше 0")
+            else:
+                clean[k] = v
+        if errs:
+            raise EditError("; ".join(errs))
+        t = doc.get("limits")
+        changes = []
+        for k, (default, label) in LIMITS.items():
+            old = t.get(k, default) if t is not None else default
+            if int(old) == clean[k]:
+                continue
+            if t is None:
+                t = tomlkit.table()
+                doc["limits"] = t
+            t[k] = clean[k]
+            changes.append(f"лимиты: {label}: {old} → {clean[k]}")
+        if not changes:
+            return ["изменений нет"]
+        self._commit(old_text, tomlkit.dumps(doc))
+        return changes
 
     def delete(self, *, name, rev) -> list[str]:
         tomlkit, doc, old_text = self._load(rev)

@@ -20,7 +20,8 @@ from pathlib import Path
 
 from .extract import EXTRACTABLE
 from .policy import Policy, glob_match
-from .registry import MODES, RegistryFile, Workspace
+from . import housekeeping
+from .registry import MODES, Limits, RegistryError, RegistryFile, Workspace
 from .runtime import Runtime, handle_id
 
 HOME = Path.home()
@@ -137,6 +138,7 @@ class Hub:
         self.rg = shutil.which("rg")  # None → питоновский обход
         self.protected = self._protected_paths(Path(config).parent)
         self.runtime = Runtime(self.state_dir, clock=clock)
+        self._next_cleanup = 0.0  # раньше этого времени очистку копий не проверяем
 
     # ---------- самозащита, хэндлы, пути ----------
 
@@ -259,12 +261,49 @@ class Hub:
     def _write_audit(self, rec: dict) -> None:
         self.runtime.last_call = {k: rec.get(k) for k in ("ts", "tool", "ws", "status")}
         self.publish()
+        self._append_journal(rec)
+
+    def _append_journal(self, rec: dict) -> None:
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             with self.audit_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            lim = self.limits()
+            housekeeping.rotate_if_needed(self.state_dir, lim.journal_max_mb * 1024 * 1024,
+                                          lim.journal_keep_files, self.clock())
         except OSError as e:
             print(f"wshub: не удалось записать журнал: {e}", file=sys.stderr)
+
+    def limits(self) -> Limits:
+        """[limits] из реестра; реестра нет или в нём ошибка — значения по умолчанию."""
+        try:
+            return self.registry.get().limits
+        except (RegistryError, OSError):
+            return Limits()
+
+    def maybe_cleanup(self) -> dict | None:
+        """Очистка старых копий: при старте сервера и потом не чаще раза в сутки (на все процессы).
+        Что удалено — одной записью в журнале."""
+        now = self.clock()
+        if now < self._next_cleanup:
+            return None
+        self._next_cleanup = now + housekeeping.CLEANUP_EVERY
+        lim = self.limits()
+        try:
+            res = housekeeping.cleanup_if_due(self.state_dir, self.backup_dir, lim.backup_keep_days,
+                                              lim.backup_keep_per_file, now)
+        except OSError as e:
+            print(f"wshub: очистка копий не удалась: {e}", file=sys.stderr)
+            return None
+        if res and res["deleted"]:
+            n = len(res["deleted"])
+            self._append_journal({
+                "ts": datetime.now().astimezone().isoformat(timespec="seconds"), "tool": "backup_cleanup",
+                "ws": None, "path": None, "status": "ok", "deleted": n, "freed": res["freed"],
+                "files": res["deleted"][:housekeeping.CLEANUP_LIST_MAX],
+                "files_truncated": n > housekeeping.CLEANUP_LIST_MAX,
+                "rule": f"старше {lim.backup_keep_days} дн. и есть ≥ {lim.backup_keep_per_file} более новых копий"})
+        return res
 
     # ---------- проекты ----------
 
@@ -277,15 +316,15 @@ class Hub:
                              for w in reg.workspaces.values())
 
     def panel_data(self) -> dict:
-        """Данные для панели: проекты из реестра и число живых хэндлов. Ничего не меняет."""
-        with self._audit("panel_data"):
-            reg = self.registry.get()
-            now = self.clock()
-            return {
-                "workspaces": [{"name": w.name, "mode": w.mode, "path": str(w.path)}
-                               for w in reg.workspaces.values()],
-                "open_handles": sum(1 for h in self.handles.values() if now < h.expires),
-            }
+        """Данные для панели: проекты из реестра и число живых хэндлов. Ничего не меняет и в журнал
+        не пишется: служебное чтение панели, иначе каждое открытие панели добавляло бы строку."""
+        reg = self.registry.get()
+        now = self.clock()
+        return {
+            "workspaces": [{"name": w.name, "mode": w.mode, "path": str(w.path)}
+                           for w in reg.workspaces.values()],
+            "open_handles": sum(1 for h in self.handles.values() if now < h.expires),
+        }
 
     def workspace_open(self, name: str, mode: str = "ro") -> str:
         with self._audit("workspace_open") as rec:
@@ -787,6 +826,8 @@ class Hub:
         self._atomic_write(target, data)
         rec.update(size=len(data), sha256_before=_sha(before) if before is not None else None,
                    sha256_after=_sha(data), backup=str(b) if b else None)
+        if b:
+            self.maybe_cleanup()
         return f"; копия: {b}" if b else "; новый файл, копия не нужна"
 
     def write(self, ws: str, path: str, content: str) -> str:

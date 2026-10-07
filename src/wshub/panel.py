@@ -4,11 +4,13 @@
 который выдаёт только panel_data (её модель вызвать не может):
 - key — для чтения (обход каталогов, журнал, копии), живёт 10 минут с последнего использования;
 - nonce — для каждого изменения, одноразовый, живёт 10 минут с выдачи.
+
+Служебные чтения панели в журнал не пишутся: иначе каждое «Обновить» добавляло бы строки.
+Изменения и отказы по коду (_mutation) пишутся.
 """
 from __future__ import annotations
 
 import difflib
-import json
 import os
 import re
 import secrets
@@ -19,6 +21,7 @@ from pathlib import Path
 
 from .core import HOME, Hub, Session, WsError
 from .doctor import Ctx, run as run_doctor
+from .housekeeping import journal_files, orig_rel, read_journal
 from .policy import Policy
 from .registry import NAME_RE, RegistryError, parse
 from .registry_edit import EditError, RegistryEditor, mask_error, revision
@@ -31,7 +34,13 @@ else:  # pragma: no cover
 
 CODE_TTL = 600
 CODES_MAX = 50
-AUDIT_LIMIT = 500
+AUDIT_PAGE = 100
+AUDIT_PAGE_MAX = 500
+# «Только изменения»: запись, восстановление, правки реестра, отзывы, очистка копий
+CHANGE_TOOLS = {"write", "edit", "panel_restore", "panel_save", "panel_delete", "panel_limits", "panel_revoke",
+                "backup_cleanup"}
+AUDIT_TOOLS = ["workspaces_list", "workspace_open", "ls", "tree", "find", "grep", "read", "extract", "write", "edit",
+               "panel_save", "panel_delete", "panel_limits", "panel_revoke", "panel_restore", "backup_cleanup"]
 BROWSE_MAX = 1000
 PREVIEW_SAMPLE = 50
 PREVIEW_TIMEOUT = 5.0
@@ -138,6 +147,7 @@ class Panel:
             "doctor": doc_res["checks"],
             "processes": doc_res["processes"],
             "sessions": sorted(sessions, key=lambda s: s.get("opened", 0)),
+            "storage": doc_res["storage"],
             "roots": [str(r) for r in self.roots],
             "pid": os.getpid(),
         }
@@ -251,35 +261,37 @@ class Panel:
 
     # ---------- журнал ----------
 
-    def audit(self, key, limit: int = AUDIT_LIMIT) -> dict:
+    def audit(self, key, cursor: str = "", limit: int = AUDIT_PAGE, ws: str = "", tool: str = "",
+              only_errors: bool = False, only_changes: bool = False) -> dict:
+        """Страница журнала (текущий файл и архивы), новые первыми, с фильтрами. cursor — из прошлой страницы."""
         self._use_key(key)
-        limit = max(1, min(int(limit), AUDIT_LIMIT))
-        path = self.hub.audit_path
         try:
-            size = path.stat().st_size
-        except FileNotFoundError:
-            return {"records": [], "total_bytes": 0}
-        chunk, data = 64 * 1024, b""
-        with path.open("rb") as fh:
-            pos = size
-            while pos > 0 and data.count(b"\n") <= limit:
-                step = min(chunk, pos)
-                pos -= step
-                fh.seek(pos)
-                data = fh.read(step) + data
-        lines = data.splitlines()
-        if pos > 0:
-            lines = lines[1:]  # первая строка могла попасть в окно не целиком
-        recs = []
-        for line in lines[-limit:]:
+            limit = max(1, min(int(limit), AUDIT_PAGE_MAX))
+        except (TypeError, ValueError):
+            raise WsError("limit — целое число") from None
+
+        def match(r: dict) -> bool:
+            return ((not ws or r.get("ws") == ws) and (not tool or r.get("tool") == tool)
+                    and (not only_errors or r.get("status") == "error")
+                    and (not only_changes or r.get("tool") in CHANGE_TOOLS))
+        try:
+            recs, nxt = read_journal(self.hub.state_dir, limit, cursor or None, match)
+        except ValueError:
+            raise WsError("курсор журнала некорректен — нажми «Загрузить заново»") from None
+        files = journal_files(self.hub.state_dir)
+        total = 0
+        for f in files:
             try:
-                r = json.loads(line)
-                if isinstance(r, dict):
-                    recs.append(r)
-            except ValueError:
-                continue
-        recs.reverse()
-        return {"records": recs, "total_bytes": size}
+                total += f.stat().st_size
+            except OSError:
+                pass
+        projects = set()
+        try:
+            projects |= set(self.hub.registry.get().workspaces)
+        except RegistryError:
+            pass
+        return {"records": recs, "cursor": nxt, "total_bytes": total, "files": len(files),
+                "tools": AUDIT_TOOLS, "projects": sorted(projects), "change_tools": sorted(CHANGE_TOOLS)}
 
     # ---------- копии ----------
 
@@ -304,14 +316,6 @@ class Panel:
             return Policy(("**",))
         return Policy(tuple(doc.get("defaults", {}).get("deny", [])))
 
-    @staticmethod
-    def _orig_rel(stamp_dir: Path, f: Path) -> str:
-        """Путь файла в проекте: копия «x.1» — второе изменение x за ту же секунду."""
-        m = re.fullmatch(r"(.+)\.(\d+)", f.name)
-        if m and (f.parent / m.group(1)).is_file():
-            f = f.with_name(m.group(1))
-        return f.relative_to(stamp_dir).as_posix()
-
     def backups(self, key, project: str = "") -> dict:
         self._use_key(key)
         projects = set()
@@ -334,7 +338,7 @@ class Panel:
             for dirpath, _dirs, files in os.walk(stamp_dir):
                 for n in sorted(files):
                     f = Path(dirpath) / n
-                    rel = self._orig_rel(stamp_dir, f)
+                    rel = orig_rel(stamp_dir, f)
                     try:
                         st = f.lstat()
                     except OSError:
@@ -351,7 +355,7 @@ class Panel:
         if not f.is_relative_to(base.resolve()) or f == base.resolve() or not f.is_file():
             raise WsError("копия не найдена — нажми «Обновить»")
         stamp_dir = base.resolve() / Path(backup_id).parts[0]
-        rel = self._orig_rel(stamp_dir, f)
+        rel = orig_rel(stamp_dir, f)
         if self._policy(project).denied(rel):
             raise WsError(f"{rel} под deny — копия не открывается и не сравнивается")
         return f, rel
@@ -416,6 +420,15 @@ class Panel:
             try:
                 changes = self.editor.save(name=name, path=path, mode=mode, description=description,
                                            brief=brief, deny=deny, rev=rev, create=bool(create))
+            except EditError as e:
+                raise WsError(str(e)) from None
+            rec["changes"] = changes
+            return {"changes": changes}
+
+    def save_limits(self, nonce, *, values, rev) -> dict:
+        with self._mutation("panel_limits", nonce) as rec:
+            try:
+                changes = self.editor.save_limits(values=values, rev=rev)
             except EditError as e:
                 raise WsError(str(e)) from None
             rec["changes"] = changes

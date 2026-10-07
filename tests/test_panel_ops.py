@@ -417,5 +417,11 @@ def test_audit_tail(env, panel):
         for i in range(700):
             f.write(json.dumps({"tool": "read", "n": i, "pad": "x" * 200}) + "\n")
         f.write("not json\n")
-    r = panel.audit(panel.data()["key"])
-    assert len(r["records"]) == 499 and r["records"][0]["n"] == 699 and r["records"][-1]["n"] == 201
+    key = panel.data()["key"]
+    r = panel.audit(key)
+    assert len(r["records"]) == 100 and r["records"][0]["n"] == 699 and r["records"][-1]["n"] == 600
+    seen = [x["n"] for x in r["records"]]
+    while r["cursor"]:  # «Показать ещё» — до начала журнала, без пропусков и повторов
+        r = panel.audit(key, cursor=r["cursor"])
+        seen += [x["n"] for x in r["records"]]
+    assert seen == list(range(699, -1, -1))

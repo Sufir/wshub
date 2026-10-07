@@ -95,6 +95,25 @@
     <thead><tr><th>Проверка</th><th>Статус</th><th>Подробности</th><th>Что сделать</th></tr></thead>
     <tbody id="doctor-rows"></tbody>
   </table></div>
+  <h2>Журнал и копии</h2>
+  <div class="wrap"><table>
+    <thead><tr><th>Что</th><th>Сейчас</th><th>Лимит</th></tr></thead>
+    <tbody id="storage-rows"></tbody>
+  </table></div>
+  <div class="hint" id="limits-source"></div>
+  <div class="actions" style="margin-top:6px"><button type="button" id="edit-limits">Изменить лимиты</button></div>
+  <div id="limits-why" class="hint why" hidden></div>
+  <form id="limits-form" class="box" hidden autocomplete="off" onsubmit="return false">
+    <h3>Лимиты журнала и копий</h3>
+    <div class="hint">Сохраняются в реестре, секция [limits]. Каждое значение — целое число больше 0.</div>
+    <div id="l-fields"></div>
+    <div class="actions">
+      <button type="button" id="l-save" class="primary">Сохранить</button>
+      <button type="button" id="l-cancel">Отмена</button>
+    </div>
+    <div id="l-save-why" class="hint why" hidden></div>
+    <div id="l-error" class="err" role="alert"></div>
+  </form>
   <h2>Процессы сервера</h2>
   <div class="wrap"><table>
     <thead><tr><th>PID</th><th>Старт</th><th>Код (HEAD)</th><th>Хэндлов</th><th>Последний вызов</th></tr></thead>
@@ -189,6 +208,7 @@
     <div><label for="a-ws">Проект</label><select id="a-ws"></select></div>
     <div><label for="a-tool">Инструмент</label><select id="a-tool"></select></div>
     <div><label class="inline" style="margin-bottom:4px"><input type="checkbox" id="a-err"> только ошибки</label></div>
+    <div><label class="inline" style="margin-bottom:4px" title="write, edit, восстановление, правки реестра, отзывы хэндлов, очистка копий"><input type="checkbox" id="a-changes"> только изменения</label></div>
     <button type="button" id="a-reload">Загрузить заново</button>
   </div>
   <div class="hint" id="a-count"></div>
@@ -196,6 +216,8 @@
     <thead><tr><th>Время</th><th>Инструмент</th><th>Проект</th><th>Путь</th><th>Результат</th></tr></thead>
     <tbody id="audit-rows"></tbody>
   </table></div>
+  <div class="actions" style="margin-top:6px"><button type="button" id="a-more">Показать ещё</button></div>
+  <div id="a-more-why" class="hint why" hidden></div>
 </section>
 
 <section id="tab-backups" role="tabpanel" hidden>
@@ -414,6 +436,7 @@ async function runMutation(name, args, after, errorEl) {
 
 function renderAll() {
   renderOverview();
+  renderStorage();
   renderProjects();
   renderSessions();
   renderFormState();
@@ -463,6 +486,72 @@ function renderOverview() {
     el("div", { text: `Процессов со старым кодом: ${stale}. HEAD на диске: ${(pr.head_disk || "?").slice(0, 8)}. ` +
       "Закрой Claude Desktop полностью (из трея) и запусти снова — процессы возьмут новый код." }));
 }
+
+// ----- журнал и копии, лимиты -----
+
+function renderStorage() {
+  const st = data.storage;
+  if (!st) return;
+  const lim = st.limits, j = st.journal, b = st.backup, lc = st.last_cleanup;
+  $("storage-rows").replaceChildren(
+    el("tr", {}, td("Журнал, текущий файл"), el("td", { class: "mono", text: `${fmtSize(j.current_bytes)} · ${j.path}` }),
+      td(`${lim.journal_max_mb} МБ — больше уходит в архив audit-<дата>.jsonl`)),
+    el("tr", {}, td("Архивы журнала"), td(`${j.archives}` + (j.archives ? `, ${fmtSize(j.archives_bytes)}` : "")),
+      td(`хранятся последние ${lim.journal_keep_files}`)),
+    el("tr", {}, td("Копии файлов"), el("td", { class: "mono", text: b.exists ? `${b.files} файлов, ${fmtSize(b.bytes)} · ${b.path}` : "копий ещё нет" }),
+      td(`копия удаляется, если она старше ${lim.backup_keep_days} дн. и у файла есть ≥ ${lim.backup_keep_per_file} более новых копий; последняя — никогда`)),
+    el("tr", {}, td("Очистка копий"), td(lc && lc.ts ? `${fmtTime(lc.ts)}, удалено: ${lc.deleted || 0}` : "ещё не было"),
+      td("при старте сервера и не чаще раза в сутки")));
+  $("limits-source").textContent = "Лимиты: " + st.limits_source + ".";
+  $("edit-limits").disabled = !!data.registry_error;
+  setWhy("limits-why", data.registry_error ? "в реестре ошибка — исправь файл, затем «Обновить»." : "");
+  renderLimitsState();
+}
+
+const LIMIT_RE = /^\d+$/;
+
+function openLimits() {
+  const st = data.storage;
+  $("l-fields").replaceChildren(...Object.keys(st.limits).map((k) => el("div", { class: "field" },
+    el("label", { for: "l-" + k, text: st.limit_labels[k] }),
+    el("input", { type: "text", id: "l-" + k, inputmode: "numeric", class: "mono", value: String(st.limits[k]),
+      autocomplete: "off", spellcheck: "false", oninput: renderLimitsState }),
+    el("div", { class: "hint", text: `ключ ${k} в [limits]` }))));
+  $("l-error").textContent = "";
+  $("limits-form").hidden = false;
+  renderLimitsState();
+  $("limits-form").scrollIntoView({ block: "nearest" });
+}
+
+function limitValues() {
+  const out = {};
+  for (const k of Object.keys(data.storage.limits)) { const i = $("l-" + k); out[k] = i ? i.value.trim() : ""; }
+  return out;
+}
+
+function renderLimitsState() {
+  if ($("limits-form").hidden || !data || !data.storage) return;
+  const v = limitValues(), labels = data.storage.limit_labels;
+  const empty = Object.keys(v).filter((k) => !v[k]).map((k) => labels[k]);
+  let why = empty.length ? `заполни: ${empty.join(", ")}.` : "";
+  if (!why) {
+    const bad = Object.keys(v).find((k) => !LIMIT_RE.test(v[k]) || Number(v[k]) < 1);
+    if (bad) why = `${labels[bad]}: нужно целое число больше 0.`;
+  }
+  if (!why && data.registry_error) why = "в реестре ошибка — исправь файл вручную.";
+  $("l-save").disabled = !!why;
+  setWhy("l-save-why", why);
+}
+
+$("edit-limits").addEventListener("click", openLimits);
+$("l-cancel").addEventListener("click", () => { $("limits-form").hidden = true; });
+$("l-save").addEventListener("click", async () => {
+  const values = limitValues();
+  $("l-save").disabled = true;
+  const res = await runMutation("panel_save_limits", { rev: data.rev, values }, null, $("l-error"));
+  if (res) $("limits-form").hidden = true;
+  else renderLimitsState();
+});
 
 // ---------- Проекты ----------
 
@@ -698,37 +787,56 @@ function askRevoke(s) {
 
 // ---------- Журнал ----------
 
-let auditLoaded = false, auditRecs = [];
+let auditLoaded = false, auditRecs = [], auditCursor = null, auditSeq = 0;
+const AUDIT_PAGE = 100;
 
-async function loadAudit() {
+// Фильтры применяет сервер: «Показать ещё» догружает следующие 100 подходящих записей (через архивы тоже)
+async function loadAudit(more) {
+  more = more === true;
+  const seq = ++auditSeq;
   $("a-count").textContent = "загрузка…";
+  $("a-more").disabled = true;
   try {
-    const r = await readTool("panel_audit", {});
-    auditRecs = r.records; auditLoaded = true;
-    fillSelect($("a-ws"), "все проекты", [...new Set(auditRecs.map((x) => x.ws).filter(Boolean))].sort());
-    fillSelect($("a-tool"), "все инструменты", [...new Set(auditRecs.map((x) => x.tool).filter(Boolean))].sort());
-    renderAudit();
-  } catch (e) { $("a-count").textContent = e.message; }
+    const r = await readTool("panel_audit", { cursor: more ? auditCursor || "" : "", limit: AUDIT_PAGE,
+      ws: $("a-ws").value, tool: $("a-tool").value, only_errors: $("a-err").checked, only_changes: $("a-changes").checked });
+    if (seq !== auditSeq) return; // фильтр успели поменять — этот ответ устарел
+    auditRecs = more ? auditRecs.concat(r.records) : r.records;
+    auditCursor = r.cursor; auditLoaded = true;
+    const uniq = (a) => [...new Set(a.filter(Boolean))].sort();
+    fillSelect($("a-ws"), "все проекты", uniq([...r.projects, ...auditRecs.map((x) => x.ws)]));
+    fillSelect($("a-tool"), "все инструменты", uniq([...r.tools, ...auditRecs.map((x) => x.tool)]));
+    renderAudit(r);
+  } catch (e) { if (seq === auditSeq) { $("a-count").textContent = e.message; renderAudit(null); } }
 }
 
 function fillSelect(sel, allLabel, values) {
   const cur = sel.value;
   sel.replaceChildren(el("option", { value: "", text: allLabel }), ...values.map((v) => el("option", { value: v, text: v })));
-  if (values.includes(cur)) sel.value = cur;
+  sel.value = values.includes(cur) ? cur : "";
 }
 
-function renderAudit() {
-  const ws = $("a-ws").value, tool = $("a-tool").value, onlyErr = $("a-err").checked;
-  const rows = auditRecs.filter((r) => (!ws || r.ws === ws) && (!tool || r.tool === tool) && (!onlyErr || r.status === "error"));
-  $("a-count").textContent = `Показано ${rows.length} из ${auditRecs.length} последних записей.`;
-  if (!rows.length) { emptyRow($("audit-rows"), 5, "Записей нет."); return; }
-  $("audit-rows").replaceChildren(...rows.map((r) => el("tr", {},
-    td((r.ts || "").replace("T", " ")), td(r.tool), td(r.ws), td(r.path, "mono"),
-    el("td", { class: r.status === "error" ? "err" : null, text: r.status === "error" ? "ошибка: " + (r.error || "") : "ok" }))));
+function auditResult(r) {
+  if (r.status === "error") return "ошибка: " + (r.error || "");
+  if (r.tool === "backup_cleanup") return `ok, удалено копий: ${r.deleted}`;
+  if (r.changes && r.changes.length) return "ok: " + r.changes.join("; ");
+  return "ok";
 }
 
-for (const id of ["a-ws", "a-tool", "a-err"]) $(id).addEventListener("change", renderAudit);
-$("a-reload").addEventListener("click", loadAudit);
+function renderAudit(r) {
+  const filtered = $("a-ws").value || $("a-tool").value || $("a-err").checked || $("a-changes").checked;
+  if (r) $("a-count").textContent = `Показано ${auditRecs.length}${filtered ? " подходящих под фильтр" : ""} записей, новые первыми` +
+    (auditCursor ? "." : " — это все.") + ` Журнал: текущий файл и архивов ${Math.max(r.files - 1, 0)}, всего ${fmtSize(r.total_bytes)}.`;
+  $("a-more").disabled = !auditCursor;
+  setWhy("a-more-why", auditLoaded && !auditCursor ? "больше записей нет." : "");
+  if (!auditRecs.length) { emptyRow($("audit-rows"), 5, filtered ? "Записей по фильтру нет." : "Записей нет."); return; }
+  $("audit-rows").replaceChildren(...auditRecs.map((x) => el("tr", {},
+    td((x.ts || "").replace("T", " ")), td(x.tool), td(x.ws), td(x.path, "mono"),
+    el("td", { class: x.status === "error" ? "err" : null, text: auditResult(x) }))));
+}
+
+for (const id of ["a-ws", "a-tool", "a-err", "a-changes"]) $(id).addEventListener("change", () => loadAudit());
+$("a-reload").addEventListener("click", () => loadAudit());
+$("a-more").addEventListener("click", () => loadAudit(true));
 
 // ---------- Копии ----------
 

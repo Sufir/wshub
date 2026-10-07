@@ -226,17 +226,21 @@ CASES = {
     "crlf-bom": '\ufeff{\r\n    "mcpServers": {\r\n        "git": {"command": "x"}\r\n    }\r\n}\r\n',
     "tabs": '{\n\t"mcpServers": {\n\t\t"a": 1\n\t}\n}',
     "unicode": '{"mcpServers": {"ё": {"command": "\\u0451"}}, "s": "строка с \\" и }"}',
+    "empty-servers-ws": '{\n  "mcpServers": {\n  }\n}\n',
+    "empty-root-ws": '{\r\n\t}\r\n',
+    "empty-root": "{ }",
 }
 
 
 @pytest.mark.parametrize("name", CASES)
 def test_jsonedit_roundtrip(name):
     text = CASES[name]
+    inner = jsonedit.empty_inner(text)
     new, action = jsonedit.set_server(text, "wshub", ENTRY)
     assert json.loads(new.lstrip("\ufeff"))["mcpServers"]["wshub"] == ENTRY
     assert jsonedit.set_server(new, "wshub", ENTRY) == (new, "unchanged")
     created = {"added-parent": "mcpServers"}.get(action)
-    back, removed = jsonedit.remove_server(new, "wshub", created)
+    back, removed = jsonedit.remove_server(new, "wshub", created, inner)
     assert removed and back == text
     if "\r\n" in text:
         assert "\n" not in new.replace("\r\n", "")
@@ -356,3 +360,89 @@ def test_installed_commit(monkeypatch):
 def test_version_cli(machine):
     r = machine.wshub("--version")
     assert r.returncode == 0 and r.stdout.startswith("wshub ")
+
+
+# ---------- находки ревью: откат и безопасность удаления ----------
+
+def test_jsonedit_duplicates_depth_whitespace():
+    dup = '{"mcpServers": {"wshub": {"command": "a"}, "git": {}, "wshub": {"command": "b"}}}'
+    out, removed = jsonedit.remove_server(dup, "wshub")
+    assert removed and json.loads(out) == {"mcpServers": {"git": {}}}
+    with pytest.raises(jsonedit.ConfigError):
+        jsonedit.set_server('{"a": ' + "[" * 5000 + "]" * 5000 + "}", "wshub", ENTRY)
+    new, action = jsonedit.set_server("\n", "wshub", ENTRY)
+    assert action == "created"
+    assert jsonedit.remove_server(new, "wshub", "empty", None, "\n") == ("\n", True)
+
+
+def test_whitespace_only_config_restored(machine):
+    m = machine
+    m.msix.write_text("\n", encoding="utf-8")
+    assert m.wshub("setup", "--yes").returncode in (0, 1)
+    assert entry(m.msix)
+    assert m.wshub("uninstall", "--yes").returncode == 0
+    assert m.msix.read_text(encoding="utf-8") == "\n"
+
+
+def test_uninstall_unknown_user_changes_nothing(machine):
+    m = machine
+    m.msix.write_text('{"preferences": {}}', encoding="utf-8")
+    assert m.wshub("setup", "--yes").returncode in (0, 1)
+    (m.mnt / "c/Users/other/AppData/Local/Packages/Claude_x").mkdir(parents=True)
+    env = m.environ()
+    env.pop("WSHUB_WIN_USER")
+    before = m.snapshot()
+    r = subprocess.run([sys.executable, "-m", "wshub", "uninstall", "--yes", "--purge"], env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 1 and "WSHUB_WIN_USER" in r.stdout
+    assert m.snapshot() == before
+    assert m.wshub("uninstall", "--yes", "--purge").returncode == 0
+    assert m.msix.read_text(encoding="utf-8") == '{"preferences": {}}'
+
+
+def test_purge_keeps_foreign_dirs(machine):
+    """WSHUB_CONFIG/WSHUB_STATE в чужой папке с именем wshub: удаляется только файл реестра, не папка."""
+    m = machine
+    repo = m.home / "code" / "wshub"
+    (repo / "src").mkdir(parents=True)
+    (repo / "src/important.py").write_text("x = 1\n")
+    env = {**m.environ(), "WSHUB_CONFIG": str(repo / "workspaces.toml"), "WSHUB_STATE": str(repo / "state")}
+
+    def run(*args):
+        return subprocess.run([sys.executable, "-m", "wshub", *args], env=env, capture_output=True, text=True,
+                              timeout=120)
+    assert run("setup", "--yes").returncode in (0, 1)
+    r = run("uninstall", "--yes", "--purge")
+    assert (repo / "src/important.py").read_text() == "x = 1\n"
+    assert not (repo / "workspaces.toml").exists() and (repo / "state").exists()
+    assert r.returncode == 1 and "удали вручную" in r.stdout
+
+
+def test_purge_state_symlink(machine, tmp_path):
+    m = machine
+    real = tmp_path / "elsewhere" / "wshub"
+    real.mkdir(parents=True)
+    (real / "keep.txt").write_text("k")
+    m.state.parent.mkdir(parents=True)
+    m.state.symlink_to(real)
+    assert m.wshub("setup", "--yes").returncode in (0, 1)
+    r = m.wshub("uninstall", "--yes", "--purge")
+    assert r.returncode == 1 and "Traceback" not in r.stderr and "симлинк" in r.stdout
+    assert (real / "keep.txt").exists() and m.state.is_symlink()
+
+
+def test_write_failure_no_traceback(machine):
+    m = machine
+    (m.msix.parent / f".{m.msix.name}.wshub-tmp").mkdir()
+    r = m.wshub("setup", "--yes")
+    assert r.returncode == 1 and "Traceback" not in r.stderr and "запись не удалась" in r.stdout
+    assert m.msix.read_text(encoding="utf-8") == DESKTOP_CONFIG
+
+
+def test_user_case_insensitive(machine):
+    """%USERNAME% или WSHUB_WIN_USER в другом регистре, чем папка профиля."""
+    env = {**machine.environ(), "WSHUB_WIN_USER": "ME"}
+    r = subprocess.run([sys.executable, "-m", "wshub", "setup", "--yes"], env=env, capture_output=True, text=True,
+                       timeout=120)
+    assert "добавлена запись wshub" in r.stdout, r.stdout
+    assert entry(machine.msix)["command"] == "wsl.exe"

@@ -86,13 +86,13 @@ def win_path(path: Path, mnt: Path = MNT) -> str | None:
     return f"{parts[0].upper()}:\\" + "\\".join(parts[1:])
 
 
-def from_windows(path: str) -> str:
+def from_windows(path: str, mnt: Path | None = None) -> str:
     """C:\\Users\\x → /mnt/c/Users/x; остальное — как есть."""
     m = re.fullmatch(r"([a-zA-Z]):[\\/]*(.*)", path.strip())
     if not m:
         return path
     rest = m.group(2).replace("\\", "/").strip("/")
-    return f"/mnt/{m.group(1).lower()}" + (f"/{rest}" if rest else "")
+    return f"{mnt or MNT}/{m.group(1).lower()}" + (f"/{rest}" if rest else "")
 
 
 def path_problems(path, roots: dict[str, Path], mnt: Path = MNT,

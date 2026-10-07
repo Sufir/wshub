@@ -157,10 +157,11 @@ def _insert(s: str, o: Obj, key: str, value, unit: str | None, nl: str) -> str:
     return s[:o.open + 1] + nl + indent + member + nl + base + s[o.close:]
 
 
-def _remove(s: str, o: Obj, idx: int) -> str:
+def _remove(s: str, o: Obj, idx: int, inner: str | None = None) -> str:
+    """Убрать член idx. Если он единственный — объект становится «{» + inner + «}» (как был до вставки)."""
     ms = o.members
     if len(ms) == 1:
-        return s[:o.open + 1] + s[o.close:]
+        return s[:o.open + 1] + (inner or "") + s[o.close:]
     if idx > 0:
         return s[:ms[idx - 1].vend] + s[ms[idx].vend:]
     return s[:ms[0].kstart] + s[ms[1].kstart:]
@@ -175,8 +176,10 @@ def _parse(text: str) -> tuple[str, str, Obj]:
         raise ConfigError(f"не читается как JSON: {e}") from None
     if not isinstance(data, dict):
         raise ConfigError("в файле не JSON-объект")
-    start = _Scanner(body).ws(0)
-    _end, root = _Scanner(body).obj(start)
+    try:
+        _end, root = _Scanner(body).obj(_Scanner(body).ws(0))
+    except RecursionError:
+        raise ConfigError("слишком глубокая вложенность JSON") from None
     return bom, body, root
 
 
@@ -226,26 +229,38 @@ def set_server(text: str, name: str, entry: dict) -> tuple[str, str]:
     return bom + body[:m.vstart] + _dump(new, indent, unit if multiline else None, nl) + body[m.vend:], "updated"
 
 
-def remove_server(text: str, name: str, created: str | None = None) -> tuple[str | None, bool]:
-    """Убрать mcpServers[name]. created — что создал setup: "mcpServers" (тогда пустой mcpServers убирается),
-    "file" (тогда файл удаляется — возвращается None, если в нём больше ничего нет), "empty" (файл был пуст).
+def empty_inner(text: str) -> str | None:
+    """Пробелы внутри пустого объекта, в который set_server вставит запись (пустой mcpServers или пустой корень
+    без mcpServers), — чтобы remove_server вернул их на место. None — объект не пуст или файла нет."""
+    if not text.strip():
+        return None
+    _bom, body, root = _parse(text)
+    srv = _servers(body, root)
+    obj = srv[2] if srv is not None else root
+    return None if obj.members else body[obj.open + 1:obj.close]
+
+
+def remove_server(text: str, name: str, created: str | None = None, inner: str | None = None,
+                  original: str | None = None) -> tuple[str | None, bool]:
+    """Убрать mcpServers[name] (все повторы ключа). Что записал setup при установке:
+    created — "mcpServers" (раздел создан им: пустой убирается), "file" (файл создан: если в нём больше ничего,
+    возвращается None — удалить файл), "empty" (файл был пуст: возвращается original);
+    inner — пробелы внутри объекта, который был пуст до вставки.
     Возвращает (новый текст или None — удалить файл, убрано ли что-то)."""
     if not text.strip():
         return text, False
-    bom, body, root = _parse(text)
-    srv = _servers(body, root)
-    if srv is None:
-        return text, False
-    idx, _m, servers = srv
-    hit = servers.get(name)
-    if hit is None:
-        return text, False
-    only = len(servers.members) == 1
-    if only and created in ("mcpServers", "file", "empty"):
-        out = _remove(body, root, idx)
-        if created == "mcpServers":
+    removed = False
+    while True:
+        bom, body, root = _parse(text)
+        srv = _servers(body, root)
+        hit = srv[2].get(name) if srv is not None else None
+        if hit is None:
+            return text, removed
+        removed = True
+        idx, _m, servers = srv
+        if len(servers.members) == 1 and created in ("mcpServers", "file", "empty"):
+            out = _remove(body, root, idx, inner if len(root.members) == 1 else None)
+            if created != "mcpServers" and json.loads(out) == {}:
+                return (None if created == "file" else (original or "")), True
             return bom + out, True
-        if json.loads(out) == {}:
-            return (None if created == "file" else ""), True
-        return bom + out, True
-    return bom + _remove(body, servers, hit[0]), True
+        text = bom + _remove(body, servers, hit[0], inner if len(servers.members) == 1 else None)

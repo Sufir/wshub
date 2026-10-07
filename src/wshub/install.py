@@ -81,7 +81,7 @@ class Env:
         return self.users_dir / self.win_user if self.win_user else None
 
 
-def _run(args: list[str], cwd: Path | None = None, timeout: float = 15) -> str | None:
+def _run(args: list[str], cwd: Path | None = None, timeout: float = 15) -> bytes | None:
     """Команда Windows из WSL (cmd.exe, tasklist.exe): вывод или None, если её нет или она не ответила."""
     if not shutil.which(args[0]):
         return None
@@ -90,7 +90,7 @@ def _run(args: list[str], cwd: Path | None = None, timeout: float = 15) -> str |
                            cwd=str(cwd) if cwd and cwd.is_dir() else None)
     except (OSError, subprocess.SubprocessError):
         return None
-    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else None
+    return r.stdout if r.returncode == 0 else None
 
 
 def find_exe(home: Path) -> Path | None:
@@ -120,17 +120,32 @@ def _desktop_users(users_dir: Path) -> list[str]:
     return out
 
 
+def _user_dirs(users_dir: Path) -> dict[str, str]:
+    """Папки профилей Windows: имя в нижнем регистре → настоящее имя (NTFS не различает регистр)."""
+    try:
+        return {p.name.lower(): p.name for p in users_dir.iterdir()
+                if p.name not in doctor.SKIP_USERS and p.is_dir()}
+    except OSError:
+        return {}
+
+
 def detect_win_user(env: Env) -> tuple[str | None, str, list[str]]:
-    """(имя, откуда взято, кандидаты при неоднозначности)."""
+    """(имя папки профиля, откуда взято, кандидаты при неоднозначности)."""
     if not env.distro:
         return None, "", []
+    dirs = _user_dirs(env.users_dir)
     forced = os.environ.get("WSHUB_WIN_USER")
     if forced:
-        return forced, "WSHUB_WIN_USER", []
-    out = _run(["cmd.exe", "/d", "/c", "echo %USERNAME%"], cwd=env.mnt / "c", timeout=10)
-    name = (out or "").strip().splitlines()[-1].strip() if (out or "").strip() else ""
-    if name and "%" not in name and (env.users_dir / name).is_dir():
-        return name, "cmd.exe", []
+        return dirs.get(forced.lower(), forced), "WSHUB_WIN_USER", []
+    raw = _run(["cmd.exe", "/d", "/c", "echo %USERNAME%"], cwd=env.mnt / "c", timeout=10) or b""
+    for enc in ("utf-8", "cp866", "cp1251"):  # cmd.exe пишет в OEM-кодировке консоли
+        try:
+            lines = raw.decode(enc).strip().splitlines()
+        except UnicodeDecodeError:
+            continue
+        name = lines[-1].strip().lower() if lines else ""
+        if name in dirs:
+            return dirs[name], "cmd.exe", []
     with_desktop = _desktop_users(env.users_dir)
     if len(with_desktop) == 1:
         return with_desktop[0], "папка с Claude Desktop", []
@@ -152,7 +167,7 @@ def desktop_running(env: Env) -> bool | None:
     if not env.distro:
         return None
     out = _run(["tasklist.exe", "/FI", "IMAGENAME eq claude.exe", "/NH", "/FO", "CSV"], cwd=env.mnt / "c")
-    return None if out is None else "claude.exe" in out.lower()
+    return None if out is None else b"claude.exe" in out.lower()
 
 
 def entry_for(env: Env) -> dict:
@@ -168,7 +183,8 @@ def desktop_configs(env: Env, only_used: bool = True) -> list[dict]:
     if env.distro:
         if not env.win_home:
             return []
-        cands = [c for c in cands if c["kind"] != "native" and c["path"].is_relative_to(env.win_home)]
+        home = str(env.win_home).lower() + "/"
+        cands = [c for c in cands if c["kind"] != "native" and str(c["path"]).lower().startswith(home)]
     return [c for c in cands if c["used"] or not only_used]
 
 
@@ -218,8 +234,13 @@ def _backup(path: Path, ui: UI) -> Path | None:
 def _write_bytes(path: Path, data: bytes) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.wshub-tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    except BaseException:
+        if tmp.is_file():
+            tmp.unlink()
+        raise
 
 
 def _read_text(path: Path) -> str:
@@ -317,25 +338,49 @@ def setup_desktop(env: Env, ui: UI) -> tuple[bool, list[str]]:
         path: Path = c["path"]
         try:
             text = _read_text(path)
+            inner = jsonedit.empty_inner(text)
             new, action = jsonedit.set_server(text, "wshub", entry)
-        except (OSError, UnicodeDecodeError, jsonedit.ConfigError) as e:
+            data = new.encode("utf-8")
+        except (OSError, UnicodeError, jsonedit.ConfigError) as e:
             ok = False
-            ui.note(f"{path}: {e} — файл не тронут; исправь его или удали и запусти Desktop, затем повтори")
+            ui.note(f"{_show(path, env)}: {e} — файл не тронут; исправь его или удали и запусти Desktop, "
+                    "затем повтори")
             continue
         if action == "unchanged":
             ui.note(f"уже настроено: {_show(path, env)}")
         else:
-            plan.append((c, path, new, action))
+            plan.append((c, path, text, data, action, inner))
     if plan:
         wait_desktop_closed(env, ui)
-    for c, path, new, action in plan:
+    for c, path, text, data, action, inner in plan:
+        # что вставили — для точного отката в uninstall; при обновлении записи прежняя отметка остаётся
         created = {"added-parent": "mcpServers", "created": "file" if not path.exists() else "empty"}.get(action)
-        backup = _backup(path, ui)
-        if not ui.dry:
-            _write_bytes(path, new.encode("utf-8"))
-            if created and str(path) not in marker:
-                marker[str(path)] = {"created": created}
-                _save_marker(env.state, marker)
+        note = {"created": created, "inner": inner, "original": text if created == "empty" else None}
+        backup = None
+        if ui.dry:
+            backup = _backup(path, ui)
+        else:
+            prev = marker.get(str(path))
+            try:
+                if action != "updated":
+                    marker.pop(str(path), None)
+                    if created or inner is not None:
+                        marker[str(path)] = note
+                    _save_marker(env.state, marker)
+                backup = _backup(path, ui)
+                _write_bytes(path, data)
+            except OSError as e:
+                ok = False
+                marker.pop(str(path), None)
+                if prev is not None:
+                    marker[str(path)] = prev
+                try:
+                    _save_marker(env.state, marker)
+                except OSError:
+                    pass
+                ui.note(f"{_show(path, env)}: запись не удалась ({e.strerror or e}) — "
+                        "закрой Desktop из трея и повтори wshub setup")
+                continue
         verb = {"updated": "обновлена запись wshub", "added": "добавлена запись wshub",
                 "added-parent": "добавлен раздел mcpServers с записью wshub",
                 "created": "создан конфиг с записью wshub"}[action]
@@ -368,7 +413,7 @@ def _ask_project(env: Env, ui: UI, taken: set[str]) -> tuple[Path, str, str] | N
         raw = ui.ask("  Путь к папке проекта в WSL (например /home/<user>/myproject; пусто — пропустить): ")
         if not raw:
             return None
-        p = Path(os.path.expanduser(outbox.from_windows(raw)))
+        p = Path(os.path.expanduser(outbox.from_windows(raw, env.mnt)))
         if not p.is_absolute():
             ui.say("  нужен абсолютный путь, начиная с /")
         elif not p.is_dir():
@@ -413,7 +458,7 @@ def setup_registry(env: Env, ui: UI, hub, project: tuple[str, str] | None) -> tu
         first = next(iter(workspaces))
     want = None
     if project:
-        p = Path(os.path.expanduser(outbox.from_windows(project[0])))
+        p = Path(os.path.expanduser(outbox.from_windows(project[0], env.mnt)))
         if not p.is_absolute() or not p.is_dir():
             ui.note(f"--project {project[0]}: папки нет или путь не абсолютный — проект не добавлен")
             return False, first
@@ -478,7 +523,7 @@ def setup_outbox(env: Env, ui: UI, hub) -> bool:
             ui.note("не настроена: publish будет отказывать; позже — wshub outbox set <путь>")
             return True
         if ans:
-            target = Path(os.path.normpath(outbox.from_windows(ans)))
+            target = Path(os.path.normpath(outbox.from_windows(ans, env.mnt)))
     win = outbox.win_path(target, env.mnt)
     roots = {w.name: w.path for w in reg.workspaces.values()} if reg else {}
     if ui.dry:
@@ -564,61 +609,75 @@ def setup(env: Env, ui: UI, project: tuple[str, str] | None = None) -> int:
 
 def uninstall(env: Env, ui: UI, purge: bool) -> int:
     ui.step("Claude Desktop")
+    choose_win_user(env, ui)
     if env.distro and not env.win_user:
-        choose_win_user(env, ui)
+        ui.say("Ничего не изменено: не определён пользователь Windows — задай WSHUB_WIN_USER=<имя> и повтори.")
+        return 1
     marker = _load_marker(env.state)
-    found = [c for c in desktop_configs(env, only_used=False) if c.get("entry") or "error" in c]
-    if any(c.get("entry") for c in found):
-        wait_desktop_closed(env, ui)
-    ok = True
-    removed_any = False
-    for c in found:
+    ok, plan = True, []
+    for c in desktop_configs(env, only_used=False):
         path: Path = c["path"]
+        if not c["exists"]:
+            continue
+        m = marker.get(str(path)) or {}
         try:
             text = _read_text(path)
-            created = (marker.get(str(path)) or {}).get("created")
-            new, removed = jsonedit.remove_server(text, "wshub", created)
-        except (OSError, UnicodeDecodeError, jsonedit.ConfigError) as e:
-            ok = False
-            ui.note(f"{path}: {e} — файл не тронут")
+            new, removed = jsonedit.remove_server(text, "wshub", m.get("created"), m.get("inner"), m.get("original"))
+            data = None if new is None else new.encode("utf-8")
+        except (OSError, UnicodeError, jsonedit.ConfigError) as e:
+            ok = ok and not c["used"]  # нечитаемый файл, который Desktop не читает, удалению не мешает
+            ui.note(f"{_show(path, env)}: {e} — файл не тронут")
             continue
-        if not removed:
-            continue
-        backup = _backup(path, ui)
+        if removed:
+            plan.append((path, data))
+        else:
+            marker.pop(str(path), None)  # записи нет (убрали руками или Desktop) — отметка больше не нужна
+    if plan:
+        wait_desktop_closed(env, ui)
+    else:
+        ui.note("записи wshub в конфигах Desktop нет")
+    for path, data in plan:
+        backup = None
         if not ui.dry:
-            if new is None:
-                path.unlink()
-            else:
-                _write_bytes(path, new.encode("utf-8"))
+            try:
+                backup = _backup(path, ui)
+                if data is None:
+                    path.unlink()
+                else:
+                    _write_bytes(path, data)
+            except OSError as e:
+                ok = False
+                ui.note(f"{_show(path, env)}: изменить не удалось ({e.strerror or e}) — закрой Desktop и повтори")
+                continue
             marker.pop(str(path), None)
-        removed_any = True
-        ui.done(f"{'удалён конфиг (его создал setup)' if new is None else 'убрана запись wshub'}: {_show(path, env)}")
+        what = "удалён конфиг (его создал setup)" if data is None else "убрана запись wshub"
+        ui.done(f"{what}: {_show(path, env)}")
         if backup:
             ui.note(f"  копия до изменения: {backup.name}")
-    if not removed_any:
-        ui.note("записи wshub в конфигах Desktop нет")
     if not ui.dry and env.state.is_dir():
-        if marker:
-            _save_marker(env.state, marker)
-        else:
-            (env.state / MARKER).unlink(missing_ok=True)
+        try:
+            if marker:
+                _save_marker(env.state, marker)
+            else:
+                (env.state / MARKER).unlink(missing_ok=True)
+        except OSError:
+            pass
     ui.step("Реестр и состояние")
     if not purge:
         ui.note(f"оставлены: {env.config} и {env.state} (удалить — wshub uninstall --purge)")
+    elif not ok:
+        ui.note("--purge пропущен: запись wshub убрана не везде — исправь и повтори (иначе потеряется отметка "
+                "для точного отката конфига)")
     else:
-        ok = purge_data(env, ui) and ok
+        ok = purge_data(env, ui)
     ui.say("")
     ui.say(f"Дальше: {RESTART}. Удалить саму программу: uv tool uninstall wshub")
     return 0 if ok else 1
 
 
-def _safe_dir(p: Path, home: Path) -> bool:
-    """Удаляем только свой каталог: имя wshub, внутри дома, не сам дом."""
-    try:
-        r = p.resolve()
-    except OSError:
-        return False
-    return r.name == "wshub" and r != home.resolve() and r.is_relative_to(home.resolve())
+def _own_dir(p: Path, default: Path) -> bool:
+    """Каталог целиком удаляется, только если это каталог wshub по умолчанию и не симлинк."""
+    return os.path.abspath(p) == os.path.abspath(default) and p.is_dir() and not p.is_symlink()
 
 
 def purge_data(env: Env, ui: UI) -> bool:
@@ -630,8 +689,8 @@ def purge_data(env: Env, ui: UI) -> bool:
             return True
     ok = True
     try:
-        reg = parse(_read_text(env.config)) if env.config.exists() else None
-    except (OSError, UnicodeDecodeError, RegistryError):
+        reg = parse(_read_text(env.config)) if env.config.is_file() else None
+    except (OSError, UnicodeError, RegistryError):
         reg = None
     if reg is not None and reg.outbox.path and reg.outbox.path.is_dir():
         if not ui.dry:
@@ -639,20 +698,24 @@ def purge_data(env: Env, ui: UI) -> bool:
             ui.done(f"перевалка {reg.outbox.path}: удалено каталогов wshub {res['deleted']} (папка оставлена)")
         else:
             ui.done(f"перевалка {reg.outbox.path}: удалить каталоги wshub (папка останется)")
-    if env.config.exists():
-        if not ui.dry:
-            env.config.unlink()
-            if _safe_dir(env.config.parent, env.home):
-                shutil.rmtree(env.config.parent, ignore_errors=True)
-        ui.done(f"удалён реестр {env.config}")
-    if env.state.exists():
-        if _safe_dir(env.state, env.home):
+    cfg_dir, state_dir = env.home / ".config" / "wshub", env.home / ".local" / "state" / "wshub"
+    try:
+        if env.config.is_file():
+            if not ui.dry:
+                env.config.unlink()
+                if _own_dir(env.config.parent, cfg_dir):
+                    shutil.rmtree(env.config.parent)
+            ui.done(f"удалён реестр {env.config}")
+        if _own_dir(env.state, state_dir):
             if not ui.dry:
                 shutil.rmtree(env.state)
             ui.done(f"удалено состояние {env.state}")
-        else:
+        elif env.state.exists():
             ok = False
-            ui.note(f"{env.state} не похож на каталог wshub в доме — не удаляю, удали вручную")
+            ui.note(f"{env.state} — не каталог wshub по умолчанию (или симлинк): не удаляю, удали вручную")
+    except OSError as e:
+        ok = False
+        ui.note(f"удалить не удалось: {e}")
     return ok
 
 

@@ -1,72 +1,102 @@
 # wshub
 
 [![CI](https://github.com/Sufir/wshub/actions/workflows/ci.yml/badge.svg)](https://github.com/Sufir/wshub/actions/workflows/ci.yml)
-[![Лицензия: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
+[![License: GPL-3.0-or-later](https://img.shields.io/badge/license-GPL--3.0--or--later-blue)](LICENSE)
 
-Даёт Claude доступ к папкам проектов в WSL: читать, искать, править и показывать файлы карточкой в чате.
-Один локальный MCP-сервер на все проекты; какие папки видны и в каком режиме — решаешь ты в реестре.
-Нужен, потому что Claude Desktop не даёт выбрать `\\wsl.localhost\…` как папку.
+Локальный MCP-сервер для Claude Desktop. Открывает Claude доступ к папкам проектов в WSL: чтение, поиск,
+правка файлов и показ файлов карточкой в чате. Один сервер обслуживает все проекты из реестра.
+
+Claude Desktop не позволяет подключать папки `\\wsl.localhost\…`, поэтому доступ к WSL идёт через wshub.
+
+## Схема
 
 ```
-Claude (облако) → Claude Desktop (Windows) → wsl.exe -d <дистрибутив> → wshub (WSL) → папки проектов
-                         ↑                                                 │
-                         └──── C:\Users\<user>\ClaudeOutbox ◄── publish ───┘
+Claude → Claude Desktop (Windows) → wsl.exe -d <дистрибутив> → wshub (WSL) → папки проектов
+                ↑                                                  │
+                └───── C:\Users\<user>\ClaudeOutbox ◄── publish ───┘
 ```
+
+## Требования
+
+| компонент | версия |
+|---|---|
+| Windows | 10 или 11, WSL 2 с Ubuntu |
+| Claude Desktop | Microsoft Store или установщик с claude.ai; запущен хотя бы один раз |
+| Python | ставится автоматически (uv) |
 
 ## Установка
-
-Нужны Windows с WSL (Ubuntu) и Claude Desktop, запущенный хотя бы раз. В терминале WSL:
 
 ```bash
 curl -LsSf https://raw.githubusercontent.com/Sufir/wshub/main/install.sh | sh
 ~/.local/bin/wshub setup
 ```
 
-1. Первая команда ставит uv, ripgrep и wshub (sudo может спросить пароль).
-2. `setup` сам найдёт Desktop и его конфиг, спросит путь первого проекта и режим `ro`/`rw`, создаст папку перевалки.
-3. Перезапусти Desktop полностью: значок в трее → Quit, затем запусти снова.
+После установки Claude Desktop перезапускается полностью: значок в трее → **Quit**, затем повторный запуск.
 
-Повторный `wshub setup` безопасен. Без вопросов: `wshub setup --yes --project ~/myproject --mode ro`.
-Ручная установка и что именно меняется — [docs/install.md](docs/install.md).
+| команда | действие |
+|---|---|
+| `install.sh` | ставит ripgrep и git (apt), uv и wshub в `~/.local/bin` |
+| `wshub setup` | добавляет запись wshub в конфиг Desktop, создаёт реестр, первый проект и папку перевалки |
 
-## Первые шаги
+`wshub setup` спрашивает только путь первого проекта и режим `ro`/`rw`; остальное определяется автоматически.
+Повторный запуск ничего не меняет. Неинтерактивно: `wshub setup --yes --project <путь> --mode ro`.
+Подробности и ручная установка — [docs/install.md](docs/install.md).
 
-Новый чат, начатый в Claude Desktop на компьютере:
+## Использование
 
-1. «Открой проект myproject через wshub» — Claude получит хэндл и BRIEF проекта. На запрос инструментов — «Always allow».
-2. «Открой панель wshub» — проекты, сессии, журнал, копии файлов, перевалка. Проекты добавляются здесь.
-3. «Покажи мне report.pdf» — `publish` положит файл карточкой в чат, минуя модель.
+Работает в чатах, начатых в Claude Desktop на компьютере.
 
-Инструменты и панель — [docs/tools.md](docs/tools.md), реестр — [docs/registry.md](docs/registry.md).
+| задача | запрос в чате | инструмент |
+|---|---|---|
+| открыть проект | «Открой проект myproject через wshub» | `workspace_open` |
+| управлять проектами, сессиями, копиями | «Открой панель wshub» | `panel` |
+| показать файл | «Покажи report.pdf» | `publish` |
+
+При первом вызове Desktop запрашивает разрешение на инструменты wshub — **Always allow**.
+Полный список инструментов — [docs/tools.md](docs/tools.md), формат реестра — [docs/registry.md](docs/registry.md).
 
 ## Безопасность
 
-1. **Только свои пути.** Всё — от корня проекта; `..`, симлинки наружу и соседние папки отклоняются. Реестр меняет только человек.
-2. **Маски секретов.** `.env`, ключи, `secrets/` и т. п.: имена видны, содержимое — нет; `grep` их пропускает.
-3. **Хэндлы с TTL и отзыв.** Доступ к проекту живёт 8 часов; в панели — отзыв и запрет проекта для всех сессий.
-4. **Копия перед записью.** Запись только в `rw` и не в `.git`; прежняя версия — в `~/.local/state/wshub/backup`.
-5. **Журнал.** Каждый вызов — в `~/.local/state/wshub/audit.jsonl` (sha256 до и после, без содержимого).
+| механизм | поведение |
+|---|---|
+| границы проекта | пути только внутри корня; `..`, симлинки наружу и соседние папки отклоняются; реестр меняет только человек |
+| маски секретов | `.env`, ключи, `secrets/` и др.: имена видны, содержимое недоступно, `grep` их пропускает |
+| хэндлы | доступ к проекту действует 8 ч; отзыв и запрет проекта — в панели, для всех процессов |
+| копии перед записью | запись только в режиме `rw` и не в `.git`; прежняя версия — в `~/.local/state/wshub/backup` |
+| журнал | каждый вызов — в `~/.local/state/wshub/audit.jsonl`: sha256 до и после, без содержимого |
 
-## Частые проблемы
+## Диагностика
 
-`wshub doctor` проверяет всё ниже и пишет, что сделать.
+`wshub doctor` проверяет окружение и выводит способ исправления для каждой проблемы.
 
-1. **Desktop из Microsoft Store не видит wshub.** Он читает конфиг внутри пакета:
-   `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\claude_desktop_config.json`, а не `%APPDATA%\Claude\…`.
-   `setup` пишет в нужный файл; doctor помечает, какой читается.
-2. **После обновления работает старый код.** Перезапусти Desktop из трея (Quit), не закрытием окна. doctor покажет «устарел».
-3. **Нет wshub в чате с телефона или нет панели.** Локальные серверы видны только в чатах, начатых в Desktop на компьютере.
-4. **`publish` спрашивает доступ к папке.** Так и задумано: один раз в каждом новом чате. Копии в перевалке живут 15 минут, карточка остаётся в чате.
-5. **`grep` медленный или падает по таймауту.** Нет ripgrep: `sudo apt install ripgrep`.
+| симптом | причина | решение |
+|---|---|---|
+| Desktop из Microsoft Store не видит wshub | конфиг читается из пакета `%LOCALAPPDATA%\Packages\Claude_<id>\LocalCache\Roaming\Claude\`, а не из `%APPDATA%\Claude\` | `wshub setup` пишет в нужный файл |
+| после обновления работает старый код | процессы wshub запущены до обновления | Quit из трея и запуск Desktop; doctor помечает процессы «устарел» |
+| нет wshub или панели в чате | чат начат не в Desktop (например, с телефона) | новый чат в Desktop на компьютере |
+| `publish` запрашивает доступ к папке | доступ к перевалке подтверждается один раз в каждом чате | разрешить; копии живут 15 мин, карточка остаётся в чате |
+| `grep` медленный или прерывается по таймауту | нет ripgrep | `sudo apt install ripgrep` |
 
-Другие серверы и настройки в конфиге Desktop `setup` не трогает; копия — рядом, `*.wshub-<время>.bak`.
+Записи других серверов и настройки в конфиге Desktop `setup` не изменяет; копия файла — рядом, `*.wshub-<время>.bak`.
 
 ## Обновление и удаление
 
 ```bash
-wshub update                # затем перезапуск Desktop из трея
-wshub uninstall [--purge]   # убрать из Desktop; --purge — ещё реестр, журнал и копии
+wshub update                # обновление; затем перезапуск Desktop из трея
+wshub uninstall             # удалить запись из конфига Desktop
+wshub uninstall --purge     # то же + реестр, журнал и копии файлов
 uv tool uninstall wshub     # удалить программу
 ```
 
-Разработка, тесты и CI (только в Docker: `scripts/check.sh`) — [docs/development.md](docs/development.md). Лицензия — [GPL-3.0-or-later](LICENSE).
+## Документация
+
+| файл | содержание |
+|---|---|
+| [docs/install.md](docs/install.md) | что делают `install.sh` и `setup`, расположение конфигов Desktop, ручная установка, удаление |
+| [docs/tools.md](docs/tools.md) | инструменты, `publish`, панель, CLI |
+| [docs/registry.md](docs/registry.md) | формат реестра, перевалка, файлы состояния |
+| [docs/development.md](docs/development.md) | разработка; тесты и CI — только в Docker (`scripts/check.sh`) |
+
+## Лицензия
+
+[GPL-3.0-or-later](LICENSE)

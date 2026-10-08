@@ -1,15 +1,15 @@
-# Установка: что происходит и как сделать руками
+# Установка
 
-Обычный путь — две команды из [README](../README.md#установка). Здесь — что они меняют, ручная установка и удаление.
+Стандартная установка — две команды из [README](../README.md#установка). Ниже — что они изменяют, ручная установка и удаление.
 
 ## Что делает `install.sh`
 
 1. Ставит через `apt` то, чего нет: `git` (uv берёт код из GitHub), `ripgrep` (быстрый `grep`), `curl`.
 2. Ставит [uv](https://docs.astral.sh/uv/) в `~/.local/bin`, если его нет.
-3. `uv tool install --force git+https://github.com/Sufir/wshub` → `~/.local/bin/wshub`. Python нужной версии uv скачает сам.
+3. `uv tool install --force git+https://github.com/Sufir/wshub` → `~/.local/bin/wshub`. Нужную версию Python uv скачивает автоматически.
 
-Не трогает установку из рабочей копии (`uv tool install --editable`) — для неё `WSHUB_FORCE=1`.
-Конкретная версия: `WSHUB_REF=v0.2.0`. Запускать от своего пользователя, не от root.
+Установка из рабочей копии (`uv tool install --editable`) не заменяется; замена — с `WSHUB_FORCE=1`.
+Конкретная версия: `WSHUB_REF=v0.2.0`. Запуск — от обычного пользователя, не от root.
 
 ## Что делает `wshub setup`
 
@@ -21,11 +21,11 @@
 | перевалка | папка `C:\Users\<user>\ClaudeOutbox` и секция `[outbox]` | секция есть — не трогает |
 | doctor | ничего: сводка проверок | — |
 
-Определяется само: дистрибутив (`WSL_DISTRO_NAME`), пользователь Windows (`cmd.exe` → единственная папка
+Определяется автоматически: дистрибутив (`WSL_DISTRO_NAME`), пользователь Windows (`cmd.exe` → единственная папка
 с Desktop → выбор из списка), где Desktop берёт конфиг, путь `~/.local/bin/wshub`.
 Спрашивается только путь первого проекта и режим `ro`/`rw` — без подставленных значений.
 
-Если Desktop запущен, `setup` попросит закрыть его из трея: при выходе Desktop может записать конфиг своей копией.
+Если Desktop запущен, `setup` предлагает закрыть его из трея: при выходе Desktop может перезаписать конфиг своей копией.
 
 Флаги: `--yes` — без вопросов (проект только из `--project <путь> --mode ro|rw`), `--dry-run` — показать план.
 
@@ -48,21 +48,21 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv tool install git+https://github.com/Sufir/wshub
 ```
 
-Закрой Desktop из трея и добавь в `mcpServers` нужного файла (остальное не трогай):
+При закрытом Desktop (Quit из трея) в раздел `mcpServers` нужного файла добавляется запись; остальное содержимое не изменяется:
 
 ```json
 "wshub": { "command": "wsl.exe", "args": ["-d", "Ubuntu-22.04", "--", "/home/<user>/.local/bin/wshub"] }
 ```
 
-`Ubuntu-22.04` — имя твоего дистрибутива (`wsl -l` в PowerShell). Desktop под Linux/macOS:
+`Ubuntu-22.04` — имя дистрибутива (`wsl -l` в PowerShell). Desktop под Linux/macOS:
 `"wshub": { "command": "/home/<user>/.local/bin/wshub" }`.
 
 Реестр — по образцу из [registry.md](registry.md), перевалка — `wshub outbox set C:\Users\<user>\ClaudeOutbox`.
-Проверка — `wshub doctor`, затем запусти Desktop.
+Проверка — `wshub doctor`, затем запуск Desktop.
 
 ## Обновление
 
-`wshub update` — `uv tool upgrade wshub` и напоминание: перезапусти Desktop из трея, иначе работает старый код
+`wshub update` — `uv tool upgrade wshub` и напоминание о перезапуске Desktop из трея: до перезапуска работает старый код
 (`wshub doctor` → «Процессы сервера», «устарел»). Установка из рабочей копии обновляется через `git pull`.
 
 ## Удаление

@@ -70,13 +70,11 @@ def test_self_protection(env, which):
 
 
 def test_self_protection_repo_ro(env):
-    """Код wshub в ro открывается и читается; записи нет."""
+    """Код wshub в ro открывается и читается; запись проверяется на поддельном каталоге (test_code_rw_by_hand)."""
     env.workspaces["self"] = {"path": str(REPO), "mode": "ro"}
     env.write_registry()
     ws = env.open("self")
     assert "[project]" in env.hub.read(ws, "pyproject.toml")
-    with pytest.raises(WsError, match="только для чтения"):
-        env.hub.write(ws, "pyproject.toml", "x")
     with pytest.raises(WsError, match="rw недоступен"):
         env.hub.workspace_open("self", "rw")
 

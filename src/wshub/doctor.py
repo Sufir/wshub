@@ -129,7 +129,8 @@ def check_paths(ctx: Ctx, reg) -> dict:
         if code and w.mode == "rw":
             rw_code.append(w.name)
             p = ctx.protected_overlap(root) if ctx.protected_overlap else None
-            lines.append(f"{w.name}: пересекается с кодом wshub {p} — в rw не откроется, в ro откроется")
+            where = f" {p}" if p else ""  # без protected_overlap каталог неизвестен — без него
+            lines.append(f"{w.name}: пересекается с кодом wshub{where} — в rw не откроется, в ro откроется")
             continue
         brief = ""
         if w.brief:

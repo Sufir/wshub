@@ -1,6 +1,7 @@
 """Ядро wshub: хэндлы, проверка путей, инструменты чтения и записи, копии, журнал."""
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -51,6 +52,37 @@ COPY_CHUNK = 1024 * 1024
 
 _UMASK = os.umask(0)
 os.umask(_UMASK)
+
+
+# Path.is_file/is_dir/is_symlink с Python 3.14 возвращают False и при отказе в доступе. Нам нужно прежнее
+# поведение: «нет прав» — это ошибка (её показывают и считают в «пропущено»), а не «файла нет».
+_MISSING = {errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP}
+
+
+def _mode(p: Path, follow: bool = True) -> int | None:
+    try:
+        return (p.stat() if follow else p.lstat()).st_mode
+    except OSError as e:
+        if e.errno in _MISSING:
+            return None
+        raise
+    except ValueError:  # \x00 в пути
+        return None
+
+
+def _is_file(p: Path) -> bool:
+    m = _mode(p)
+    return m is not None and stat.S_ISREG(m)
+
+
+def _is_dir(p: Path) -> bool:
+    m = _mode(p)
+    return m is not None and stat.S_ISDIR(m)
+
+
+def _is_symlink(p: Path) -> bool:
+    m = _mode(p, follow=False)
+    return m is not None and stat.S_ISLNK(m)
 
 
 class WsError(Exception):
@@ -251,9 +283,9 @@ class Hub:
             raise WsError(f"доступ запрещён политикой deny: {path}")
         if any(part.lower() == ".git" for part in (rel + "/" + lex_rel).split("/")):
             raise WsError("запись внутрь .git запрещена")
-        if target.is_symlink():
+        if _is_symlink(target):
             raise WsError(f"конечный компонент пути — симлинк, запись запрещена: {rel}")
-        if target.is_dir():
+        if _is_dir(target):
             raise WsError(f"это каталог: {rel}")
         return target, rel
 
@@ -366,7 +398,7 @@ class Hub:
             if mode == "rw" and ws.mode != "rw":
                 raise WsError(f"проект «{name}» в реестре только для чтения (ro); rw недоступен")
             root = ws.path.resolve()
-            if not root.is_dir():
+            if not _is_dir(root):
                 raise WsError(f"папка проекта не найдена: {ws.path}")
             p = self.protected_overlap(root)
             if p is not None:
@@ -401,7 +433,7 @@ class Hub:
             return "BRIEF: в реестре не задан."
         try:
             f, rel = self._resolve(s, b)
-            if not f.is_file():
+            if not _is_file(f):
                 return f"BRIEF ({b}): файла нет."
             data = f.read_bytes()
         except WsError as e:
@@ -472,7 +504,7 @@ class Hub:
         if not d.is_relative_to(s.root):
             raise WsError(f"путь вне проекта: {path}")
         with _perm(self._rel(s, d)):
-            if not d.is_dir():
+            if not _is_dir(d):
                 raise WsError(f"не каталог: {path}")
         return d
 
@@ -628,14 +660,14 @@ class Hub:
     def _grep_py(self, s: Session, top: Path, rx: re.Pattern, glob: str, skipped: Skipped):
         deadline = time.monotonic() + GREP_TIMEOUT
         hits: list[str] = []
-        if top.is_file():
+        if _is_file(top):
             files = iter([top])
         else:
             files = (b / n for b, _d, fs in self._walk(s, top, skipped, deadline) for n in fs)
         try:
             for f in files:
                 try:
-                    if (f.is_symlink() and f != top) or not f.is_file():  # как rg: симлинки при обходе не открываем
+                    if (_is_symlink(f) and f != top) or not _is_file(f):  # как rg: симлинки при обходе не открываем
                         continue
                     rel = self._grep_ok(s, f, glob)
                     if rel is None:
@@ -736,7 +768,7 @@ class Hub:
                 return self._read(s, f, rel, offset, limit, rec)
 
     def _read(self, s: Session, f: Path, rel: str, offset: int, limit: int, rec: dict) -> str:
-        if not f.is_file():
+        if not _is_file(f):
             raise WsError(f"не файл: {rel}")
         rec["size"] = f.stat().st_size
         if f.suffix.lower() in EXTRACTABLE or _is_binary(f):
@@ -787,7 +819,7 @@ class Hub:
             rec["ws"] = s.ws.name
             f, rel = self._resolve(s, path)
             with _perm(rel):
-                if not f.is_file():
+                if not _is_file(f):
                     raise WsError(f"не файл: {path}")
                 rec["size"] = f.stat().st_size
                 if f.suffix.lower() not in EXTRACTABLE:
@@ -872,7 +904,7 @@ class Hub:
             s = self._session(ws)
             rec["ws"] = s.ws.name
             target, rel = self._resolve_for_write(s, path)
-            if not target.is_file():
+            if not _is_file(target):
                 raise WsError(f"файла нет: {rel}; для нового файла — write")
             if not old:
                 raise WsError("old не может быть пустым")

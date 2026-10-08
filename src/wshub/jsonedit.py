@@ -174,6 +174,8 @@ def _parse(text: str) -> tuple[str, str, Obj]:
         data = json.loads(body)
     except ValueError as e:
         raise ConfigError(f"не читается как JSON: {e}") from None
+    except RecursionError:  # Python 3.10–3.11 на очень глубокой вложенности
+        raise ConfigError("слишком глубокая вложенность JSON") from None
     if not isinstance(data, dict):
         raise ConfigError("в файле не JSON-объект")
     try:

@@ -69,4 +69,4 @@ wshub uninstall [--purge]   # убрать из Desktop; --purge — ещё ре
 uv tool uninstall wshub     # удалить программу
 ```
 
-Разработка, тесты и CI — [docs/development.md](docs/development.md). Лицензия — [GPL-3.0-or-later](LICENSE).
+Разработка, тесты и CI (только в Docker: `scripts/check.sh`) — [docs/development.md](docs/development.md). Лицензия — [GPL-3.0-or-later](LICENSE).

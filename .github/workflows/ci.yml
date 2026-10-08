@@ -1,5 +1,6 @@
 name: CI
 
+# Все проверки — внутри контейнера (docker/check.Dockerfile), на раннере ничего не ставится и не запускается.
 on:
   push:
     branches: ["**"]
@@ -15,22 +16,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  lint:
-    name: ruff
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-      - run: uv run --frozen ruff check .
-      - name: install.sh (shellcheck)
-        run: |
-          command -v shellcheck || { sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck; }
-          shellcheck install.sh
-
-  test:
-    name: pytest (Python ${{ matrix.python }})
+  check:
+    name: ruff, shellcheck, pytest (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -39,30 +26,42 @@ jobs:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v7
-      - name: ripgrep
-        run: |
-          command -v rg || { sudo apt-get update -qq && sudo apt-get install -y -qq ripgrep; }
-          rg --version
-      - uses: astral-sh/setup-uv@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: образ для проверок
+        uses: docker/build-push-action@v7
         with:
-          python-version: ${{ matrix.python }}
-          enable-cache: true
+          context: .
+          file: docker/check.Dockerfile
+          build-args: PYTHON=${{ matrix.python }}
+          tags: wshub-check:py${{ matrix.python }}
+          load: true
+          cache-from: type=gha,scope=check-py${{ matrix.python }}
+          cache-to: type=gha,mode=max,scope=check-py${{ matrix.python }}
       # WSL-тесты (метка wsl) здесь пропускаются с причиной в отчёте -rs
-      - run: uv run --frozen pytest -rs
+      - run: scripts/check.sh --python ${{ matrix.python }} --no-build
 
   build:
     name: сборка пакета
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
         with:
-          enable-cache: true
-      - run: uv build
-      - name: колесо содержит панель и запускается
+          context: .
+          file: docker/check.Dockerfile
+          build-args: PYTHON=3.13
+          tags: wshub-check:py3.13
+          load: true
+          cache-from: type=gha,scope=check-py3.13
+      - name: uv build в контейнере; колесо содержит панель и запускается
         run: |
-          python3 -m zipfile -l dist/*.whl | grep -q 'wshub/panel.html'
-          uv tool run --from dist/*.whl wshub --version
+          docker run --name wshub-dist wshub-check:py3.13 sh -ec '
+            uv build --out-dir /home/tester/dist
+            python3 -m zipfile -l /home/tester/dist/*.whl | grep -q "wshub/panel.html"
+            uv tool run --from /home/tester/dist/*.whl wshub --version'
+          docker cp wshub-dist:/home/tester/dist ./dist
+          docker rm wshub-dist
       - uses: actions/upload-artifact@v7
         with:
           name: dist

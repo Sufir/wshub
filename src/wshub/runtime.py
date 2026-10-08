@@ -59,6 +59,25 @@ def git_head(repo: Path | None) -> str | None:
     return None
 
 
+def installed_commit(dist: str = "wshub") -> str | None:
+    """Коммит, из которого пакет установлен из git (uv tool install git+…): vcs_info в direct_url.json."""
+    try:
+        from importlib.metadata import PackageNotFoundError, distribution
+
+        raw = distribution(dist).read_text("direct_url.json")
+        info = json.loads(raw) if raw else {}
+    except (PackageNotFoundError, OSError, ValueError):
+        return None
+    vcs = info.get("vcs_info") if isinstance(info, dict) else None
+    commit = vcs.get("commit_id") if isinstance(vcs, dict) else None
+    return commit if isinstance(commit, str) and commit else None
+
+
+def code_head(repo: Path | None) -> str | None:
+    """Версия кода для сравнения «запущен старый код?»: HEAD рабочей копии (editable) или коммит установки из git."""
+    return git_head(repo) if repo is not None else installed_commit()
+
+
 def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
     """Время старта процесса из /proc/<pid>/stat (поле 22): отличает живой pid от переиспользованного."""
     try:
@@ -121,7 +140,7 @@ class Runtime:
         self.pid = pid or os.getpid()
         self.started = clock()
         self.repo = repo_dir()
-        self.head = git_head(self.repo)
+        self.head = code_head(self.repo)
         self.last_call: dict | None = None
         self.enabled = False  # run-файл пишет только процесс сервера, не тесты и не doctor
         self._rev_stamp = None

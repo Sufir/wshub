@@ -203,9 +203,13 @@ def build_server(hub: Hub, panel: Panel | None = None) -> FastMCP:
 
 USAGE = """\
 wshub                     — MCP-сервер (stdio); его запускает Claude Desktop
+wshub setup               — подключить к Claude Desktop: конфиг, реестр, первый проект, перевалка (--help — флаги)
 wshub doctor              — проверить окружение: ripgrep, реестр, запись в Desktop, процессы, журнал, копии, перевалку
-wshub outbox set <путь>   — папка перевалки для publish, например /mnt/c/Users/<имя>/ClaudeOutbox
-wshub outbox clean        — удалить все каталоги перевалки wshub"""
+wshub update              — обновить wshub
+wshub uninstall           — убрать запись из Desktop; --purge — ещё реестр и состояние
+wshub outbox set <путь>   — папка перевалки для publish, например C:\\Users\\<имя>\\ClaudeOutbox
+wshub outbox clean        — удалить все каталоги перевалки wshub
+wshub --version           — версия и коммит"""
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -213,14 +217,30 @@ def main(argv: list[str] | None = None) -> None:
     # WSHUB_CONFIG / WSHUB_STATE — только для тестов и отладки
     config = Path(os.environ.get("WSHUB_CONFIG") or DEFAULT_CONFIG)
     state = Path(os.environ.get("WSHUB_STATE") or DEFAULT_STATE)
-    if argv == ["doctor"]:
+    cmd, rest = (argv[0], argv[1:]) if argv else (None, [])
+    if cmd is None:
+        serve(config, state)
+        return
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        sys.exit(0)
+    if cmd in ("--version", "version") and not rest:
+        from .install import version_line
+        print(version_line())
+        sys.exit(0)
+    if cmd == "doctor" and not rest:
         from .doctor import main as doctor
         sys.exit(doctor(config, state))
-    if argv[:1] == ["outbox"] and (argv[1:2] == ["clean"] and len(argv) == 2 or argv[1:2] == ["set"] and len(argv) == 3):
-        sys.exit(outbox_cli(config, state, argv[1:]))
-    if argv:
-        print(USAGE, file=sys.stderr)
-        sys.exit(0 if argv[0] in ("-h", "--help") else 2)
+    if cmd == "outbox" and (rest == ["clean"] or rest[:1] == ["set"] and len(rest) == 2):
+        sys.exit(outbox_cli(config, state, rest))
+    if cmd in ("setup", "uninstall", "update"):
+        from .install import cli
+        sys.exit(cli(cmd, rest, config, state))
+    print(USAGE, file=sys.stderr)
+    sys.exit(2)
+
+
+def serve(config: Path, state: Path) -> None:
     hub = Hub(config, state)
     hub.runtime.start()
     hub.publish()

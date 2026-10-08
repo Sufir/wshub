@@ -1,0 +1,41 @@
+name: Release
+
+# Тег vX.Y.Z → проверки и сборка в контейнере, затем GitHub Release с колесом и исходниками.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/check.Dockerfile
+          build-args: PYTHON=3.13
+          tags: wshub-check:py3.13
+          load: true
+          cache-from: type=gha,scope=check-py3.13
+      - name: тег совпадает с версией в pyproject.toml
+        run: |
+          version=$(docker run --rm --network none wshub-check:py3.13 uv version --short --frozen)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::тег $GITHUB_REF_NAME, а в pyproject.toml версия $version"
+            exit 1
+          fi
+      - run: scripts/check.sh --python 3.13 --no-build
+      - name: uv build в контейнере
+        run: |
+          docker run --name wshub-dist wshub-check:py3.13 uv build --out-dir /home/tester/dist
+          docker cp wshub-dist:/home/tester/dist ./dist
+          docker rm wshub-dist
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "wshub $GITHUB_REF_NAME" --generate-notes --verify-tag

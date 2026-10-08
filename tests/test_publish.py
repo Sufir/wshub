@@ -91,7 +91,7 @@ def test_refusals_like_read_and_partial_success(env, box):
     assert lines[1].endswith("\\a.txt — 12 байт") and lines[2].endswith("\\in-link.txt — 12 байт")
     refused = lines[3:]
     assert len(refused) == len(bad)
-    for line, (p, why) in zip(refused, bad.items()):
+    for line, (p, why) in zip(refused, bad.items(), strict=True):
         assert line.startswith(f"отказ: {p} — ") and why in line
     [st] = stages(box)
     assert sorted(p.name for p in st.iterdir()) == ["a.txt", "in-link.txt"]
@@ -332,6 +332,7 @@ def test_max_total_evicts_oldest(env, box):
     assert rec["tool"] == "publish" and rec["status"] == "error" and "переполнена" in rec["error"]
 
 
+@pytest.mark.nonroot
 def test_busy_file_skipped_then_retried(env, box):
     busy = make_stage(box, "20260101-000000-aaaaaa", 10, older=3600)
     os.chmod(busy, 0o555)  # как занятый файл в Windows: удалить содержимое нельзя
@@ -346,6 +347,7 @@ def test_busy_file_skipped_then_retried(env, box):
     assert env.hub.outbox_cleanup()["deleted"] == 1 and not busy.exists()
 
 
+@pytest.mark.nonroot
 def test_busy_counts_against_total(env, box):
     set_outbox(env, max_total_mb=1)
     busy = make_stage(box, "20260101-000000-aaaaaa", 900 * 1024, older=3600)
@@ -377,7 +379,7 @@ def test_two_processes_in_parallel(env, box):
     args = [sys.executable, "-c", SCRIPT, str(env.cfg), str(env.state), str(env.mnt)]
     procs = [subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(2)]
     outs = [p.communicate(timeout=60) for p in procs]
-    for p, (out, err) in zip(procs, outs):
+    for p, (_out, err) in zip(procs, outs, strict=True):
         assert p.returncode == 0, err
     dirs = stages(box)
     assert len(dirs) == 10 and not old.exists()
@@ -530,10 +532,15 @@ def test_doctor_outbox(env, box):
     set_outbox(env, text=f'[outbox]\npath = "{cloud}"\n')
     c = check()
     assert c["status"] == "warn" and "onedrive" in c["fix"].lower() + " ".join(c["detail"]).lower()
-    set_outbox(env, text=f'[outbox]\npath = "{box}"\n')
+
+
+@pytest.mark.nonroot
+def test_doctor_outbox_readonly(env, box):
+    ctx = make_panel(env).doctor_ctx
+    ctx.mnt_root = env.mnt
     os.chmod(box, 0o555)
     try:
-        c = check()
+        c = {c["id"]: c for c in doctor.run(ctx)["checks"]}["outbox"]
         assert c["status"] == "fail" and any("запись" in x for x in c["detail"])
     finally:
         os.chmod(box, 0o755)

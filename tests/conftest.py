@@ -10,6 +10,22 @@ import pytest
 
 from wshub.core import Hub
 
+# Только явный WSL с дисками Windows: ядро WSL в контейнере Docker само по себе не в счёт
+IN_WSL = bool(os.environ.get("WSL_DISTRO_NAME")) and Path("/mnt/c/Users").is_dir()
+IS_ROOT = hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def pytest_collection_modifyitems(config, items):
+    """Метки окружения: тест не падает, а пропускается с понятной причиной."""
+    for item in items:
+        if "wsl" in item.keywords and not IN_WSL:
+            item.add_marker(pytest.mark.skip(reason="нужен WSL с дисками Windows — "
+                                                    "запусти scripts/check.sh --wsl"))
+        if "nonroot" in item.keywords and IS_ROOT:
+            item.add_marker(pytest.mark.skip(reason="тесты запущены от root: chmod его не ограничивает, "
+                                                    "недоступные пути и занятые файлы не воспроизвести"))
+
+
 DENY = ['.env', '.env.*', '*.pem', '*.key', 'id_rsa*', 'id_ed25519*',
         '**/secrets/**', '**/node_modules/**', '**/.git/objects/**']
 

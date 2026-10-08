@@ -18,9 +18,9 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from . import housekeeping, outbox
 from .extract import EXTRACTABLE
 from .policy import Policy, glob_match
-from . import housekeeping, outbox
 from .registry import MODES, Limits, Outbox, RegistryError, RegistryFile, Workspace
 from .runtime import Runtime, handle_id
 
@@ -1001,7 +1001,8 @@ class Hub:
                 except OSError as e:
                     msg = f"не удалось прочитать: {e.strerror or e}"
                 refused.append((p, msg))
-                self._write_audit({**self._new_rec("publish", p), "ws": s.ws.name, "status": "error", "error": msg[:500]})
+                self._write_audit({**self._new_rec("publish", p), "ws": s.ws.name, "status": "error",
+                                   "error": msg[:500]})
             stage = None
             if ok:
                 incoming = sum(x[3] for x in ok)
@@ -1018,7 +1019,7 @@ class Hub:
             names = outbox.unique_names([outbox.ntfs_name(Path(os.path.normpath(p)).name or Path(rel).name)
                                          for p, _f, rel, _size in ok])
             lines = []
-            for (p, f, rel, _size), name in zip(ok, names):
+            for (p, f, rel, _size), name in zip(ok, names, strict=True):
                 rec = {**self._new_rec("publish", rel), "ws": s.ws.name, "outbox_id": stage.name}
                 try:
                     with _perm(rel, "чтение или запись копии"):

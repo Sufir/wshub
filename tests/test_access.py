@@ -6,9 +6,7 @@ import pytest
 
 from wshub.core import WsError
 
-pytestmark = pytest.mark.skipif(
-    hasattr(os, "geteuid") and os.geteuid() == 0,
-    reason="тесты запущены от root: chmod 000 его не ограничивает, недоступные пути не воспроизвести")
+pytestmark = pytest.mark.nonroot
 
 SKIP_RE = re.compile(r"\(пропущен[о]? (\d+) недоступн\w+ пут\w+, например: (.+)\)$")
 
@@ -16,7 +14,7 @@ SKIP_RE = re.compile(r"\(пропущен[о]? (\d+) недоступн\w+ пу�
 @pytest.fixture
 def locked(env):
     """locked_dir/ — 000; locked.txt и locked.pdf — 000;
-    noexec/ — r-- без x (как root-каталог valinor): имена видны, но ни stat, ни вход внутрь."""
+    noexec/ — r-- без x (как чужой каталог с правами r--): имена видны, но ни stat, ни вход внутрь."""
     p = env.proj
     (p / "ok.txt").write_text("needle ok\n")
     (p / "ok.pdf").write_bytes(b"%PDF-1.4\n")

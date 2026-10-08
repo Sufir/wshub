@@ -5,12 +5,12 @@ import os
 from datetime import datetime
 
 import pytest
+from test_panel_ops import make_panel
 
 from wshub import doctor, housekeeping
+from wshub.core import WsError
 from wshub.registry import Limits, RegistryError, parse
 from wshub.registry_edit import revision
-
-from test_panel_ops import make_panel
 
 DAY = 86400
 
@@ -67,7 +67,7 @@ def test_panel_changes_logged(env):
     panel.restore(panel.data()["nonce"], "payload", item["id"])
     hid = env.hub.handles[token].hid
     panel.revoke(panel.data()["nonce"], hid)
-    with pytest.raises(Exception):
+    with pytest.raises(WsError):
         panel.revoke("bad", hid)
     tools = [(r["tool"], r["status"]) for r in journal(env)]
     assert tools == [("workspace_open", "ok"), ("write", "ok"), ("panel_save", "ok"), ("panel_limits", "ok"),
@@ -80,7 +80,7 @@ def test_audit_filters(env):
     token = env.open("payload", "rw")
     env.hub.write(token, "a.txt", "v2\n")
     env.hub.read(token, "a.txt")
-    with pytest.raises(Exception):
+    with pytest.raises(WsError):
         env.hub.read(token, ".env")
     key = panel.data()["key"]
     assert [r["tool"] for r in panel.audit(key)["records"]] == ["read", "read", "write", "workspace_open"]
@@ -312,7 +312,8 @@ def test_doctor_storage(env):
     assert "из 2 МБ" in checks["audit"]["detail"][0]
     assert checks["audit"]["detail"][1].startswith("архивов: 1 из 5")
     assert "файлов 1" in checks["backup"]["detail"][0] and "старше 30 дн." in checks["backup"]["detail"][1]
-    assert checks["limits"]["status"] == "ok" and "journal_max_mb = 2 (размер файла журнала, МБ)" in checks["limits"]["detail"]
+    assert checks["limits"]["status"] == "ok"
+    assert "journal_max_mb = 2 (размер файла журнала, МБ)" in checks["limits"]["detail"]
     assert res["storage"]["journal"]["archives"] == 1 and res["storage"]["backup"]["files"] == 1
     env.write_registry()
     checks = {c["id"]: c for c in doctor.run(ctx)["checks"]}

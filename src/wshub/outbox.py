@@ -13,14 +13,15 @@ import re
 import secrets
 import shutil
 import string
+from collections.abc import Callable
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Callable
 
 from .runtime import atomic_write_text
 
-MNT = Path("/mnt")
+# где смонтированы диски Windows; WSHUB_MNT — только для тестов и нестандартного automount.root
+MNT = Path(os.environ.get("WSHUB_MNT") or "/mnt")
 STAGE_RE = re.compile(r"^\d{8}-\d{6}-[a-z0-9]{6}$")
 STAGE_ALPHABET = string.ascii_lowercase + string.digits
 PARTIAL = ".partial"
@@ -85,13 +86,13 @@ def win_path(path: Path, mnt: Path = MNT) -> str | None:
     return f"{parts[0].upper()}:\\" + "\\".join(parts[1:])
 
 
-def from_windows(path: str) -> str:
+def from_windows(path: str, mnt: Path | None = None) -> str:
     """C:\\Users\\x → /mnt/c/Users/x; остальное — как есть."""
     m = re.fullmatch(r"([a-zA-Z]):[\\/]*(.*)", path.strip())
     if not m:
         return path
     rest = m.group(2).replace("\\", "/").strip("/")
-    return f"/mnt/{m.group(1).lower()}" + (f"/{rest}" if rest else "")
+    return f"{mnt or MNT}/{m.group(1).lower()}" + (f"/{rest}" if rest else "")
 
 
 def path_problems(path, roots: dict[str, Path], mnt: Path = MNT,
@@ -232,8 +233,8 @@ def cleanup(root: Path, ttl_s: float, now: float, max_total: int | None = None, 
 
 def write_mark(state: Path, res: dict, now: float) -> None:
     try:
-        atomic_write_text(Path(state) / CLEAN_MARK,
-                          json.dumps({"ts": now, "deleted": res["deleted"], "freed": res["freed"], "busy": res["busy"]}))
+        mark = {"ts": now, "deleted": res["deleted"], "freed": res["freed"], "busy": res["busy"]}
+        atomic_write_text(Path(state) / CLEAN_MARK, json.dumps(mark))
     except OSError:
         pass
 

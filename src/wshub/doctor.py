@@ -16,7 +16,7 @@ from pathlib import Path
 
 from . import housekeeping, outbox
 from .registry import LIMITS, OUTBOX, Limits, Outbox, RegistryError, parse
-from .runtime import git_head, live_processes, pid_alive, proc_start, repo_dir
+from .runtime import code_head, live_processes, pid_alive, proc_start, repo_dir
 
 BACKUP_WARN = 1024 * 1024 * 1024
 if sys.version_info >= (3, 11):
@@ -32,7 +32,7 @@ class Ctx:
     config: Path
     state: Path
     home: Path = field(default_factory=Path.home)
-    win_users: Path = Path("/mnt/c/Users")
+    win_users: Path = field(default_factory=lambda: outbox.MNT / "c" / "Users")
     proc: Path = Path("/proc")
     repo: Path | None = field(default_factory=repo_dir)
     distro: str | None = field(default_factory=lambda: os.environ.get("WSL_DISTRO_NAME"))
@@ -82,7 +82,7 @@ def check_tomlkit() -> dict:
         import tomlkit
     except ImportError:
         return _check("tomlkit", "tomlkit", "fail", "tomlkit не установлен: панель не может сохранять реестр",
-                      "переустанови wshub: uv tool install --editable --reinstall <папка репозитория wshub>")
+                      "переустанови wshub: uv tool install --reinstall git+https://github.com/Sufir/wshub")
     return _check("tomlkit", "tomlkit", "ok", f"tomlkit {getattr(tomlkit, '__version__', '?')}")
 
 
@@ -92,7 +92,7 @@ def check_registry(ctx: Ctx) -> tuple[dict, dict | None]:
         text = ctx.config.read_text(encoding="utf-8")
     except FileNotFoundError:
         return _check("registry", title, "fail", f"реестра нет: {ctx.config}",
-                      "создай файл по образцу из README или добавь проект в панели"), None
+                      "запусти wshub setup — он создаст реестр и добавит первый проект"), None
     except OSError as e:
         return _check("registry", title, "fail", f"не читается: {ctx.config}: {e}", "проверь права на файл"), None
     try:
@@ -227,7 +227,7 @@ def check_desktop(ctx: Ctx) -> dict:
     cands = desktop_candidates(ctx)
     if not cands:
         return _check("desktop", title, "info", "конфигов Claude Desktop не найдено (не Windows/WSL и не Linux/macOS "
-                      "Desktop)", "добавь запись wshub в claude_desktop_config.json, см. README")
+                      "Desktop)", "установи Claude Desktop, запусти его один раз, затем wshub setup")
     lines, active = [], []
     for c in cands:
         mark = "читается Desktop" if c["used"] else "не читается"
@@ -250,10 +250,10 @@ def check_desktop(ctx: Ctx) -> dict:
     stale = [c for c in cands if not c["used"] and c.get("entry")]
     if not active:
         return _check("desktop", title, "fail", lines,
-                      "добавь запись wshub в файл с пометкой «читается Desktop» при закрытом Desktop (README)")
+                      "запусти wshub setup — он добавит запись в файл с пометкой «читается Desktop»")
     broken = [c for c in active if c["entry"]["problems"]]
     if broken:
-        return _check("desktop", title, "fail", lines, "исправь command/args записи wshub при закрытом Desktop")
+        return _check("desktop", title, "fail", lines, "запусти wshub setup — он исправит запись")
     if stale:
         return _check("desktop", title, "warn", lines,
                       "запись в нечитаемом файле ни на что не влияет — её можно удалить, чтобы не путаться")
@@ -278,7 +278,7 @@ def _is_wshub_cmd(argv: list[str]) -> bool:
 
 def processes(ctx: Ctx) -> dict:
     """Живые процессы сервера: с run-файлом и без него (запущены версией до панели)."""
-    head_disk = git_head(ctx.repo)
+    head_disk = code_head(ctx.repo)
     reg = live_processes(ctx.state, ctx.proc)
     known = {int(d["pid"]) for d in reg}
     rows = []
@@ -318,10 +318,11 @@ def check_processes(ctx: Ctx, procs: dict) -> dict:
     for r in procs["legacy"]:
         lines.append(f"pid {r['pid']}: без run-файла — запущен версией wshub до панели ({r['cmd']})")
     head = procs["head_disk"]
-    lines.append(f"HEAD на диске: {head[:8] if head else 'неизвестен (не git-checkout)'}")
+    lines.append(f"код на диске: {head[:8] if head else 'версия неизвестна (не git-checkout и не установка из git)'}")
     if any(r["stale"] for r in procs["registered"]) or procs["legacy"]:
         return _check("procs", title, "warn", lines,
-                      "код новее запущенного — перезапусти Desktop (полностью, из трея), чтобы процессы взяли новый код")
+                      "код новее запущенного — перезапусти Desktop (полностью, из трея), "
+                      "чтобы процессы взяли новый код")
     if not procs["registered"]:
         return _check("procs", title, "info", lines + ["живых процессов нет: Desktop не запущен или wshub отключён"],
                       "")

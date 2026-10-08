@@ -1,10 +1,26 @@
 [project]
 name = "wshub"
-version = "0.1.0"
-description = "Локальный MCP-сервер (stdio): доступ к папкам проектов по реестру ~/.config/wshub/workspaces.toml"
+version = "0.2.0"
+description = "Один MCP-сервер для Claude Desktop: доступ облачных сессий Claude к папкам проектов в WSL по реестру"
 readme = "README.md"
-license = { text = "MIT" }
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE"]
+authors = [{ name = "Sufir" }]
 requires-python = ">=3.10"
+keywords = ["mcp", "claude", "claude-desktop", "wsl", "model-context-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development",
+]
 dependencies = [
     # 1.x проверена с нашим Claude Desktop — не повышать
     "mcp>=1.2,<2",
@@ -17,16 +33,36 @@ dependencies = [
     "tomlkit>=0.12",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Sufir/wshub"
+Documentation = "https://github.com/Sufir/wshub/tree/main/docs"
+Issues = "https://github.com/Sufir/wshub/issues"
+Changelog = "https://github.com/Sufir/wshub/releases"
+
 [project.scripts]
 wshub = "wshub.server:main"
 
 [dependency-groups]
-# ripgrep с PyPI нужен только тестам, чтобы проверить ветку grep через rg
-dev = ["pytest>=8", "ripgrep"]
+# только для образа проверок (docker/check.Dockerfile); ripgrep там системный: колесо с PyPI требует glibc 2.39
+dev = ["pytest>=8", "ruff>=0.9"]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.sdist]
+include = ["src", "tests", "docs", "README.md", "LICENSE", "install.sh"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "wsl: нужен WSL с дисками Windows (scripts/check.sh --wsl); иначе тест пропускается",
+    "nonroot: нужен обычный пользователь (chmod); от root тест пропускается",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]

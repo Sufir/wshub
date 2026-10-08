@@ -7,9 +7,9 @@ import os
 import re
 import stat
 import tempfile
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
-from typing import Callable
 
 from .outbox import from_windows
 from .policy import glob_regex

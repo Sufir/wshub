@@ -1,0 +1,69 @@
+name: CI
+
+# Все проверки — внутри контейнера (docker/check.Dockerfile), на раннере ничего не ставится и не запускается.
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ruff, shellcheck, pytest (Python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # те же версии, что в classifiers pyproject.toml (requires-python >= 3.10)
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - name: образ для проверок
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/check.Dockerfile
+          build-args: PYTHON=${{ matrix.python }}
+          tags: wshub-check:py${{ matrix.python }}
+          load: true
+          cache-from: type=gha,scope=check-py${{ matrix.python }}
+          cache-to: type=gha,mode=max,scope=check-py${{ matrix.python }}
+      # WSL-тесты (метка wsl) здесь пропускаются с причиной в отчёте -rs
+      - run: scripts/check.sh --python ${{ matrix.python }} --no-build
+
+  build:
+    name: сборка пакета
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/check.Dockerfile
+          build-args: PYTHON=3.13
+          tags: wshub-check:py3.13
+          load: true
+          cache-from: type=gha,scope=check-py3.13
+      - name: uv build в контейнере; колесо содержит панель и запускается
+        run: |
+          docker run --name wshub-dist wshub-check:py3.13 sh -ec '
+            uv build --out-dir /home/tester/dist
+            python3 -m zipfile -l /home/tester/dist/*.whl | grep -q "wshub/panel.html"
+            uv tool run --from /home/tester/dist/*.whl wshub --version'
+          docker cp wshub-dist:/home/tester/dist ./dist
+          docker rm wshub-dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7

@@ -38,7 +38,7 @@ REGISTRY_TEMPLATE = f"""\
 # закрыто во всех проектах: имена видны, содержимое — нет
 deny = [
   ".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*",
-  "**/secrets/**", "**/node_modules/**", "**/.git/objects/**",
+  "**/secrets/**", "**/node_modules/**", "**/.git/objects/**", "**/.git/config",
 ]
 max_read_kb = 512  # больше за один read не отдаётся
 ttl_hours = 8      # срок жизни хэндла workspace_open
@@ -484,7 +484,7 @@ def setup_registry(env: Env, ui: UI, hub, project: tuple[str, str] | None) -> tu
     if ui.dry:
         ui.done(f"добавлен проект {name} [{mode}] → {path}" + (f", BRIEF {brief}" if brief else ""))
         return True, name
-    editor = RegistryEditor(env.config, env.state / "registry-history", hub.protected_overlap)
+    editor = RegistryEditor(env.config, env.state / "registry-history", hub.workspace_conflict)
     try:
         changes = editor.save(name=name, path=str(path), mode=mode, description="", brief=brief, deny=[],
                               rev=revision(env.config.read_bytes()), create=True)
@@ -541,7 +541,7 @@ def setup_outbox(env: Env, ui: UI, hub) -> bool:
     except OSError as e:
         ui.note(f"папку {target} создать не удалось: {e}")
         return False
-    editor = RegistryEditor(env.config, env.state / "registry-history", hub.protected_overlap)
+    editor = RegistryEditor(env.config, env.state / "registry-history", hub.workspace_conflict)
     try:
         changes = editor.save_outbox(values={"path": str(target)}, rev=revision(env.config.read_bytes()),
                                      check_path=lambda p, r: outbox.path_problems(p, r, env.mnt,
@@ -559,7 +559,8 @@ def run_doctor(env: Env, hub, ui: UI) -> bool:
     """Короткая сводка doctor: только то, что требует внимания; полный отчёт — wshub doctor."""
     ui.step("Проверка (wshub doctor)")
     ctx = doctor.Ctx(config=env.config, state=env.state, home=env.home, win_users=env.users_dir, distro=env.distro,
-                     protected_overlap=hub.protected_overlap, mnt_root=env.mnt)
+                     protected_overlap=hub.protected_overlap, workspace_conflict=hub.workspace_conflict,
+                     mnt_root=env.mnt)
     checks = doctor.run(ctx)["checks"]
     for c in checks:
         if c["status"] in ("warn", "fail"):

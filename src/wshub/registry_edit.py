@@ -53,10 +53,10 @@ def mask_error(m) -> str | None:
 
 
 class RegistryEditor:
-    def __init__(self, path: Path, history_dir: Path, protected_overlap: Callable[[Path], Path | None]):
+    def __init__(self, path: Path, history_dir: Path, workspace_conflict: Callable[[Path, str], str | None]):
         self.path = Path(path)
         self.history_dir = Path(history_dir)
-        self.protected_overlap = protected_overlap
+        self.workspace_conflict = workspace_conflict  # Hub.workspace_conflict: самозащита по режиму
 
     def _load(self, rev: str):
         import tomlkit  # только здесь: без tomlkit сервер работает, не работает лишь правка из панели
@@ -102,9 +102,9 @@ class RegistryEditor:
                 errs.append(f"{path} — не каталог; выбери папку")
             else:
                 root = p.resolve()
-                bad = self.protected_overlap(root)
+                bad = self.workspace_conflict(root, mode if mode in MODES else "ro")
                 if bad is not None:
-                    errs.append(f"папка пересекается со служебным каталогом wshub {bad} — выбери другую")
+                    errs.append(bad)
         if not isinstance(description, str):
             errs.append("описание должно быть строкой")
         elif len(description) > DESC_MAX or "\n" in description:

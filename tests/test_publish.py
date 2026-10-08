@@ -275,6 +275,12 @@ def test_path_problems(env, box):
     assert outbox.from_windows("C:\\Users\\me\\Box") == "/mnt/c/Users/me/Box"
 
 
+def test_path_problems_code_dir(env, code_dir):
+    """Перевалка строгая: каталог кода wshub не годится, хотя проект в ro на нём открывается."""
+    errs = path_problems(str(code_dir), {}, env.tmp, env.hub.protected_overlap)
+    assert any(f"служебным каталогом wshub {code_dir}" in e for e in errs), errs
+
+
 def test_bad_path_refuses_publish(env, box):
     env.workspaces["inbox"] = {"path": str(box.parent), "mode": "ro"}
     set_outbox(env)

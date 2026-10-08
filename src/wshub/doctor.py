@@ -37,7 +37,8 @@ class Ctx:
     repo: Path | None = field(default_factory=repo_dir)
     distro: str | None = field(default_factory=lambda: os.environ.get("WSL_DISTRO_NAME"))
     self_pid: int = field(default_factory=os.getpid)
-    protected_overlap: object = None  # Hub.protected_overlap, если есть
+    protected_overlap: object = None  # Hub.protected_overlap, если есть: строгая проверка перевалки
+    workspace_conflict: object = None  # Hub.workspace_conflict, если есть: самозащита для проектов
     mnt_root: Path = outbox.MNT  # где смонтированы диски Windows
 
 
@@ -111,26 +112,39 @@ def check_paths(ctx: Ctx, reg) -> dict:
     title = "Пути проектов"
     if reg is None:
         return _check("paths", title, "info", "не проверены: реестр не прочитан", "сначала исправь реестр")
-    lines, bad = [], []
+    lines, bad, rw_code = [], [], []
     for w in reg.workspaces.values():
         if not w.path.is_dir():
             bad.append(w.name)
             lines.append(f"{w.name}: папки нет — {w.path}")
             continue
-        overlap = ctx.protected_overlap(w.path.resolve()) if ctx.protected_overlap else None
-        if overlap is not None:
+        root = w.path.resolve()
+        conflict = ctx.workspace_conflict if ctx.workspace_conflict else lambda _root, _mode: None
+        why = conflict(root, "ro")
+        if why is not None:
             bad.append(w.name)
-            lines.append(f"{w.name}: пересекается со служебным каталогом wshub {overlap} — не откроется")
+            lines.append(f"{w.name}: {why} — не откроется")
+            continue
+        code = conflict(root, "rw") is not None
+        if code and w.mode == "rw":
+            rw_code.append(w.name)
+            p = ctx.protected_overlap(root) if ctx.protected_overlap else None
+            where = f" {p}" if p else ""  # без protected_overlap каталог неизвестен — без него
+            lines.append(f"{w.name}: пересекается с кодом wshub{where} — в rw не откроется, в ro откроется")
             continue
         brief = ""
         if w.brief:
             brief = ", BRIEF есть" if (w.path / w.brief).is_file() else f", BRIEF {w.brief} — файла нет"
-        lines.append(f"{w.name}: {w.path}{brief}")
+        lines.append(f"{w.name}: {w.path}{brief}{', код wshub — только чтение' if code else ''}")
     if not reg.workspaces:
         return _check("paths", title, "info", "реестр пуст", "добавь проект на вкладке «Проекты»")
+    fixes = []
     if bad:
-        return _check("paths", title, "fail", lines,
-                      f"исправь путь или удали проект: {', '.join(bad)} (вкладка «Проекты»)")
+        fixes.append(f"исправь путь или удали проект: {', '.join(bad)} (вкладка «Проекты»)")
+    if rw_code:
+        fixes.append(f"смени режим на ro: {', '.join(rw_code)} (вкладка «Проекты»)")
+    if fixes:
+        return _check("paths", title, "fail" if bad else "warn", lines, "; ".join(fixes))
     return _check("paths", title, "ok", lines)
 
 
@@ -470,6 +484,6 @@ def main(config: Path, state: Path) -> int:
 
     hub = Hub(config, state)
     res = run(Ctx(config=Path(config), state=Path(state), protected_overlap=hub.protected_overlap,
-                  mnt_root=hub.mnt_root))
+                  workspace_conflict=hub.workspace_conflict, mnt_root=hub.mnt_root))
     print(format_report(res))
     return 1 if any(c["status"] == "fail" for c in res["checks"]) else 0

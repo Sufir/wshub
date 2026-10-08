@@ -194,6 +194,7 @@
       <label class="inline"><input type="radio" name="f-mode" value="ro"> ro — только чтение</label>
       <label class="inline"><input type="radio" name="f-mode" value="rw"> rw — чтение и запись</label>
     </fieldset>
+    <div id="f-mode-why" class="hint why" hidden></div>
     <div class="field">
       <label for="f-desc">Описание</label>
       <input type="text" id="f-desc" autocomplete="off">
@@ -735,7 +736,8 @@ function askDelete(w) {
 
 // ----- форма проекта -----
 
-const form = { editing: null, masks: [] };
+// pathKind/pathProtected — ответ panel_path_check для пути pathFor: "data" | "code" | null
+const form = { editing: null, masks: [], pathFor: null, pathKind: null, pathProtected: null };
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9-]*$/;
 
 function openForm(w) {
@@ -755,6 +757,7 @@ function openForm(w) {
   renderMasks();
   renderFormState();
   checkBrief();
+  checkPath();
   $("form").scrollIntoView({ block: "nearest" });
 }
 
@@ -795,6 +798,12 @@ function renderFormState() {
   $("f-defaults").textContent = data.defaults && data.defaults.deny
     ? `Плюс общие маски, они действуют всегда: ${data.defaults.deny.join(", ")}` : "";
 
+  // пока ответа panel_path_check для текущего пути нет — не блокируем: сервер проверит при сохранении
+  const kind = form.pathFor === v.path ? form.pathKind : null;
+  const rw = document.querySelector("input[name=f-mode][value=rw]");
+  rw.disabled = kind === "code";
+  setWhy("f-mode-why", kind === "code" ? `rw недоступен: папка пересекается с кодом wshub ${form.pathProtected}.` : "");
+
   const pv = !v.path ? "сначала укажи путь к папке проекта." : !v.deny.length ? "добавь хотя бы одну маску." : "";
   $("f-preview").disabled = !!pv;
   setWhy("f-preview-why", pv);
@@ -806,6 +815,8 @@ function renderFormState() {
   let why = missing.length ? `заполни: ${missing.join(", ")}.` : "";
   if (!why && !form.editing && !NAME_RE.test(v.name)) why = "имя: только латиница, цифры и дефис, первый символ — буква или цифра.";
   if (!why && v.deny.some((m) => !m)) why = "есть пустая маска — впиши её или нажми «Убрать».";
+  if (!why && kind === "data") why = `папка пересекается со служебными данными wshub ${form.pathProtected} — выбери другую.`;
+  if (!why && kind === "code" && v.mode === "rw") why = "режим rw для этой папки недоступен — выбери ro.";
   if (!why && data.registry_error) why = "в реестре ошибка — исправь файл вручную.";
   $("f-save").disabled = !!why;
   setWhy("f-save-why", why);
@@ -818,6 +829,22 @@ for (const id of ["f-path", "f-brief"]) $(id).addEventListener("input", () => {
   clearTimeout(briefTimer);
   briefTimer = setTimeout(checkBrief, 400);
 });
+let pathTimer = null;
+$("f-path").addEventListener("input", () => {
+  clearTimeout(pathTimer);
+  pathTimer = setTimeout(checkPath, 400);
+});
+
+async function checkPath() {
+  const path = formValues().path;
+  let r = { protected: null, protected_kind: null };
+  if (path) {
+    try { r = await readTool("panel_path_check", { path }); } catch (e) { /* не блокируем: сервер проверит при сохранении */ }
+  }
+  if (formValues().path !== path) return;  // путь уже другой — ответ устарел
+  form.pathFor = path; form.pathKind = r.protected_kind; form.pathProtected = r.protected;
+  renderFormState();
+}
 
 async function checkBrief() {
   const v = formValues();
@@ -876,8 +903,10 @@ async function browse(path) {
     picker.path = r.path; picker.parent = r.parent;
     $("pk-path").textContent = r.path || "(корни)";
     $("pk-up").disabled = !r.parent;
-    $("pk-choose").disabled = !r.path || !!r.protected;
-    setWhy("pk-why", !r.path ? "выбери один из корней ниже." : r.protected ? `папка пересекается со служебным каталогом wshub ${r.protected}.` : "");
+    $("pk-choose").disabled = !r.path || r.protected_kind === "data";
+    setWhy("pk-why", !r.path ? "выбери один из корней ниже."
+      : r.protected_kind === "data" ? `папка пересекается со служебными данными wshub ${r.protected} — выбери другую.`
+      : r.protected_kind === "code" ? `папка пересекается с кодом wshub ${r.protected}: подойдёт только режим ro.` : "");
     $("pk-msg").textContent = r.truncated ? "Показаны первые 1000 папок." : (r.dirs.length ? "" : "Вложенных папок нет.");
     $("pk-list").replaceChildren(...(r.path && !r.parent ? [el("button", { type: "button", text: "↑ к списку корней", onclick: () => browse("") })] : []),
       ...r.dirs.map((d) => el("button", { type: "button", class: "mono", text: d.name + "/", onclick: () => browse(d.path) })));
@@ -897,6 +926,7 @@ $("pk-choose").addEventListener("click", () => {
   $("picker").hidden = true;
   renderFormState();
   checkBrief();
+  checkPath();
 });
 
 // ---------- Сессии ----------

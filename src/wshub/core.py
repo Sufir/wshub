@@ -49,6 +49,9 @@ NO_OUTBOX = ("перевалка для publish не настроена (в ре
              "wshub outbox set /mnt/c/Users/<имя>/ClaudeOutbox или поля «Перевалка» в панели wshub. "
              "Пока показать файл карточкой нельзя")
 COPY_CHUNK = 1024 * 1024
+PROTECTED_DATA = "папка пересекается со служебными данными wshub {} — выбери другую"
+PROTECTED_CODE = ("папка пересекается с кодом wshub {} — запись туда запрещена, "
+                  "для такой папки доступен только режим ro")
 
 _UMASK = os.umask(0)
 os.umask(_UMASK)
@@ -173,30 +176,51 @@ class Hub:
         self.handles: dict[str, Handle] = {}
         self.clock = clock
         self.rg = shutil.which("rg")  # None → питоновский обход
-        self.protected = self._protected_paths(Path(config).parent)
+        self.protected_data, self.protected_code = self._protected_paths(Path(config).parent)
         self.runtime = Runtime(self.state_dir, clock=clock)
         self._next_cleanup = 0.0  # раньше этого времени очистку копий не проверяем
         self.mnt_root = outbox.MNT  # тесты подменяют: «диск Windows» во временной папке
 
     # ---------- самозащита, хэндлы, пути ----------
 
-    def _protected_paths(self, config_dir: Path) -> list[Path]:
+    def _protected_paths(self, config_dir: Path) -> tuple[list[Path], list[Path]]:
+        """Служебные каталоги wshub: данные (реестр, состояние) и код (пакет, репозиторий, venv, uv tools)."""
         pkg = Path(__file__).resolve().parent
         uv_tools = os.environ.get("UV_TOOL_DIR") or Path(
             os.environ.get("XDG_DATA_HOME") or HOME / ".local/share") / "uv/tools"
-        ps = [pkg, config_dir, self.state_dir, DEFAULT_CONFIG.parent, DEFAULT_STATE, Path(uv_tools) / "wshub"]
+        data = [config_dir, self.state_dir, DEFAULT_CONFIG.parent, DEFAULT_STATE]
+        code = [pkg, Path(uv_tools) / "wshub"]
         if (pkg.parents[1] / "pyproject.toml").is_file():  # editable-установка: корень репозитория
-            ps.append(pkg.parents[1])
+            code.append(pkg.parents[1])
         if sys.prefix != sys.base_prefix:  # venv, из которого запущен сервер
-            ps.append(Path(sys.prefix))
-        return [p.resolve() for p in ps]
+            code.append(Path(sys.prefix))
+        return [p.resolve() for p in data], [p.resolve() for p in code]
+
+    def protected_kind(self, root: Path) -> tuple[Path, str] | None:
+        """(служебный каталог, "data" | "code"), с которым пересекается root (внутри или снаружи), или None.
+        Данные проверяются первыми: корень, который задевает оба класса, считается данными."""
+        for kind, ps in (("data", self.protected_data), ("code", self.protected_code)):
+            for p in ps:
+                if p.is_relative_to(root) or root.is_relative_to(p):
+                    return p, kind
+        return None
 
     def protected_overlap(self, root: Path) -> Path | None:
-        """Служебный каталог wshub, с которым пересекается root (внутри или снаружи), или None."""
-        for p in self.protected:
-            if p.is_relative_to(root) or root.is_relative_to(p):
-                return p
-        return None
+        """Служебный каталог wshub любого класса, с которым пересекается root, или None. Строгая проверка —
+        только для перевалки [outbox]; проекты проверяет workspace_conflict."""
+        k = self.protected_kind(root)
+        return k[0] if k else None
+
+    def workspace_conflict(self, root: Path, mode: str) -> str | None:
+        """Почему проект с корнем root нельзя открыть в режиме mode, или None. Данные wshub закрыты всегда,
+        код wshub — только для записи (rw)."""
+        k = self.protected_kind(root)
+        if k is None:
+            return None
+        p, kind = k
+        if kind == "data":
+            return PROTECTED_DATA.format(p)
+        return PROTECTED_CODE.format(p) if mode == "rw" else None
 
     def handles_info(self) -> list[dict]:
         """Живые хэндлы без токенов — для run-файла и панели."""
@@ -400,9 +424,9 @@ class Hub:
             root = ws.path.resolve()
             if not _is_dir(root):
                 raise WsError(f"папка проекта не найдена: {ws.path}")
-            p = self.protected_overlap(root)
-            if p is not None:
-                raise WsError(f"отказ: проект {root} пересекается со служебным каталогом wshub {p}")
+            why = self.workspace_conflict(root, mode)
+            if why is not None:
+                raise WsError(f"отказ: проект {name} ({root}): {why}")
             now = self.clock()
             for t in [t for t, h in self.handles.items() if now >= h.expires]:
                 del self.handles[t]

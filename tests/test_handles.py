@@ -49,32 +49,85 @@ def test_handles_are_per_process(env):
         other.ls(ws, ".")
 
 
-@pytest.mark.parametrize("which", ["state_parent", "config_dir", "state_dir", "repo", "inside_state"])
+REPO = Path(wshub.__file__).resolve().parents[2]  # корень репозитория — только открыть и прочитать
+
+
+@pytest.mark.parametrize("which", ["state_parent", "config_dir", "state_dir", "inside_state"])
 def test_self_protection(env, which):
     target = {
         "state_parent": env.tmp,  # проект, внутри которого лежат state и реестр
         "config_dir": env.cfg.parent,
         "state_dir": env.state,
-        "repo": Path(wshub.__file__).resolve().parents[2],  # корень репозитория — только попытка открыть
         "inside_state": env.state / "backup",
     }[which]
     target.mkdir(parents=True, exist_ok=True)
     env.workspaces["bad"] = {"path": str(target), "mode": "rw"}
     env.write_registry()
-    with pytest.raises(WsError, match="служебным каталогом"):
-        env.hub.workspace_open("bad", "ro")
+    for mode in ("ro", "rw"):
+        with pytest.raises(WsError, match="служебными данными wshub"):
+            env.hub.workspace_open("bad", mode)
     assert not env.hub.handles
 
 
-def test_self_protection_uv_tool_dir(env, monkeypatch, tmp_path):
-    tools = tmp_path / "uvtools"
-    (tools / "wshub").mkdir(parents=True)
-    monkeypatch.setenv("UV_TOOL_DIR", str(tools))
-    hub = Hub(env.cfg, env.state)
-    env.workspaces["bad"] = {"path": str(tools), "mode": "ro"}
+def test_self_protection_repo_ro(env):
+    """Код wshub в ro открывается и читается; записи нет."""
+    env.workspaces["self"] = {"path": str(REPO), "mode": "ro"}
     env.write_registry()
-    with pytest.raises(WsError, match="служебным каталогом"):
-        hub.workspace_open("bad")
+    ws = env.open("self")
+    assert "[project]" in env.hub.read(ws, "pyproject.toml")
+    with pytest.raises(WsError, match="только для чтения"):
+        env.hub.write(ws, "pyproject.toml", "x")
+    with pytest.raises(WsError, match="rw недоступен"):
+        env.hub.workspace_open("self", "rw")
+
+
+def test_self_protection_uv_tool_dir(env, code_dir):
+    env.workspaces["tools"] = {"path": str(code_dir.parent), "mode": "ro"}
+    env.workspaces["tools_rw"] = {"path": str(code_dir.parent), "mode": "rw"}
+    env.write_registry()
+    env.open("tools")
+    with pytest.raises(WsError, match="доступен только режим ro"):
+        env.hub.workspace_open("tools_rw", "rw")
+
+
+def test_code_rw_by_hand(env, code_dir):
+    """rw поверх кода (реестр записан руками): rw — отказ, ro открывается, запись — отказ."""
+    env.workspaces["code"] = {"path": str(code_dir), "mode": "rw"}
+    env.write_registry()
+    with pytest.raises(WsError, match="кодом wshub"):
+        env.hub.workspace_open("code", "rw")
+    ws = env.open("code")
+    assert "code" in env.hub.read(ws, "x.txt")
+    with pytest.raises(WsError, match="только для чтения"):
+        env.hub.write(ws, "x.txt", "y")
+    assert (code_dir / "x.txt").read_text() == "code\n"
+
+
+@pytest.mark.parametrize("which", ["home", "tmp"])
+def test_root_with_data_and_code(env, code_dir, which):
+    """Корень, который содержит данные (и, возможно, код), — отказ в любом режиме: побеждают данные."""
+    target = Path.home() if which == "home" else env.tmp
+    env.workspaces["wide"] = {"path": str(target), "mode": "rw"}
+    env.write_registry()
+    for mode in ("ro", "rw"):
+        with pytest.raises(WsError, match="служебными данными wshub"):
+            env.hub.workspace_open("wide", mode)
+
+
+def test_symlink_to_protected(env, code_dir):
+    links = env.tmp / "links"
+    links.mkdir()
+    (links / "code").symlink_to(code_dir)
+    (links / "state").symlink_to(env.state)
+    env.state.mkdir(exist_ok=True)
+    env.workspaces["lcode"] = {"path": str(links / "code"), "mode": "rw"}
+    env.workspaces["lstate"] = {"path": str(links / "state"), "mode": "ro"}
+    env.write_registry()
+    env.open("lcode")
+    with pytest.raises(WsError, match="кодом wshub"):
+        env.hub.workspace_open("lcode", "rw")
+    with pytest.raises(WsError, match="служебными данными wshub"):
+        env.hub.workspace_open("lstate")
 
 
 def test_workspaces_list(env):

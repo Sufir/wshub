@@ -6,7 +6,7 @@
 ```toml
 [defaults]
 deny = [".env", ".env.*", "*.pem", "*.key", "id_rsa*", "id_ed25519*",
-        "**/secrets/**", "**/node_modules/**", "**/.git/objects/**"]
+        "**/secrets/**", "**/node_modules/**", "**/.git/objects/**", "**/.git/config"]
 max_read_kb = 512   # больше за один read не отдаётся
 ttl_hours = 8       # срок жизни хэндла workspace_open
 
@@ -33,7 +33,9 @@ max_files_per_call = 10
 
 ## Правила
 
-1. Имя проекта — латиница, цифры, `-` и `_`. Путь — абсолютный, не пересекается со служебными каталогами wshub.
+1. Имя проекта — латиница, цифры, `-` и `_`. Путь — абсолютный. Пересечение (внутри или снаружи) с данными wshub
+   (`~/.config/wshub`, `~/.local/state/wshub`, каталоги из `WSHUB_CONFIG` и `WSHUB_STATE`) — отказ всегда;
+   с кодом wshub (пакет, репозиторий при editable-установке, venv, `uv tools/wshub`) — только `ro`.
 2. `mode` в реестре — потолок: `workspace_open(name, "rw")` не даст записи в проект `ro`.
 3. Маски `deny` — без учёта регистра, по пути от корня и по имени; проверяются и путь, и цель симлинка.
    `ls`/`find` имена показывают, `read`/`extract`/`write`/`edit` отказывают, `grep` пропускает.

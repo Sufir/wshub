@@ -59,9 +59,10 @@ class Panel:
     def __init__(self, hub: Hub, roots: list[Path] | None = None, doctor_ctx: Ctx | None = None):
         self.hub = hub
         self.roots = [Path(r) for r in (roots if roots is not None else [HOME, Path("/mnt/c")])]
-        self.editor = RegistryEditor(hub.registry.path, hub.state_dir / "registry-history", hub.protected_overlap)
+        self.editor = RegistryEditor(hub.registry.path, hub.state_dir / "registry-history", hub.workspace_conflict)
         self.doctor_ctx = doctor_ctx or Ctx(config=hub.registry.path, state=hub.state_dir,
-                                            protected_overlap=hub.protected_overlap, mnt_root=hub.mnt_root)
+                                            protected_overlap=hub.protected_overlap,
+                                            workspace_conflict=hub.workspace_conflict, mnt_root=hub.mnt_root)
         self._nonces: dict[str, float] = {}  # код → срок
         self._keys: dict[str, float] = {}
 
@@ -200,10 +201,20 @@ class Panel:
         parent = None
         if any(d != r.resolve() and d.is_relative_to(r.resolve()) for r in self.roots if r.exists()):
             parent = str(d.parent)
-        overlap = self.hub.protected_overlap(d)
         return {"path": str(d), "parent": parent, "truncated": len(dirs) > BROWSE_MAX,
-                "dirs": [{"name": n, "path": str(d / n)} for n in dirs[:BROWSE_MAX]],
-                "protected": str(overlap) if overlap else None}
+                "dirs": [{"name": n, "path": str(d / n)} for n in dirs[:BROWSE_MAX]], **self._protected(d)}
+
+    def _protected(self, d: Path) -> dict:
+        k = self.hub.protected_kind(d)
+        return {"protected": str(k[0]) if k else None, "protected_kind": k[1] if k else None}
+
+    def path_check(self, key, path: str) -> dict:
+        """Пересекается ли папка со служебными каталогами wshub — для формы проекта."""
+        self._use_key(key)
+        root = Path(path) if isinstance(path, str) and path and "\x00" not in path else None
+        if root is None or not root.is_absolute() or not root.is_dir():
+            return {"protected": None, "protected_kind": None}
+        return self._protected(root.resolve())
 
     def brief_check(self, key, path: str, brief: str) -> dict:
         self._use_key(key)
@@ -228,8 +239,9 @@ class Panel:
         root = self._in_roots(path)
         if not root.is_dir():
             raise WsError(f"не каталог: {path} — выбери папку проекта")
-        if self.hub.protected_overlap(root) is not None:
-            raise WsError("папка пересекается со служебным каталогом wshub — выбери другую")
+        why = self.hub.workspace_conflict(root, "ro")
+        if why is not None:
+            raise WsError(why)
         if not isinstance(masks, list):
             raise WsError("masks — список масок")
         res = [{"mask": m, "error": mask_error(m), "count": 0, "sample": []} for m in masks]
@@ -371,15 +383,16 @@ class Panel:
             raise WsError(f"{rel} под deny — копия не открывается и не сравнивается")
         return f, rel
 
-    def _current(self, project, rel) -> tuple[Session, Path]:
+    def _current(self, project, rel, mode: str) -> tuple[Session, Path]:
         ws = self._workspace(project)
         if ws is None:
             raise WsError(f"проекта «{project}» нет в реестре — сравнивать и восстанавливать не с чем")
         root = ws.path.resolve()
         if not root.is_dir():
             raise WsError(f"папки проекта нет: {ws.path} — исправь путь на вкладке «Проекты»")
-        if self.hub.protected_overlap(root) is not None:
-            raise WsError("папка проекта пересекается со служебным каталогом wshub — исправь путь")
+        why = self.hub.workspace_conflict(root, mode)
+        if why is not None:
+            raise WsError(why)
         s = Session(ws, root, "rw", Policy(ws.deny), self.hub.registry.get().max_read_kb * 1024)
         target, _ = self.hub._resolve_for_write(s, rel)
         return s, target
@@ -387,7 +400,7 @@ class Panel:
     def diff(self, key, project: str, backup_id: str) -> dict:
         self._use_key(key)
         f, rel = self._backup_file(project, backup_id)
-        _s, cur = self._current(project, rel)
+        _s, cur = self._current(project, rel, "ro")
         exists = cur.is_file()
         if f.stat().st_size > DIFF_MAX_FILE or (exists and cur.stat().st_size > DIFF_MAX_FILE):
             return {"rel": rel, "current_exists": exists, "binary": False,
@@ -414,7 +427,7 @@ class Panel:
             rec["ws"] = project
             f, rel = self._backup_file(project, backup_id)
             rec["path"] = rel
-            s, target = self._current(project, rel)
+            s, target = self._current(project, rel, "rw")
             data = f.read_bytes()
             before = target.read_bytes() if target.is_file() else None
             if before == data:

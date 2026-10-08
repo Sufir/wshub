@@ -1,4 +1,5 @@
 """wshub doctor на подменённых путях: Windows-профиль, /proc, git-репозиторий — во временной папке."""
+import dataclasses
 import json
 import os
 import sys
@@ -38,7 +39,8 @@ def fake(env, tmp_path):
     proc = tmp_path / "proc"
     proc.mkdir()
     ctx = Ctx(config=env.cfg, state=env.state, home=tmp_path / "home", win_users=users, proc=proc, repo=repo,
-              distro="Ubuntu-test", self_pid=999999, protected_overlap=env.hub.protected_overlap)
+              distro="Ubuntu-test", self_pid=999999, protected_overlap=env.hub.protected_overlap,
+              workspace_conflict=env.hub.workspace_conflict)
     return ctx, msix, classic, exe
 
 
@@ -107,6 +109,28 @@ def test_registry_and_paths(fake, env):
     env.cfg.write_text("[defaults\n")
     res = by_id(doctor.run(ctx))
     assert res["registry"]["status"] == "fail" and res["paths"]["status"] == "info"
+
+
+def test_paths_over_code(fake, env, code_dir):
+    ctx = dataclasses.replace(fake[0], protected_overlap=env.hub.protected_overlap,
+                              workspace_conflict=env.hub.workspace_conflict)
+    env.workspaces = {"code": {"path": str(code_dir), "mode": "ro"}}
+    env.write_registry()
+    c = by_id(doctor.run(ctx))["paths"]
+    assert c["status"] == "ok" and c["detail"] == [f"code: {code_dir}, код wshub — только чтение"]
+
+    env.workspaces["coderw"] = {"path": str(code_dir), "mode": "rw"}
+    env.write_registry()
+    c = by_id(doctor.run(ctx))["paths"]
+    assert c["status"] == "warn" and "coderw" in c["fix"] and "смени режим на ro" in c["fix"]
+    assert f"coderw: пересекается с кодом wshub {code_dir} — в rw не откроется, в ro откроется" in c["detail"]
+
+    env.state.mkdir(exist_ok=True)
+    env.workspaces["data"] = {"path": str(env.state), "mode": "ro"}
+    env.write_registry()
+    c = by_id(doctor.run(ctx))["paths"]
+    assert c["status"] == "fail" and "data" in c["fix"] and "coderw" in c["fix"]
+    assert any(line.startswith("data: папка пересекается со служебными данными wshub") for line in c["detail"])
 
 
 def test_processes_and_stale_head(fake, env):

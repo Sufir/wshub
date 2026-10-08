@@ -131,6 +131,11 @@ def build_server(hub: Hub, panel: Panel | None = None) -> FastMCP:
         return ops.brief_check(key, path, brief)
 
     @app_tool
+    def panel_path_check(key: str, path: str) -> dict[str, Any]:
+        """Пересекается ли папка проекта со служебными каталогами wshub (данные или код). Только для панели."""
+        return ops.path_check(key, path)
+
+    @app_tool
     def panel_mask_preview(key: str, path: str, masks: list[str]) -> dict[str, Any]:
         """Какие файлы закрывает каждая маска deny (первые 50). Только для панели."""
         return ops.mask_preview(key, path, masks)
@@ -262,7 +267,7 @@ def outbox_cli(config: Path, state: Path, args: list[str]) -> int:
             print(f"wshub outbox clean: {e}", file=sys.stderr)
             return 1
         return 0
-    editor = RegistryEditor(hub.registry.path, hub.state_dir / "registry-history", hub.protected_overlap)
+    editor = RegistryEditor(hub.registry.path, hub.state_dir / "registry-history", hub.workspace_conflict)
     try:
         data = hub.registry.path.read_bytes() if hub.registry.path.exists() else b""
         with hub._audit("outbox_set") as rec:

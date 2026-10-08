@@ -25,7 +25,8 @@ def make_panel(env, hub=None, proc=None) -> Panel:
     fake_proc = env.tmp / "proc"
     fake_proc.mkdir(exist_ok=True)
     ctx = Ctx(config=env.cfg, state=env.state, home=env.tmp / "home", win_users=env.tmp / "nowin",
-              proc=proc or fake_proc, protected_overlap=hub.protected_overlap)
+              proc=proc or fake_proc, protected_overlap=hub.protected_overlap,
+              workspace_conflict=hub.workspace_conflict)
     return Panel(hub, roots=[env.tmp], doctor_ctx=ctx)
 
 
@@ -78,7 +79,8 @@ def test_nonce_expired_and_single_use(env, panel):
 
 def test_read_tools_require_key(env, panel):
     for call in (lambda k: panel.browse(k, str(env.tmp)), lambda k: panel.audit(k),
-                 lambda k: panel.backups(k), lambda k: panel.mask_preview(k, str(env.proj), ["*.txt"])):
+                 lambda k: panel.backups(k), lambda k: panel.mask_preview(k, str(env.proj), ["*.txt"]),
+                 lambda k: panel.path_check(k, str(env.proj))):
         with pytest.raises(WsError, match="ключ панели"):
             call("nope")
     t = [1_000_000.0]
@@ -182,8 +184,8 @@ def test_save_keeps_comments_and_history(env, panel):
     ({"path": "relative/dir"}, "абсолютным"),
     ({"path": "/nonexistent/wshub-test"}, "нет — проверь"),
     ({"path": "FILE"}, "не каталог"),
-    ({"path": "STATE"}, "служебным каталогом"),
-    ({"path": "CFGDIR"}, "служебным каталогом"),
+    ({"path": "STATE"}, "служебными данными wshub"),
+    ({"path": "CFGDIR"}, "служебными данными wshub"),
     ({"deny": ["ok*", ""]}, "пустая маска"),
     ({"deny": ["a\\b"]}, "косая черта"),
     ({"deny": ["[abc"]}, "незакрытая"),
@@ -205,6 +207,17 @@ def test_save_validation(env, panel, kw, err):
         save(panel, **kw)
     assert env.cfg.read_bytes() == before
     assert not (env.state / "registry-history").exists()
+
+
+def test_save_over_code(env, code_dir):
+    """Код wshub: ro сохраняется, rw — отказ, реестр не меняется."""
+    panel = make_panel(env)
+    before = env.cfg.read_bytes()
+    with pytest.raises(WsError, match="доступен только режим ro"):
+        save(panel, name="code", path=str(code_dir), mode="rw")
+    assert env.cfg.read_bytes() == before
+    save(panel, name="code", path=str(code_dir), mode="ro")
+    assert env.hub.registry.get().workspaces["code"].mode == "ro"
 
 
 def test_save_rejects_stale_revision(env, panel):
@@ -398,6 +411,46 @@ def test_mask_preview(env, panel):
     assert m["secrets"]["count"] == 1
     assert m["nomatch*"]["count"] == 0
     assert m["[bad"]["error"] and "незакрытая" in m["[bad"]["error"]
+
+
+def test_protected_kind_in_browse_and_path_check(env, code_dir):
+    panel = make_panel(env)
+    env.state.mkdir(exist_ok=True)
+    key = panel.data()["key"]
+    for path, kind in ((code_dir, "code"), (env.state, "data"), (env.tmp, "data"), (env.proj, None)):
+        for r in (panel.browse(key, str(path)), panel.path_check(key, str(path))):
+            assert r["protected_kind"] == kind, path
+            assert (r["protected"] is None) == (kind is None)
+    for bad in ("", "relative", str(env.proj / "a.txt"), "/nonexistent/wshub-test"):
+        assert panel.path_check(key, bad) == {"protected": None, "protected_kind": None}
+
+
+def test_mask_preview_protected(env, code_dir):
+    panel = make_panel(env)
+    env.state.mkdir(exist_ok=True)
+    key = panel.data()["key"]
+    r = panel.mask_preview(key, str(code_dir), ["*.txt"])
+    assert r["masks"][0]["count"] == 1
+    with pytest.raises(WsError, match="служебными данными wshub"):
+        panel.mask_preview(key, str(env.state), ["*"])
+
+
+def test_diff_restore_over_code(env, code_dir):
+    """ro-проект поверх кода: diff работает, restore — отказ, файл не меняется."""
+    env.workspaces["code"] = {"path": str(code_dir), "mode": "ro"}
+    env.write_registry()
+    stamp = env.state / "backup" / "code" / "20260101-000000"
+    stamp.mkdir(parents=True)
+    (stamp / "x.txt").write_text("old\n")
+    panel = make_panel(env)
+    key = panel.data()["key"]
+    item = panel.backups(key, "code")["items"][0]
+    diff = panel.diff(key, "code", item["id"])
+    assert "-old" in diff["diff"] and "+code" in diff["diff"]
+    d = panel.data()
+    with pytest.raises(WsError, match="кодом wshub"):
+        panel.restore(d["nonce"], "code", item["id"])
+    assert (code_dir / "x.txt").read_text() == "code\n"
 
 
 def test_brief_check(env, panel):

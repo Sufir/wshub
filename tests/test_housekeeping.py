@@ -306,7 +306,8 @@ def test_doctor_storage(env):
     env.hub.write(token, "a.txt", "v2\n")
     (env.state / "audit-20261001-120000.jsonl").write_text("{}\n")
     ctx = Ctx(config=env.cfg, state=env.state, home=env.tmp / "home", win_users=env.tmp / "nowin",
-              proc=env.tmp / "proc", protected_overlap=env.hub.protected_overlap)
+              proc=env.tmp / "proc", protected_overlap=env.hub.protected_overlap,
+              workspace_conflict=env.hub.workspace_conflict)
     res = doctor.run(ctx)
     checks = {c["id"]: c for c in res["checks"]}
     assert "из 2 МБ" in checks["audit"]["detail"][0]

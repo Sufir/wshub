@@ -27,7 +27,7 @@ def pytest_collection_modifyitems(config, items):
 
 
 DENY = ['.env', '.env.*', '*.pem', '*.key', 'id_rsa*', 'id_ed25519*',
-        '**/secrets/**', '**/node_modules/**', '**/.git/objects/**']
+        '**/secrets/**', '**/node_modules/**', '**/.git/objects/**', '**/.git/config']
 
 
 def registry_text(workspaces: dict[str, dict], max_read_kb: int = 512, ttl_hours: float = 8) -> str:
@@ -81,6 +81,17 @@ class Env:
 @pytest.fixture
 def env(tmp_path) -> Env:
     return Env(tmp_path)
+
+
+@pytest.fixture
+def code_dir(env, monkeypatch, tmp_path):
+    """Поддельный каталог кода wshub (UV_TOOL_DIR/wshub) и Hub, который его знает."""
+    tools = tmp_path / "uvtools"
+    (tools / "wshub").mkdir(parents=True)
+    (tools / "wshub" / "x.txt").write_text("code\n")
+    monkeypatch.setenv("UV_TOOL_DIR", str(tools))
+    env.hub = Hub(env.cfg, env.state)
+    return tools / "wshub"
 
 
 def _rg_path() -> str | None:

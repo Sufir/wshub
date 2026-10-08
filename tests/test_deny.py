@@ -17,6 +17,15 @@ def test_policy_semantics():
         assert not p.denied(rel), rel
 
 
+def test_git_config_mask():
+    """**/.git/config из defaults.deny: токен в URL remote или http.extraheader не читается."""
+    p = Policy(("**/.git/config",))
+    for rel in (".git/config", "sub/.git/config", ".GIT/Config"):
+        assert p.denied(rel), rel
+    for rel in (".gitconfig", ".git/config.bak", ".git/HEAD", "config"):
+        assert not p.denied(rel), rel
+
+
 def test_case_insensitive(env):
     (env.proj / "Server.PEM").write_text("k")
     (env.proj / "SECRETS").mkdir()

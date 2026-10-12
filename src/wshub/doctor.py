@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -453,6 +454,71 @@ def check_outbox(info: dict, now: float | None = None) -> dict:
     return _check("outbox", title, "ok", lines)
 
 
+def check_code(ctx: Ctx, reg, hub) -> dict:
+    """wshub-code: валидность [code], наличие claude/bwrap/socat, запись в Desktop, живые задачи."""
+    title = "wshub-code"
+    lines, problems, infos = [], [], []
+    if reg is None:
+        return _check("code", title, "info", "не проверено: реестр не прочитан", "сначала исправь реестр")
+    code = reg.code
+    if code.error:
+        problems.append(f"[code]: {code.error}")
+    for name, err in code.project_errors.items():
+        problems.append(f"[workspace.{name}.code]: {err}")
+    enabled = [n for n, p in code.projects.items() if p.enabled]
+    lines.append(f"проектов с code.enabled: {len(enabled)}" + (f" ({', '.join(enabled)})" if enabled else ""))
+
+    entries = [c for c in desktop_candidates(ctx) if c.get("used") and "wshub-code" in (c.get("servers") or [])]
+    in_use = bool(enabled or entries)  # код используется — тогда claude/bwrap/socat обязательны
+    need = problems.append if in_use else infos.append
+
+    claude = code.glob.claude
+    exe = claude if os.path.isabs(claude) else shutil.which(claude)
+    if exe and os.access(exe, os.X_OK):
+        ver = ""
+        try:
+            r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=15,
+                               stdin=subprocess.DEVNULL, check=False)
+            ver = r.stdout.strip().splitlines()[0] if r.stdout.strip() else ""
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+        lines.append(f"claude: {exe}" + (f" ({ver})" if ver else ""))
+    else:
+        need(f"claude не найден ({claude}) — поставь Claude Code или задай [code].claude")
+
+    missing = [t for t in ("bwrap", "socat") if not shutil.which(t)]
+    if missing:
+        need(f"нет для песочницы Claude Code: {', '.join(missing)} — sudo apt-get install bubblewrap socat")
+    else:
+        lines.append("bwrap и socat: найдены")
+
+    if entries:
+        lines.append("запись wshub-code в Desktop: есть")
+    else:
+        infos.append("записи wshub-code в Desktop нет (это опция; добавить — wshub setup --code)")
+
+    try:
+        from .jobs import LIVE, Jobs
+        from .runtime import read_json
+        jobs = Jobs(hub)
+        states = [jobs.effective_state(read_json(j)) for j in sorted(jobs.root.glob("*/job.json"))] \
+            if jobs.root.is_dir() else []
+        live = sum(s in LIVE for s in states)
+        bad = sum(s in ("orphaned", "lost") for s in states)
+        lines.append(f"задач: всего {len(states)}, живых {live}, orphaned/lost {bad}")
+        if bad:
+            infos.append(f"orphaned/lost задач: {bad} — посмотри wshub code status")
+    except Exception as e:  # noqa: BLE001
+        infos.append(f"задачи не прочитаны: {e}")
+
+    if problems:
+        return _check("code", title, "fail", lines + problems, "исправь реестр [code] или окружение")
+    if not in_use:
+        return _check("code", title, "info", lines + infos, "запуск Claude Code не настроен — это опция")
+    status = "warn" if infos else "ok"
+    return _check("code", title, status, lines + infos)
+
+
 def run(ctx: Ctx) -> dict:
     reg_check, reg = check_registry(ctx)
     procs = processes(ctx)
@@ -483,7 +549,10 @@ def main(config: Path, state: Path) -> int:
     from .core import Hub
 
     hub = Hub(config, state)
-    res = run(Ctx(config=Path(config), state=Path(state), protected_overlap=hub.protected_overlap,
-                  workspace_conflict=hub.workspace_conflict, mnt_root=hub.mnt_root))
+    ctx = Ctx(config=Path(config), state=Path(state), protected_overlap=hub.protected_overlap,
+              workspace_conflict=hub.workspace_conflict, mnt_root=hub.mnt_root)
+    res = run(ctx)
+    _reg = check_registry(ctx)[1]
+    res["checks"].append(check_code(ctx, _reg, hub))  # только в wshub doctor, не на вкладке «Обзор»
     print(format_report(res))
     return 1 if any(c["status"] == "fail" for c in res["checks"]) else 0

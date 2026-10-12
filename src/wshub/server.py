@@ -214,6 +214,11 @@ wshub update              — обновить wshub
 wshub uninstall           — убрать запись из Desktop; --purge — ещё реестр и состояние
 wshub outbox set <путь>   — папка перевалки для publish, например C:\\Users\\<имя>\\ClaudeOutbox
 wshub outbox clean        — удалить все каталоги перевалки wshub
+wshub code                — MCP-сервер wshub-code (stdio); его запускает Claude Desktop
+wshub code start <проект> <ТЗ>  — запустить задачу Claude Code; печатает job (--follow — события до конца)
+wshub code status [job]   — список последних задач или снимок одной
+wshub code result <job>   — итог задачи
+wshub code stop <job>|--all     — остановить задачу
 wshub --version           — версия и коммит"""
 
 
@@ -241,6 +246,9 @@ def main(argv: list[str] | None = None) -> None:
     if cmd in ("setup", "uninstall", "update"):
         from .install import cli
         sys.exit(cli(cmd, rest, config, state))
+    if cmd in ("code", "code-run", "code-hook"):
+        from .code_cli import code_main
+        sys.exit(code_main(cmd, rest, config, state))
     print(USAGE, file=sys.stderr)
     sys.exit(2)
 

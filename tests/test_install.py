@@ -209,6 +209,36 @@ def test_classic_install_and_existing_entry(machine):
     assert json.loads(m.classic.read_text()) == {"mcpServers": {"git": {"command": "g"}}}
 
 
+def test_setup_code_adds_and_uninstall_restores(machine):
+    """setup --code добавляет запись wshub-code; uninstall снимает обе и возвращает конфиг побайтово (п. 5.14)."""
+    m = machine
+    before = DESKTOP_CONFIG
+    r = m.wshub("setup", "--yes", "--code", "--project", str(m.project), "--mode", "rw")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "добавлена запись wshub-code" in r.stdout
+    servers = json.loads(m.msix.read_text(encoding="utf-8"))["mcpServers"]
+    assert servers["wshub"] == {"command": "wsl.exe", "args": ["-d", "Ubuntu-test", "--", str(m.exe)]}
+    assert servers["wshub-code"] == {"command": "wsl.exe", "args": ["-d", "Ubuntu-test", "--", str(m.exe), "code"]}
+    assert "git" in servers  # чужой сервер цел
+    # повторный setup --code ничего не меняет
+    snap = m.snapshot()
+    r2 = m.wshub("setup", "--yes", "--code", "--project", str(m.project), "--mode", "rw")
+    assert r2.returncode == 0 and "уже настроено (wshub-code)" in r2.stdout
+    after = m.snapshot()
+    changed = {k for k in after if before != after.get(k)} and {k for k in after if snap.get(k) != after[k]}
+    assert not {k for k in changed if not k.startswith("home/u/.local/state/")}, changed
+    # uninstall снимает обе записи и возвращает исходный конфиг байт в байт
+    u = m.wshub("uninstall", "--yes")
+    assert u.returncode == 0, u.stdout + u.stderr
+    assert m.msix.read_text(encoding="utf-8") == before
+
+
+def test_setup_without_code_leaves_no_code_entry(machine):
+    m = machine
+    m.wshub("setup", "--yes", "--project", str(m.project), "--mode", "rw")
+    assert "wshub-code" not in json.loads(m.msix.read_text(encoding="utf-8"))["mcpServers"]
+
+
 def test_bad_flags(machine):
     assert machine.wshub("setup", "--bogus").returncode == 2
     r = machine.wshub("setup", "--yes", "--project", str(machine.project))

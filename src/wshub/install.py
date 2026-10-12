@@ -45,10 +45,11 @@ ttl_hours = 8      # срок жизни хэндла workspace_open
 """
 
 USAGE = """\
-wshub setup [--yes] [--dry-run] [--project <путь> --mode ro|rw]
+wshub setup [--yes] [--dry-run] [--code] [--project <путь> --mode ro|rw]
     подключить wshub к Claude Desktop, создать реестр, первый проект и перевалку; повторный запуск безопасен
       --yes       не задавать вопросов: всё по умолчанию, проект — только из --project
       --dry-run   показать, что изменится, ничего не меняя
+      --code      добавить и запись wshub-code (запуск Claude Code из чата)
 wshub uninstall [--purge] [--yes] [--dry-run]
     убрать запись wshub из конфига Desktop (с копией); --purge — ещё реестр и состояние (журнал, копии)
 wshub update
@@ -397,6 +398,57 @@ def setup_desktop(env: Env, ui: UI) -> tuple[bool, list[str]]:
     return ok, changed
 
 
+def code_entry(env: Env) -> dict:
+    """Запись wshub-code: тот же entry_for, к args добавляется «code» (ТЗ WSH-2, п. 2.8.1)."""
+    e = dict(entry_for(env))
+    e["args"] = [*e.get("args", []), "code"]
+    return e
+
+
+def setup_desktop_code(env: Env, ui: UI) -> bool:
+    """Запись wshub-code в те же конфиги Desktop, что и wshub. Добавляется пустой записью после wshub,
+    поэтому uninstall снимает её простым удалением члена и восстанавливает файл побайтово."""
+    ui.step("Claude Desktop: wshub-code")
+    if not env.exe or (env.distro and not env.win_user):
+        ui.note("пропущено: сначала основная запись wshub")
+        return False
+    targets = desktop_configs(env)
+    if not targets:
+        return False
+    entry = code_entry(env)
+    marker = _load_marker(env.state)
+    ok = True
+    for c in targets:
+        path: Path = c["path"]
+        try:
+            text = _read_text(path)
+            new, action = jsonedit.set_server(text, "wshub-code", entry)
+        except (OSError, UnicodeError, jsonedit.ConfigError) as e:
+            ok = False
+            ui.note(f"{_show(path, env)}: {e} — запись wshub-code не добавлена")
+            continue
+        if action == "unchanged":
+            ui.note(f"уже настроено (wshub-code): {_show(path, env)}")
+            continue
+        if ui.dry:
+            ui.done(f"добавлена запись wshub-code: {_show(path, env)}")
+            continue
+        try:
+            _write_bytes(path, new.encode("utf-8"))
+        except OSError as e:
+            ok = False
+            ui.note(f"{_show(path, env)}: запись wshub-code не удалась ({e.strerror or e})")
+            continue
+        marker.setdefault(str(path), {})["code"] = True
+        try:
+            _save_marker(env.state, marker)
+        except OSError:
+            pass
+        ui.done(f"добавлена запись wshub-code: {_show(path, env)}")
+        ui.note(f"  {entry['command']} {' '.join(entry.get('args', []))}")
+    return ok
+
+
 def _project_name(path: Path, taken: set[str]) -> str | None:
     base = re.sub(r"[^A-Za-z0-9-]+", "-", path.name).strip("-").lower()
     if not base or not base[0].isalnum():
@@ -577,7 +629,7 @@ def _show(path: Path, env: Env) -> str:
     return outbox.win_path(path, env.mnt) or str(path)
 
 
-def setup(env: Env, ui: UI, project: tuple[str, str] | None = None) -> int:
+def setup(env: Env, ui: UI, project: tuple[str, str] | None = None, code: bool = False) -> int:
     from .core import Hub
 
     hub = Hub(env.config, env.state)
@@ -587,13 +639,14 @@ def setup(env: Env, ui: UI, project: tuple[str, str] | None = None) -> int:
     deps = check_deps(env, ui)
     choose_win_user(env, ui)
     d_ok, changed = setup_desktop(env, ui)
+    c_ok = setup_desktop_code(env, ui) if code else True
     r_ok, name = setup_registry(env, ui, hub, project)
     o_ok = setup_outbox(env, ui, hub)
     if ui.dry:
         ui.say("\n--dry-run: ничего не изменено")
-        return 0 if deps and d_ok and r_ok and o_ok else 1
+        return 0 if deps and d_ok and c_ok and r_ok and o_ok else 1
     doc_ok = run_doctor(env, hub, ui)
-    ok = deps and d_ok and r_ok and o_ok and doc_ok
+    ok = deps and d_ok and c_ok and r_ok and o_ok and doc_ok
     first = f"«открой проект {name} через wshub»" if name else "«покажи проекты wshub»"
     ui.say("")
     if not ok:
@@ -623,8 +676,13 @@ def uninstall(env: Env, ui: UI, purge: bool) -> int:
         m = marker.get(str(path)) or {}
         try:
             text = _read_text(path)
+            # wshub-code (если её добавил setup --code) снимаем первой: простое удаление члена,
+            # после него remove_server("wshub") восстанавливает файл, как без --code
+            if m.get("code"):
+                text, _ = jsonedit.remove_server(text, "wshub-code")
             new, removed = jsonedit.remove_server(text, "wshub", m.get("created"), m.get("inner"), m.get("original"))
             data = None if new is None else new.encode("utf-8")
+            removed = removed or m.get("code")
         except (OSError, UnicodeError, jsonedit.ConfigError) as e:
             ok = ok and not c["used"]  # нечитаемый файл, который Desktop не читает, удалению не мешает
             ui.note(f"{_show(path, env)}: {e} — файл не тронут")
@@ -775,8 +833,8 @@ def update(env: Env, ui: UI) -> int:
 # ---------- CLI ----------
 
 def cli(cmd: str, args: list[str], config: Path, state: Path, ask_fn=input, out=print) -> int:
-    flags = {"setup": {"--yes", "--dry-run", "--project", "--mode"}, "uninstall": {"--yes", "--dry-run", "--purge"},
-             "update": set()}[cmd]
+    flags = {"setup": {"--yes", "--dry-run", "--project", "--mode", "--code"},
+             "uninstall": {"--yes", "--dry-run", "--purge"}, "update": set()}[cmd]
     opts: dict[str, str | bool] = {}
     i = 0
     while i < len(args):
@@ -811,7 +869,7 @@ def cli(cmd: str, args: list[str], config: Path, state: Path, ask_fn=input, out=
     ui = UI(interactive=interactive, dry=dry, ask_fn=ask_fn, out=out)
     try:
         if cmd == "setup":
-            return setup(env, ui, project)
+            return setup(env, ui, project, code=bool(opts.get("--code")))
         if cmd == "uninstall":
             return uninstall(env, ui, purge=bool(opts.get("--purge")))
         return update(env, ui)

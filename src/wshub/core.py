@@ -343,6 +343,21 @@ class Hub:
         self.publish()
         self._append_journal(rec)
 
+    def _audit_code(self, tool: str, project: str | None, job: str | None, params: dict | None = None,
+                    prompt_sha: str | None = None, status: str = "ok", error: str | None = None) -> None:
+        """Строка журнала о вызове wshub-code: инструмент, проект, job, итоговые параметры. Текст промпта —
+        только sha256 (prompt_sha), не сам текст (ТЗ WSH-2, п. 2.7)."""
+        rec = self._new_rec(tool, None)
+        rec["ws"] = project
+        rec.update(job=job, status=status)
+        if params:
+            rec["params"] = params
+        if prompt_sha:
+            rec["prompt_sha256"] = prompt_sha
+        if error:
+            rec["error"] = str(error)[:500]
+        self._write_audit(rec)
+
     def _append_journal(self, rec: dict) -> None:
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)

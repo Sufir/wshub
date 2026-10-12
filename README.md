@@ -51,6 +51,7 @@ curl -LsSf https://raw.githubusercontent.com/Sufir/wshub/main/install.sh | sh
 | открыть проект | «Открой проект myproject через wshub» | `workspace_open` |
 | управлять проектами, сессиями, копиями | «Открой панель wshub» | `panel` |
 | показать файл | «Покажи report.pdf» | `publish` |
+| запустить Claude Code по ТЗ | «Запусти Code по org/task.md в проекте payload» | `code_start` (сервер `wshub-code`) |
 
 При первом вызове Desktop запрашивает разрешение на инструменты wshub — **Always allow**.
 Полный список инструментов — [docs/tools.md](docs/tools.md), формат реестра — [docs/registry.md](docs/registry.md).
@@ -65,6 +66,7 @@ curl -LsSf https://raw.githubusercontent.com/Sufir/wshub/main/install.sh | sh
 | хэндлы | доступ к проекту действует 8 ч; отзыв и запрет проекта — в панели, для всех процессов |
 | копии перед записью | запись только в режиме `rw` и не в `.git`; прежняя версия — в `~/.local/state/wshub/backup` |
 | журнал | каждый вызов — в `~/.local/state/wshub/audit.jsonl`: sha256 до и после, без содержимого |
+| запуск Claude Code (`wshub-code`) | ограничения задаёт хаб: правила прав только с путём от рабочего каталога, песочница без сети, хук на Bash, окружение без ключей; пуш невозможен; git fetch делает хаб вне песочницы — [docs/code.md](docs/code.md) |
 
 ## Диагностика
 
@@ -83,6 +85,7 @@ curl -LsSf https://raw.githubusercontent.com/Sufir/wshub/main/install.sh | sh
 ## Обновление и удаление
 
 ```bash
+wshub setup --code          # добавить и запись wshub-code (запуск Claude Code из чата)
 wshub update                # обновление; затем перезапуск Desktop из трея
 wshub uninstall             # удалить запись из конфига Desktop
 wshub uninstall --purge     # то же + реестр, журнал и копии файлов
@@ -96,6 +99,7 @@ uv tool uninstall wshub     # удалить программу
 | [docs/install.md](docs/install.md) | что делают `install.sh` и `setup`, расположение конфигов Desktop, ручная установка, удаление |
 | [docs/tools.md](docs/tools.md) | инструменты, `publish`, панель, CLI |
 | [docs/registry.md](docs/registry.md) | формат реестра, перевалка, файлы состояния |
+| [docs/code.md](docs/code.md) | запуск Claude Code из чата: реестр `[code]`, шапка, шаблоны, профили, модель безопасности, состояния, CLI |
 | [docs/development.md](docs/development.md) | разработка; тесты и CI — только в Docker (`scripts/check.sh`) |
 
 ## Лицензия

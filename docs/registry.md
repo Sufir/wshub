@@ -59,6 +59,25 @@ wshub outbox set C:\\Users\\<user>\\ClaudeOutbox   # создать или из�
 wshub outbox clean                               # удалить все каталоги перевалки wshub
 ```
 
+## Запуск Claude Code `[code]`
+
+Глобальная секция `[code]` и подтаблица `[workspace.<имя>.code]` настраивают сервер `wshub-code`
+(запуск Claude Code из чата). Ошибка значений в них — ошибка только для `wshub-code`: файловый сервер
+`wshub` продолжает работать. Полностью — в [docs/code.md](code.md).
+
+```toml
+[code]
+claude = "claude"                 # имя в PATH или абсолютный путь
+deny_read = ["~/.ssh", "~/.config/wshub", "~/.claude/.credentials.json", "~/.claude.json"]
+
+[workspace.payload.code]
+enabled = true
+dirs = ["org"]                    # где можно запускать; строго вне служебных каталогов wshub
+prompts = ".agents/templates/code-prompts"
+profiles = ["recon", "task", "review"]
+model_max = "opus"                # потолки модели, effort, ходов и бюджета
+```
+
 ## Состояние `~/.local/state/wshub`
 
 | что | зачем |
@@ -69,3 +88,4 @@ wshub outbox clean                               # удалить все кат�
 | `blocked.json` | проекты, запрещённые в панели |
 | `registry-history/` | прежние версии реестра после правок |
 | `outbox-cleanup.json`, `desktop-setup.json` | последняя очистка перевалки; что `setup` создал в конфиге Desktop |
+| `jobs/<id>/`, `claude-flags.json` | задачи Claude Code (метаданные, события, итог); флаги установленного `claude` по версии |

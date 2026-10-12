@@ -1,0 +1,191 @@
+"""Запуск Claude Code для задачи wshub-code: argv, settings.json, mcp.json, окружение.
+
+Ограничения задаёт хаб, а не текст промпта: профиль прав (allow/deny), песочница, хук на Bash, белый список
+окружения. Ключи настроек сверены с Claude Code 2.1.291 и документацией от 2026-10-08 (ТЗ WSH-2, раздел 0.3).
+Встроенные Read/Edit/Write песочница не ограничивает — только правила permissions, поэтому файловые
+инструменты разрешены лишь с путём от рабочего каталога, а служебные каталоги и deny_read закрыты явно.
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+from .registry import CodeGlobal, ProjectCode
+from .runtime import atomic_write_text
+
+SUBAGENT_TOOL = "Task"  # так инструмент называется в init.tools у 2.1.291; в документации Agent — алиас
+FILE_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit")
+RECON_BASH = ("git status *", "git log *", "git show *", "git diff *", "git grep *")
+TASK_BASH = ("git add *", "git commit *", "git switch *", "git branch *", "git rev-parse *", "git rev-list *",
+             "git merge --ff-only *", "git checkout *")
+DENY_BASH = ("git push *", "git remote *", "git clean *", "ssh *", "scp *", "sudo *", "curl *", "wget *")
+ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ", "DOCKER_HOST", "DOCKER_CONFIG")
+# исполняемая часть git: Code её не меняет — иначе git хаба (вне песочницы) запустит его программу
+GIT_PROTECTED = (".git/config", ".git/hooks", ".git/info", ".git/modules")
+SANDBOX_DENY_READ = ("~/", "/mnt/")  # домашний каталог и диски Windows; нужное открывает allowRead
+SANDBOX_ALLOW_READ = ("~/.gitconfig", "~/.config/git/")
+RULE_UNSAFE = re.compile(r"[*?\[\]{}()\\]")  # путь с такими символами в правиле — шаблон, а не один файл
+FLAGS_CACHE = "claude-flags.json"
+
+
+class CliError(Exception):
+    pass
+
+
+def wshub_cmd() -> list[str]:
+    """Как запустить этот же wshub из другого процесса: абсолютный путь к исполняемому файлу или python -m."""
+    argv0 = Path(sys.argv[0]) if sys.argv and sys.argv[0] else None
+    if argv0 is not None and argv0.name == "wshub" and argv0.is_file():
+        return [str(argv0.absolute())]
+    exe = shutil.which("wshub")
+    if exe and Path(sys.executable).parent == Path(exe).parent:  # тот же venv
+        return [exe]
+    return [sys.executable, "-m", "wshub"]
+
+
+def _abs_rule(p: str) -> str:
+    return "/" + p if p.startswith("/") else p  # «//путь» — абсолютный путь в правилах Claude Code
+
+
+def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home: Path) -> list[str]:
+    """Абсолютные пути, закрытые для встроенных файловых инструментов: deny_read (с раскрытым ~) и служебные
+    каталоги wshub. Симлинк даёт два пути: как записан и куда ведёт."""
+    out: list[str] = []
+    for raw in (*glob.deny_read, *proj.deny_read):
+        p = Path(str(home) + raw[1:]) if raw == "~" or raw.startswith("~/") else Path(raw)
+        if not p.is_absolute():
+            continue  # относительные deny_read — только для песочницы (Bash)
+        for q in (Path(os.path.normpath(p)), p.resolve()):
+            if str(q) not in out:
+                out.append(str(q))
+    for p in protected:
+        if str(p) not in out:
+            out.append(str(p))
+    return out
+
+
+def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
+             data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path) -> dict:
+    """settings.json задачи. cwd — dir (рабочий каталог Code), task_rel — путь к ТЗ от него; protected — все
+    служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук)."""
+    if RULE_UNSAFE.search(task_rel):
+        raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
+    allow = ["Read(./**)", f"Edit(./{task_rel})", *(f"Bash({c})" for c in RECON_BASH)]
+    if profile == "task":
+        allow += ["Edit(./**)", SUBAGENT_TOOL, *(f"Bash({c})" for c in TASK_BASH),
+                  *(f"Bash({c})" for c in proj.bash_allow)]
+    elif profile == "review":
+        allow += ["Edit(./.agents/**)", SUBAGENT_TOOL]
+    elif profile != "recon":
+        raise CliError(f"неизвестный профиль {profile}")
+    deny = [*(f"Bash({c})" for c in DENY_BASH), "Read(**/.env*)", "WebFetch", "WebSearch",
+            *(f"Edit({m})" for m in proj.deny_edit),
+            *(f"Edit(./{g}{'' if g.endswith('config') else '/**'})" for g in GIT_PROTECTED)]
+    for p in deny_paths(glob, proj, protected, home):
+        r = _abs_rule(p)
+        deny += [f"Read({r})", f"Edit({r})", f"Read({r}/**)", f"Edit({r}/**)"]
+    data: dict = {
+        "permissions": {"allow": list(dict.fromkeys(allow)), "deny": list(dict.fromkeys(deny))},
+        "sandbox": {
+            "enabled": True,
+            "failIfUnavailable": True,
+            "allowUnsandboxedCommands": False,
+            "autoAllowBashIfSandboxed": False,  # Bash — только по allow-правилам профиля
+            "excludedCommands": list(proj.sandbox_exclude),
+            "network": {"allowedDomains": [*glob.network, *proj.network]},
+            "filesystem": {
+                # служебные каталоги wshub — абсолютными путями тоже: при нестандартном WSHUB_STATE/CONFIG
+                # вне ~ и /mnt их бы не закрыли ни ~/, ни /mnt/ (чтение через Bash в песочнице)
+                "denyRead": list(dict.fromkeys([*glob.deny_read, *proj.deny_read, *SANDBOX_DENY_READ,
+                                                *(str(p) for p in protected)])),
+                "allowRead": list(dict.fromkeys([str(cwd), *SANDBOX_ALLOW_READ, *proj.allow_read])),
+                "denyWrite": [str(cwd / g) for g in GIT_PROTECTED],
+            },
+        },
+        "hooks": {"PreToolUse": [{"matcher": "Bash",
+                                  "hooks": [{"type": "command", "command": shlex.join([*hook_cmd, "code-hook",
+                                                                                         *map(str, data_dirs)])}]}]},
+    }
+    if proj.claude_md_excludes:
+        data["claudeMdExcludes"] = list(proj.claude_md_excludes)
+    return data
+
+
+def argv(claude: str, prompt: str, *, job_dir: Path, model: str, effort: str, max_turns: int, budget_usd: float,
+         flags: dict, session_id: str | None = None, resume: str | None = None) -> list[str]:
+    if (session_id is None) == (resume is None):
+        raise CliError("нужен ровно один из session_id и resume")
+    out = [claude, "-p", prompt, "--output-format", "stream-json", "--verbose"]
+    out += ["--session-id", session_id] if session_id else ["--resume", str(resume)]
+    out += ["--model", model, "--effort", effort, "--max-turns", str(max_turns),
+            "--max-budget-usd", f"{budget_usd:g}", "--permission-mode", "dontAsk"]
+    if flags.get("permission_prompts"):
+        out += ["--permission-prompts", "none"]
+    out += ["--settings", str(job_dir / "settings.json")]
+    if flags.get("setting_sources"):
+        out += ["--setting-sources", "project,local"]
+    out += ["--strict-mcp-config", "--mcp-config", str(job_dir / "mcp.json")]
+    return out
+
+
+def environment(environ: dict, pass_env: tuple[str, ...]) -> dict:
+    """Белый список, а не наследование. Секретов нет даже из pass_env (реестр такие имена не пропускает)."""
+    names = set(ENV_PASS) | {k for k in environ if k.startswith("LC_")} | set(pass_env)
+    env = {k: v for k, v in environ.items() if k in names and not _secret_name(k)}
+    env["TERM"] = "dumb"
+    return env
+
+
+def _secret_name(name: str) -> bool:
+    return name == "SSH_AUTH_SOCK" or re.search(r"TOKEN|SECRET|PASSWORD|KEY", name, re.IGNORECASE) is not None
+
+
+def resolve_claude(claude: str, env: dict) -> str:
+    exe = claude if os.path.isabs(claude) else shutil.which(claude, path=env.get("PATH"))
+    if not exe or not os.access(exe, os.X_OK):
+        raise CliError(f"claude не найден ({claude}): поставь Claude Code или задай [code].claude")
+    return exe
+
+
+def detect_flags(claude: str, cache_dir: Path, env: dict) -> dict:
+    """Есть ли у установленного claude необязательные флаги; результат кэшируется по версии."""
+    def run(*args: str) -> str:
+        try:
+            r = subprocess.run([claude, *args], capture_output=True, text=True, timeout=30, env=env,
+                               stdin=subprocess.DEVNULL, check=False)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise CliError(f"claude {' '.join(args)} не выполнился: {e}") from None
+        return r.stdout + r.stderr
+
+    out = run("--version").strip()
+    version = out.splitlines()[0] if out else "?"
+    cache = cache_dir / FLAGS_CACHE
+    try:
+        data = json.loads(cache.read_text(encoding="utf-8"))
+        data = data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        data = {}
+    hit = data.get(claude)
+    if isinstance(hit, dict) and hit.get("version") == version and version != "?":
+        return hit
+    help_text = run("--help")
+    res = {"version": version, "permission_prompts": "--permission-prompts" in help_text,
+           "setting_sources": "--setting-sources" in help_text}
+    data[claude] = res
+    try:
+        atomic_write_text(cache, json.dumps(data, ensure_ascii=False, indent=1))
+    except OSError:
+        pass
+    return res
+
+
+def write_job_files(job_dir: Path, settings_data: dict, prompt: str) -> None:
+    atomic_write_text(job_dir / "settings.json", json.dumps(settings_data, ensure_ascii=False, indent=2) + "\n")
+    atomic_write_text(job_dir / "mcp.json", json.dumps({"mcpServers": {}}) + "\n")
+    atomic_write_text(job_dir / "prompt.txt", prompt)

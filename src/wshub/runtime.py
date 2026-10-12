@@ -87,10 +87,22 @@ def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
     return stat.rsplit(")", 1)[-1].split()[19]
 
 
+def _zombie(pid: int, proc: Path) -> bool:
+    """Процесс — зомби (завершился, но родитель его не снял): по инструментам считается мёртвым."""
+    try:
+        stat = (proc / str(pid) / "stat").read_text()
+    except OSError:
+        return False
+    fields = stat.rsplit(")", 1)[-1].split()
+    return bool(fields) and fields[0] == "Z"
+
+
 def pid_alive(pid: int, started: str | None, proc: Path = Path("/proc")) -> bool:
     if proc.is_dir():
         now = proc_start(pid, proc)
-        return now is not None and (started is None or now == started)
+        if now is None or (started is not None and now != started):
+            return False
+        return not _zombie(pid, proc)
     try:  # без /proc (macOS)
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -115,6 +127,15 @@ def atomic_write_text(path: Path, text: str) -> None:
         except FileNotFoundError:
             pass
         raise
+
+
+def read_json(path: Path) -> dict:
+    """JSON-объект из файла или {} при любой ошибке (нет файла, битый, не объект)."""
+    try:
+        d = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def live_processes(state_dir: Path, proc: Path = Path("/proc")) -> list[dict]:

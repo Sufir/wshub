@@ -8,7 +8,7 @@ FROM python:${PYTHON}-slim
 # ripgrep — для веток grep через rg, shellcheck — для install.sh и scripts/*.sh
 # hadolint ignore=DL3008
 RUN if ! command -v rg >/dev/null || ! command -v shellcheck >/dev/null; then \
-        apt-get update && apt-get install -y --no-install-recommends ripgrep shellcheck \
+        apt-get update && apt-get install -y --no-install-recommends ripgrep shellcheck git \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 COPY --from=uv /uv /uvx /usr/local/bin/

@@ -10,6 +10,7 @@ import os
 import secrets
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -26,9 +27,15 @@ MODELS = ("haiku", "sonnet", "opus", "fable")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 LIVE = ("starting", "prefetch", "running", "cancelling", "orphaned")
 TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost")
-# сигнал отмены → пауза → эскалация (п. 2.5.4)
+# сигнал отмены → пауза → эскалация (п. 2.5.4). Паузы можно укоротить env-переменными — только для тестов
 CANCEL_SIGTERM_AFTER = 20
 CANCEL_SIGKILL_AFTER = 10
+
+
+def cancel_timers() -> tuple[float, float]:
+    """(пауза до SIGTERM, пауза до SIGKILL), секунд. WSHUB_CODE_CANCEL_* — тестовое переопределение."""
+    return (float(os.environ.get("WSHUB_CODE_CANCEL_SIGTERM_S", CANCEL_SIGTERM_AFTER)),
+            float(os.environ.get("WSHUB_CODE_CANCEL_SIGKILL_S", CANCEL_SIGKILL_AFTER)))
 
 
 class JobError(WsError):
@@ -102,17 +109,26 @@ class Jobs:
                 raise RegistryError(f"code.dirs: каталога нет — {p}")
             if self.hub.protected_kind(p) is not None:
                 raise RegistryError(f"code.dirs: {p} пересекается со служебным каталогом wshub")
+            # каждый dir — корень рабочего дерева git (замечание 3): иначе allowRead открывает только cwd,
+            # а .git остаётся в родителе под закрытым ~/, и git у Code не работает
+            if not (p / ".git").is_dir():
+                raise RegistryError(f"code.dirs: {p} — не корень git-репозитория (нет каталога .git); "
+                                    "каждый dir должен быть рабочим деревом git")
             out.append(p)
         return out
 
     def plan(self, project: str, task: str, *, model=None, effort=None, max_turns=None, budget_usd=None,
-             note=None, literal_prompt: str | None = None) -> Plan:
+             note=None, prompt_override: str | None = None) -> Plan:
         ws, proj, _glob = self._project(project)
         root = ws.path.resolve()
         dirs = self._dirs(root, proj)
 
         task_in = Path(task)
         task_abs = (task_in if task_in.is_absolute() else root / task_in).resolve()
+        # «внутри dir» — до чтения файла (замечание 13): иначе моделью можно открыть любой читаемый файл
+        container = next((d for d in dirs if task_abs == d or task_abs.is_relative_to(d)), None)
+        if container is None:
+            raise JobError(f"файл ТЗ {task} вне разрешённых каталогов (code.dirs) проекта {project}")
         if not task_abs.is_file():
             raise JobError(f"файл ТЗ не найден: {task}")
         try:
@@ -126,8 +142,8 @@ class Jobs:
         dir_abs = (root / header["dir"]).resolve()
         if dir_abs not in dirs:
             raise JobError(f"dir из шапки ({header['dir']}) не в code.dirs проекта {project}")
-        if not task_abs.is_relative_to(dir_abs):
-            raise JobError(f"файл ТЗ {task_abs} лежит вне dir {dir_abs}")
+        if dir_abs != container:
+            raise JobError(f"файл ТЗ {task_abs} лежит вне своего dir {dir_abs}")
         task_rel = task_abs.relative_to(dir_abs).as_posix()
         profile = header["profile"]
         if profile not in proj.profiles:
@@ -139,17 +155,15 @@ class Jobs:
         budget_usd = float(budget_usd if budget_usd is not None else header.get("budget_usd", proj.max_budget_usd))
         self._check_ceilings(proj, model, effort, max_turns, budget_usd)
 
-        prompt_name = header.get("prompt") or profile
-        if literal_prompt is not None:  # resume: промпт продолжения задаёт оператор, шаблон не читается
-            prompt, warnings = literal_prompt, []
-        else:
-            if not taskfile.NAME_RE.match(prompt_name):
-                raise JobError(f"имя шаблона промпта недопустимо: {prompt_name}")
-            template_path = (root / proj.prompts / f"{prompt_name}.md").resolve()
-            if not template_path.is_file():
-                raise JobError(f"шаблон промпта не найден: {proj.prompts}/{prompt_name}.md")
-            prompt, warnings = taskfile.render(template_path.read_text(encoding="utf-8"),
-                                               ticket=header["ticket"], task=task_rel, note=note)
+        # промпт — только из шаблона (п. 2.3, 8): имя из override (resume) или из шапки, литерального текста нет
+        prompt_name = prompt_override or header.get("prompt") or profile
+        if not taskfile.NAME_RE.match(prompt_name):
+            raise JobError(f"имя шаблона промпта недопустимо: {prompt_name}")
+        template_path = (root / proj.prompts / f"{prompt_name}.md").resolve()
+        if not template_path.is_file():
+            raise JobError(f"шаблон промпта не найден: {proj.prompts}/{prompt_name}.md")
+        prompt, warnings = taskfile.render(template_path.read_text(encoding="utf-8"),
+                                           ticket=header["ticket"], task=task_rel, note=note)
         return Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, model, effort,
                     max_turns, budget_usd, prompt, warnings, proj)
 
@@ -257,8 +271,9 @@ class Jobs:
             data["claude"] = claude
             data["flags"] = flags
             protected = [p for p in (self.hub.protected_data + self.hub.protected_code)]
+            hook_cmd = [sys.executable, "-m", "wshub.hook"]  # лёгкий запуск хука (замечание 9)
             settings = claude_cli.settings(plan.profile, plan.task_rel, glob, plan.proj, protected,
-                                           self.hub.protected_data, claude_cli.wshub_cmd(), Path.home(), plan.dir)
+                                           self.hub.protected_data, hook_cmd, Path.home(), plan.dir)
             claude_cli.write_job_files(jdir, settings, plan.prompt)
             argv = claude_cli.argv(claude, plan.prompt, job_dir=jdir, model=plan.model, effort=plan.effort,
                                    max_turns=plan.max_turns, budget_usd=plan.budget_usd, flags=flags,
@@ -337,23 +352,40 @@ class Jobs:
             return self.snapshot(jid)
         atomic_write_text(self.job_dir(jid) / "cancel", "1")
         if state == "orphaned":
-            # надзиратель мёртв — гасим группу Code сами по pgid, проверив proc_start (защита от повторного pid)
-            self._kill_group(d)
-            with self._flock():
-                d = self.read(jid)
-                if self.effective_state(d) not in TERMINAL:
-                    d["state"], d["reason"] = "cancelled", "orphaned"
-                    self.write(jid, d)
+            # надзиратель мёртв — гасим группу Code сами, но в фоне: code_cancel отвечает сразу (2.7, замечание 15)
+            self._spawn_killer(jid)
         return self.snapshot(jid)
 
+    def _spawn_killer(self, jid: str) -> None:
+        """Гасим группу Code отдельным процессом `wshub code-kill`, а не os.fork: в MCP-сервере (многопоточный
+        async) fork копирует удерживаемый flock-fd и заклинил бы лок. close_fds (по умолчанию) этого не даёт."""
+        subprocess.Popen([*claude_cli.wshub_cmd(), "code-kill", jid], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                         env={**os.environ})
+
+    def kill_orphaned(self, jid: str) -> dict:
+        """Погасить группу Code осиротевшей задачи и записать cancelled (вызывается процессом `code-kill`)."""
+        self._kill_group(self.read(jid))
+        with self._flock():
+            d = self.read(jid)
+            # raw-состояние осиротевшей задачи — «running» (надзиратель умер, не обновив); effective_state дал бы
+            # «lost», поэтому смотрим на записанное состояние и не трогаем настоящие терминальные итоги
+            keep = {"completed", "failed", "max_turns", "max_budget", "timeout", "cancelled"}
+            if d.get("state") not in keep:
+                d["state"], d["reason"] = "cancelled", "orphaned"
+                self.write(jid, d)
+        return d
+
     def _kill_group(self, d: dict) -> None:
+        """SIGINT процессу Code → SIGTERM группе → SIGKILL группе; proc_start защищает от повторного pid."""
         pgid, pid = d.get("pgid"), d.get("pid")
         if not pgid or not _alive(pid, d.get("proc_start")):
             return
-        for sig, wait in ((signal.SIGINT, CANCEL_SIGTERM_AFTER), (signal.SIGTERM, CANCEL_SIGKILL_AFTER),
-                          (signal.SIGKILL, 0)):
+        t_term, t_kill = cancel_timers()
+        for sig, group, wait in ((signal.SIGINT, False, t_term),
+                                 (signal.SIGTERM, True, t_kill), (signal.SIGKILL, True, 0)):
             with contextlib.suppress(ProcessLookupError, PermissionError):
-                os.killpg(pgid, sig)
+                os.killpg(pgid, sig) if group else os.kill(int(pid), sig)
             if not wait or not _alive(pid, d.get("proc_start")):
                 break
             deadline = time.time() + wait
@@ -365,15 +397,20 @@ class Jobs:
     def resume(self, jid: str, prompt: str, *, note=None, model=None, effort=None, max_turns=None,
                budget_usd=None) -> dict:
         d = self.read(jid)
-        if self.effective_state(d) in LIVE and _alive(d.get("sup_pid"), d.get("sup_start")):
-            raise JobError(f"родитель {jid} ещё жив — дождись завершения или отмени его")
+        # жив надзиратель ИЛИ Code родителя — отказ (любое состояние, кроме терминальных и lost; замечание 5):
+        # иначе можно поднять второй claude на тот же session_id
+        state = self.effective_state(d)
+        if state not in TERMINAL and state != "lost":
+            raise JobError(f"родитель {jid} в состоянии {state} — продолжить можно только завершённую "
+                           "или потерянную (lost) задачу")
         sid = d.get("session_id")
         if not sid:
             raise JobError(f"у задачи {jid} нет session_id — продолжить нельзя")
+        # prompt — имя шаблона (не литеральный текст из чата, замечание 6); рендер тем же taskfile.render
         plan = self.plan(d["project"], d["task"], model=model or d.get("model"),
                          effort=effort or d.get("effort"), max_turns=max_turns or d.get("max_turns"),
                          budget_usd=budget_usd if budget_usd is not None else d.get("budget_usd"),
-                         note=note, literal_prompt=prompt)
+                         note=note, prompt_override=prompt)
         # тот же dir и профиль, что у родителя (п. 2.5.6): задача-потомок могла править свою шапку
         if str(plan.dir) != d.get("dir") or plan.profile != d.get("profile"):
             raise JobError(f"шапка ТЗ изменилась с момента родителя (dir/profile): было "

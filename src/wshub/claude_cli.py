@@ -108,9 +108,10 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
                 "denyWrite": [str(cwd / g) for g in GIT_PROTECTED],
             },
         },
+        # хук запускается на каждую Bash-команду: python -m wshub.hook (~0.03 с) без тяжёлых импортов сервера
         "hooks": {"PreToolUse": [{"matcher": "Bash",
-                                  "hooks": [{"type": "command", "command": shlex.join([*hook_cmd, "code-hook",
-                                                                                         *map(str, data_dirs)])}]}]},
+                                  "hooks": [{"type": "command",
+                                             "command": shlex.join([*hook_cmd, *map(str, data_dirs)])}]}]},
     }
     if proj.claude_md_excludes:
         data["claudeMdExcludes"] = list(proj.claude_md_excludes)

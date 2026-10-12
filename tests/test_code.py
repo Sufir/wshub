@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import threading
 import time
 from pathlib import Path
@@ -17,7 +18,8 @@ from wshub.jobs import JobError, Jobs
 from wshub.registry import RegistryError, parse
 
 FAKE = Path(__file__).parent / "fake_claude.py"
-FAKE_ENV = ["FAKE_REC", "FAKE_SLEEP", "FAKE_SIGINT", "FAKE_TOUCH", "FAKE_COST", "FAKE_SUBTYPE", "FAKE_DENIALS"]
+FAKE_ENV = ["FAKE_REC", "FAKE_SLEEP", "FAKE_SIGINT", "FAKE_TOUCH", "FAKE_COST", "FAKE_SUBTYPE",
+            "FAKE_DENIALS", "FAKE_SIGMARK"]
 TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost")
 
 
@@ -231,30 +233,59 @@ def test_ceilings(code):
 
 # ---------- 4. argv и settings ----------
 
-def test_settings_profiles(code):
+GOLDEN = json.loads((Path(__file__).parent / "golden_settings.json").read_text(encoding="utf-8"))
+
+
+def _golden_settings(profile):
     from wshub.registry import CodeGlobal, ProjectCode
     glob = CodeGlobal()
     proj = ProjectCode(enabled=True, dirs=(".",), prompts="p", deny_edit=("docker-compose*.yml",))
     protected = [Path("/home/u/.config/wshub"), Path("/home/u/.local/state/wshub")]
-    for profile, must in (("recon", ["Read(./**)", "Edit(./TASK.md)"]),
-                          ("task", ["Edit(./**)", "Task", "Bash(git commit *)"]),
-                          ("review", ["Edit(./.agents/**)", "Task"])):
-        s = claude_cli.settings(profile, "TASK.md", glob, proj, protected, protected, ["/w"], Path("/home/u"),
-                                Path("/home/u/proj"))
-        allow = s["permissions"]["allow"]
-        assert all(m in allow for m in must), (profile, allow)
-        assert not any(t in allow for t in ("Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit")), profile
-        deny = s["permissions"]["deny"]
-        assert "Bash(git push *)" in deny and "WebFetch" in deny
-        assert "Edit(docker-compose*.yml)" in deny and "Edit(./.git/config)" in deny
-        assert s["sandbox"]["autoAllowBashIfSandboxed"] is False
-        assert "/home/u/proj" in s["sandbox"]["filesystem"]["allowRead"]
-        assert "~/" in s["sandbox"]["filesystem"]["denyRead"]
-        for p in protected:
-            assert f"Read(/{p}/**)" in deny and f"Edit(/{p}/**)" in deny
-    # recon правит только файл ТЗ
-    s = claude_cli.settings("recon", "TASK.md", glob, proj, protected, protected, ["/w"], Path("/h"), Path("/h/p"))
-    assert "Edit(./**)" not in s["permissions"]["allow"]
+    return claude_cli.settings(profile, "org/TASK.md", glob, proj, protected, protected,
+                               ["/py", "-m", "wshub.hook"], Path("/home/u"), Path("/home/u/proj"))
+
+
+@pytest.mark.parametrize("profile", ["recon", "task", "review"])
+def test_settings_golden(profile):
+    """Кейс 4 (замечание 2): весь settings.json каждого профиля сверяется с эталоном целиком.
+    Мутации (убрать --settings/правило/denyRead /mnt/, failIfUnavailable=false, сменить matcher) краснят."""
+    assert _golden_settings(profile) == GOLDEN[profile]
+
+
+def test_argv_golden():
+    """Полный argv для старта и для resume — целиком против эталона (замечание 2)."""
+    flags = {"permission_prompts": True, "setting_sources": True}
+    start = claude_cli.argv("/claude", "PROMPT", job_dir=Path("/j"), model="sonnet", effort="high",
+                            max_turns=80, budget_usd=5, flags=flags, session_id="SID")
+    resume = claude_cli.argv("/claude", "PROMPT", job_dir=Path("/j"), model="sonnet", effort="high",
+                             max_turns=80, budget_usd=5, flags=flags, resume="OLD")
+    assert start == GOLDEN["argv_start"]
+    assert resume == GOLDEN["argv_resume"]
+
+
+def test_no_fileless_file_rules(code):
+    """Ни в одном профиле нет allow-правила файлового инструмента без пути (кейс 4)."""
+    for profile in ("recon", "task", "review"):
+        allow = _golden_settings(profile)["permissions"]["allow"]
+        assert not ({"Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit"} & set(allow)), (profile, allow)
+
+
+def test_hook_command_denies_push(code, tmp_path):
+    """Строку хука берём из сгенерированного settings.json, запускаем с событием git push → код 2 (замечание 2)."""
+    import shlex
+    import subprocess
+    cmd = _golden_settings("task")["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    parts = shlex.split(cmd)
+    # заменяем питон эталона на реальный и прогоняем модуль хука со служебными каталогами из строки
+    argv = [sys.executable, *parts[1:]]
+    event = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git push origin main"}, "cwd": "/home/u/proj"})
+    r = subprocess.run(argv, input=event, capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent / "src")})
+    assert r.returncode == 2, (r.returncode, r.stderr)
+    ok = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}, "cwd": "/home/u/proj"})
+    r2 = subprocess.run(argv, input=ok, capture_output=True, text=True,
+                        env={**os.environ, "PYTHONPATH": str(Path(__file__).parent.parent / "src")})
+    assert r2.returncode == 0, (r2.returncode, r2.stderr)
 
 
 def test_settings_no_fileless_rules_and_git_protected(code):
@@ -293,16 +324,24 @@ def test_environment_whitelist():
         assert k not in out
 
 
+def test_environment_second_filter_blocks_secret_in_pass_env():
+    """Второй фильтр _secret_name (замечание 12): даже если секрет просочился в pass_env, в Code он не идёт."""
+    out = claude_cli.environment({"API_KEY": "x", "HOME": "/h"}, ("API_KEY",))
+    assert "API_KEY" not in out
+
+
 def test_environment_reaches_fake_without_secrets(code, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "k")
     monkeypatch.setenv("GITLAB_TOKEN", "t")
     monkeypatch.setenv("X_SECRET", "s")
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")  # явно задан — проверка не пустая (замечание 12)
     monkeypatch.setenv("FAKE_REC", str(code.state / "rec.json"))
     t = code.taskfile()
     d = code.jobs.start(code.jobs.plan("proj", t))
     wait_terminal(code.jobs, d["id"])
     rec = json.loads((code.state / "rec.json").read_text())
     assert rec["env"].get("WSHUB_TESTVAR") == "сквозь-белый-список"
+    assert os.environ["SSH_AUTH_SOCK"] == "/tmp/agent.sock"  # в сервере был
     for k in ("ANTHROPIC_API_KEY", "GITLAB_TOKEN", "X_SECRET", "SSH_AUTH_SOCK"):
         assert k not in rec["env"]
 
@@ -354,6 +393,21 @@ def test_terminal_cli_parity(code, monkeypatch, capsys):
     assert settings["sandbox"]["autoAllowBashIfSandboxed"] is False
 
 
+def test_real_job_settings_wiring(code):
+    """jobs.start передаёт в settings.json правильную строку хука и deny служебных каталогов (не только
+    чистая функция settings() из golden): замечание второго ревью."""
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    wait_terminal(code.jobs, d["id"])
+    s = json.loads((code.jobs.job_dir(d["id"]) / "settings.json").read_text())
+    hook = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "-m wshub.hook" in hook  # лёгкий запуск (замечание 9)
+    assert str(code.state) in hook  # служебный каталог состояния передан хуку аргументом
+    deny = s["permissions"]["deny"]
+    # реальные служебные каталоги wshub (из Hub.protected) закрыты для файловых инструментов
+    assert any(str(code.state) in r and r.startswith("Read(//") for r in deny)
+    assert s["sandbox"]["failIfUnavailable"] is True and s["sandbox"]["autoAllowBashIfSandboxed"] is False
+
+
 # ---------- 7. отмена ----------
 
 def test_cancel_sigint(code, monkeypatch):
@@ -370,14 +424,39 @@ def test_cancel_sigint(code, monkeypatch):
     _assert_no_fake()
 
 
-def test_cancel_escalates_to_kill(code, monkeypatch):
+def test_cancel_escalates_to_sigterm(code, monkeypatch):
+    """Фейк игнорирует SIGINT, умирает по SIGTERM: эскалация дошла до SIGTERM (мутация «без SIGTERM» краснит)."""
+    mark = code.state / "sig.txt"
     monkeypatch.setenv("FAKE_SLEEP", "60")
     monkeypatch.setenv("FAKE_SIGINT", "ignore")
+    monkeypatch.setenv("FAKE_SIGMARK", str(mark))
+    monkeypatch.setenv("WSHUB_CODE_CANCEL_SIGTERM_S", "1")
+    monkeypatch.setenv("WSHUB_CODE_CANCEL_SIGKILL_S", "10")
     d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
     _wait_running(code.jobs, d["id"])
     code.jobs.cancel(d["id"])
-    snap = wait_terminal(code.jobs, d["id"], timeout=60)
+    snap = wait_terminal(code.jobs, d["id"], timeout=30)
     assert snap["state"] == "cancelled"
+    assert mark.exists() and mark.read_text() == "TERM"  # дошло именно до SIGTERM, не до SIGINT
+    _assert_no_fake()
+
+
+def test_cancel_escalates_to_sigkill(code, monkeypatch):
+    """Фейк игнорирует SIGINT и SIGTERM: остановит только SIGKILL, в пределах времени (мутация «без SIGKILL»)."""
+    mark = code.state / "sig2.txt"
+    monkeypatch.setenv("FAKE_SLEEP", "60")
+    monkeypatch.setenv("FAKE_SIGINT", "ignore-all")
+    monkeypatch.setenv("FAKE_SIGMARK", str(mark))
+    monkeypatch.setenv("WSHUB_CODE_CANCEL_SIGTERM_S", "1")
+    monkeypatch.setenv("WSHUB_CODE_CANCEL_SIGKILL_S", "1")
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    _wait_running(code.jobs, d["id"])
+    t0 = time.time()
+    code.jobs.cancel(d["id"])
+    snap = wait_terminal(code.jobs, d["id"], timeout=30)
+    assert snap["state"] == "cancelled"
+    assert time.time() - t0 < 30  # предел ≤ 30 с (критерий 2)
+    assert not mark.exists()  # ни SIGINT, ни SIGTERM не привели к выходу — только SIGKILL
     _assert_no_fake()
 
 
@@ -391,6 +470,22 @@ def test_timeout(code, monkeypatch):
     snap = wait_terminal(code.jobs, d["id"], timeout=60)
     assert snap["state"] == "timeout"
     _assert_no_fake()
+
+
+def test_prefetch_fail_under_sigchld_ign(code, monkeypatch):
+    """Замечание 1: даже если сервер игнорировал SIGCHLD (наследуется надзирателем через exec), prefetch
+    с битым remote заканчивается failed/prefetch — надзиратель сбрасывает SIGCHLD в SIG_DFL."""
+    import signal
+    git(code.root, "remote", "add", "origin", str(code.root / "no-such-remote.git"))
+    code.write(prefetch="true")
+    old = signal.getsignal(signal.SIGCHLD)
+    signal.signal(signal.SIGCHLD, signal.SIG_IGN)  # как в сервере — надзиратель не должен это унаследовать
+    try:
+        d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+        snap = wait_terminal(code.jobs, d["id"])
+    finally:
+        signal.signal(signal.SIGCHLD, old)
+    assert snap["state"] == "failed" and code.jobs.read(d["id"])["reason"] == "prefetch"
 
 
 # ---------- 9. параллелизм и дневной бюджет ----------
@@ -443,10 +538,12 @@ def test_orphaned_then_cancel(code, monkeypatch):
     os.kill(jd["sup_pid"], 9)  # убиваем надзирателя, Code жив
     time.sleep(0.3)
     assert code.jobs.snapshot(d["id"])["state"] == "orphaned"
-    code.jobs.cancel(d["id"])  # code_cancel сам гасит группу Code
+    code.jobs.cancel(d["id"])  # code_cancel спавнит отдельный процесс wshub code-kill (не fork сервера)
+    # ждём, пока killer погасит Code и запишет именно cancelled (между смертью Code и записью — миг lost)
     end = time.time() + 40
-    while time.time() < end and _fake_running():
+    while time.time() < end and code.jobs.snapshot(d["id"])["state"] != "cancelled":
         time.sleep(0.2)
+    assert code.jobs.snapshot(d["id"])["state"] == "cancelled"  # не «lost» (мёртвая ветка исправлена)
     _assert_no_fake()
 
 
@@ -469,7 +566,7 @@ def test_resume(code, monkeypatch):
     snap = wait_terminal(code.jobs, d["id"])
     sid = snap["session_id"]
     monkeypatch.setenv("FAKE_REC", str(code.state / "resume-rec.json"))
-    r = code.jobs.resume(d["id"], "продолжай")
+    r = code.jobs.resume(d["id"], "task", note="продолжай после BLOCKED")  # prompt — ИМЯ шаблона (замечание 6)
     assert r["parent"] == d["id"] and r["session_id"] == sid
     wait_terminal(code.jobs, r["id"])
     rec = json.loads((code.state / "resume-rec.json").read_text())
@@ -477,14 +574,39 @@ def test_resume(code, monkeypatch):
     assert "--session-id" not in rec["argv"]
 
 
+def test_resume_bad_template_name_refused(code):
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    wait_terminal(code.jobs, d["id"])
+    with pytest.raises((JobError, taskfile.TaskError)):
+        code.jobs.resume(d["id"], "../etc/passwd")  # недопустимое имя шаблона
+    with pytest.raises(JobError, match="шаблон промпта не найден"):
+        code.jobs.resume(d["id"], "nosuchtemplate")
+
+
 def test_resume_parent_alive_refused(code, monkeypatch):
     monkeypatch.setenv("FAKE_SLEEP", "20")
     d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
     _wait_running(code.jobs, d["id"])
-    with pytest.raises(JobError, match="ещё жив"):
-        code.jobs.resume(d["id"], "продолжай")
+    with pytest.raises(JobError, match="состоянии"):
+        code.jobs.resume(d["id"], "task")
     code.jobs.cancel(d["id"])
     wait_terminal(code.jobs, d["id"], timeout=60)
+
+
+def test_resume_refused_when_orphaned(code, monkeypatch):
+    """Замечание 5: родитель orphaned (надзиратель мёртв, Code жив) — resume отказан."""
+    monkeypatch.setenv("FAKE_SLEEP", "30")
+    monkeypatch.setenv("FAKE_SIGINT", "exit")
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    _wait_running(code.jobs, d["id"])
+    jd = code.jobs.read(d["id"])
+    os.kill(jd["sup_pid"], 9)
+    time.sleep(0.3)
+    assert code.jobs.snapshot(d["id"])["state"] == "orphaned"
+    with pytest.raises(JobError, match="состоянии orphaned"):
+        code.jobs.resume(d["id"], "task")
+    code.jobs.cancel(d["id"])
+    _assert_no_fake()
 
 
 # ---------- 14. doctor ----------
@@ -506,19 +628,154 @@ def test_doctor_code_fail_when_enabled_no_claude(code):
     assert c["status"] == "fail" and any("claude не найден" in d for d in c["detail"])
 
 
-# ---------- хук (заглушка; полный разбор команд пишет архитектор, п. 2.6 / кейс 12) ----------
+# ---------- замечания ревью: требования без тестов ----------
 
-def test_hook_stub_fail_closed():
-    import io
+def test_doctor_not_file_server_for_code(code):
+    """Замечание 4: процессы wshub code* не считаются файловым сервером (иначе doctor уходит в «внимание»)."""
+    from wshub.doctor import _is_wshub_cmd
+    assert _is_wshub_cmd(["wshub"]) is True
+    assert _is_wshub_cmd(["wshub", "code"]) is False
+    assert _is_wshub_cmd(["wshub", "code-run", "20260101-000000-abcdef"]) is False
+    assert _is_wshub_cmd(["wshub", "code-hook", "/x"]) is False
+    assert _is_wshub_cmd(["wshub", "doctor"]) is False
+    assert _is_wshub_cmd(["python", "-m", "wshub", "code-run", "x"]) is False
+    assert _is_wshub_cmd(["python", "-m", "wshub"]) is True
 
-    from wshub import hook
-    bash = io.StringIO(json.dumps({"tool_name": "Bash", "tool_input": {"command": "git status"}}))
-    err = io.StringIO()
-    assert hook.main([], stdin=bash, stderr=err) == 2  # заглушка отклоняет любой Bash
-    other = io.StringIO(json.dumps({"tool_name": "Read", "tool_input": {"file_path": "x"}}))
-    assert hook.main([], stdin=other, stderr=io.StringIO()) == 0
-    broken = io.StringIO("не json")
-    assert hook.main([], stdin=broken, stderr=io.StringIO()) == 2  # ошибка разбора — тоже отказ
+
+def test_audit_every_tool(code):
+    """Замечание 7: каждый инструмент MCP пишет строку в журнал; отказ — со status error."""
+    import asyncio
+
+    from wshub import code_server
+    mcp = code_server.build_code_server(code.hub)
+
+    def call(name, args):
+        asyncio.run(mcp.call_tool(name, args))
+
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    wait_terminal(code.jobs, d["id"])
+    call("code_projects", {})
+    call("code_status", {"job": d["id"]})
+    call("code_result", {"job": d["id"]})
+    call("code_jobs", {})
+    call("code_wait", {"job": d["id"], "seconds": 1})
+    call("code_cancel", {"job": d["id"]})
+    call("code_status", {"job": "нет-такой"})  # отказ
+    lines = [json.loads(x) for x in (code.state / "audit.jsonl").read_text().splitlines()]
+    tools = {r["tool"] for r in lines}
+    for t in ("code_projects", "code_status", "code_result", "code_jobs", "code_wait", "code_cancel"):
+        assert t in tools, t
+    assert any(r["tool"] == "code_status" and r.get("status") == "error" for r in lines)
+
+
+def test_code_status_turns(code):
+    """Замечание 16: code_status отдаёт число ходов по событиям."""
+    import asyncio
+
+    from wshub import code_server
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    wait_terminal(code.jobs, d["id"])
+    mcp = code_server.build_code_server(code.hub)
+    out = asyncio.run(mcp.call_tool("code_status", {"job": d["id"]}))
+    content = out[0] if isinstance(out, tuple) else out
+    snap = json.loads(content[0].text)
+    assert snap["turns"] == 2  # фейк шлёт два события assistant
+
+
+def test_terminal_cli_bad_header_no_traceback(code, capsys):
+    """Замечание 14: плохая шапка — «wshub code: отказ: …» и код 1, без трассировки."""
+    from wshub import code_cli
+    (code.root / "BAD.md").write_text("нет шапки\n", encoding="utf-8")
+    rc = code_cli.code_main("code", ["start", "proj", "BAD.md"], code.cfg, code.state)
+    err = capsys.readouterr().err
+    assert rc == 1 and "отказ:" in err and "Traceback" not in err
+
+
+def test_sup_pid_survives_in_job_json(code):
+    """Замечание 20: надзиратель не затирает sup_pid/sup_start, записанные родителем (перечитывает под flock)."""
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    wait_terminal(code.jobs, d["id"])
+    jd = code.jobs.read(d["id"])
+    assert jd.get("sup_pid") and jd.get("sup_start")  # были бы потеряны при затирании → ложный orphaned/lost
+
+
+def test_dirs_must_be_git_root(code):
+    """Замечание 3: каждый dir — корень рабочего дерева git (есть каталог .git), иначе ошибка реестра."""
+    (code.root / "sub").mkdir()  # подпапка без .git
+    code.write(dirs='["sub"]')
+    proj = parse(code.cfg.read_text()).code.projects["proj"]
+    with pytest.raises(RegistryError, match="не корень git"):
+        code.jobs._dirs(code.root, proj)
+
+
+def test_dirs_symlink_outside_root(code, tmp_path):
+    """Замечание 12: dir-симлинк наружу — отказ «вне корня» (а не из-за отсутствия каталога)."""
+    outside = make_repo(tmp_path / "ext")
+    (code.root / "link").symlink_to(outside)
+    code.write(dirs='["link"]')
+    proj = parse(code.cfg.read_text()).code.projects["proj"]
+    with pytest.raises(RegistryError, match="вне корня"):
+        code.jobs._dirs(code.root, proj)
+
+
+def test_status_regex_reads_taskfile_not_output(code, monkeypatch):
+    """Замечание 8: статус берётся из ФАЙЛА ТЗ, не из текста Code."""
+    code.write(status_regex=r"'\*\*Статус:\*\*\s*(\S+)'")
+    t = "ST.md"
+    (code.root / t).write_text("---\nticket: P\ndir: .\nprofile: task\n---\n**Статус:** ГОТОВ\n", encoding="utf-8")
+    monkeypatch.setenv("FAKE_COST", "0.1")  # текст Code — «готово», слова «Статус» там нет
+    d = code.jobs.start(code.jobs.plan("proj", t))
+    wait_terminal(code.jobs, d["id"])
+    assert code.jobs.read(d["id"])["result"]["taskfile_status"] == "ГОТОВ"
+
+
+def test_daily_budget_counts_completed_cost(code, monkeypatch):
+    """Замечание 12: дневной бюджет учитывает total_cost_usd задач, завершённых сегодня (не budget_usd)."""
+    code.write(max_parallel="3", daily_budget_usd="2", max_budget_usd="1")
+    monkeypatch.setenv("FAKE_COST", "1.5")  # первая задача завершится с реальной стоимостью 1.5
+    d1 = code.jobs.start(code.jobs.plan("proj", code.taskfile("A.md"), budget_usd=1))
+    wait_terminal(code.jobs, d1["id"])
+    # по budget_usd было бы 1+1=2 (не превышает), по total_cost_usd — 1.5+1=2.5 > 2 → отказ
+    with pytest.raises(JobError, match="дневной бюджет"):
+        code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md"), budget_usd=1))
+
+
+def test_resume_pins_dir_profile(code):
+    """Замечание 12/5: resume отказывает, если шапка ТЗ сменила профиль с момента родителя."""
+    t = code.taskfile(profile="task")
+    d = code.jobs.start(code.jobs.plan("proj", t))
+    wait_terminal(code.jobs, d["id"])
+    (code.root / t).write_text("---\nticket: P\ndir: .\nprofile: recon\n---\n#\n", encoding="utf-8")  # профиль сменился
+    with pytest.raises(JobError, match="шапка ТЗ изменилась"):
+        code.jobs.resume(d["id"], "task")
+
+
+def test_resume_allowed_when_lost(code, monkeypatch):
+    """Замечание 12: родителя в lost продолжить можно (session_id известен с первой секунды)."""
+    monkeypatch.setenv("FAKE_SLEEP", "30")
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    _wait_running(code.jobs, d["id"])
+    jd = code.jobs.read(d["id"])
+    os.kill(jd["sup_pid"], 9)
+    os.killpg(jd["pgid"], 9)
+    time.sleep(0.3)
+    assert code.jobs.snapshot(d["id"])["state"] == "lost"
+    monkeypatch.setenv("FAKE_SLEEP", "0")
+    r = code.jobs.resume(d["id"], "task")
+    assert r["parent"] == d["id"] and r["session_id"] == jd["session_id"]
+    wait_terminal(code.jobs, r["id"])
+
+
+def test_journal_written_before_terminal(code, monkeypatch):
+    """Замечание 10: строка code_finish есть в журнале к моменту, когда состояние уже терминальное (10 прогонов)."""
+    audit = code.state / "audit.jsonl"
+    for _ in range(10):
+        d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+        wait_terminal(code.jobs, d["id"])
+        text = audit.read_text()
+        assert text.count(f'"{d["id"]}"') and "code_finish" in text
+        # строка code_finish для этого job уже на диске, как только снимок стал completed
+        assert any("code_finish" in line and d["id"] in line for line in text.splitlines())
 
 
 # ---------- вспомогательное ----------

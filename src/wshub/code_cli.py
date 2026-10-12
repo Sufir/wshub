@@ -7,8 +7,11 @@ import time
 from pathlib import Path
 
 from .core import Hub, WsError
+from .registry import RegistryError
+from .taskfile import TaskError
 
 TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost")
+USER_ERR = (WsError, TaskError, RegistryError, OSError)
 
 
 def code_main(cmd: str, rest: list[str], config: Path, state: Path) -> int:
@@ -21,34 +24,49 @@ def code_main(cmd: str, rest: list[str], config: Path, state: Path) -> int:
             return 2
         from .runner import run_job
         return run_job(Hub(config, state), rest[0])
+    if cmd == "code-kill":  # служебная: гашение группы Code осиротевшей задачи (из code_cancel)
+        if len(rest) != 1:
+            print("wshub code-kill <job> — служебная команда", file=sys.stderr)
+            return 2
+        from .jobs import Jobs
+        Jobs(Hub(config, state)).kill_orphaned(rest[0])
+        return 0
     # cmd == "code"
     if not rest:
         return _serve(config, state)
     sub, args = rest[0], rest[1:]
+    if sub not in ("start", "status", "result", "stop"):
+        print("wshub code [start|status|result|stop] (без аргументов — MCP-сервер wshub-code)", file=sys.stderr)
+        return 2
     hub = Hub(config, state)
     try:
-        if sub == "start":
-            return _start(hub, args)
-        if sub == "status":
-            return _status(hub, args)
-        if sub == "result":
-            return _result(hub, args)
-        if sub == "stop":
-            return _stop(hub, args)
-    except WsError as e:
-        print(f"wshub code {sub}: {e}", file=sys.stderr)
+        return {"start": _start, "status": _status, "result": _result, "stop": _stop}[sub](hub, args)
+    except USER_ERR as e:
+        hub._audit_code(f"cli_code_{sub}", None, None, status="error", error=str(e))
+        print(f"wshub code: отказ: {e}", file=sys.stderr)  # без трассировки (замечание 14)
         return 1
-    print("wshub code [start|status|result|stop] (без аргументов — MCP-сервер wshub-code)", file=sys.stderr)
-    return 2
+
+
+def _reap(signum=None, frame=None) -> None:
+    """Снять завершённых детей (надзирателей), не теряя их код выхода. SIG_IGN здесь нельзя: он наследуется
+    надзирателем через fork+exec (POSIX сохраняет SIG_IGN при exec) и обнулил бы коды его subprocess."""
+    import os
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
 
 
 def _serve(config: Path, state: Path) -> None:
     import signal
 
     from .code_server import build_code_server
-    # надзиратели — наши дети; снимаем их автоматически, чтобы завершённые не висели зомби
+    # перехватываемый обработчик (не SIG_IGN): при exec надзирателя сбрасывается в SIG_DFL — утечки нет
     try:
-        signal.signal(signal.SIGCHLD, signal.SIG_IGN)
+        signal.signal(signal.SIGCHLD, _reap)
     except (AttributeError, ValueError, OSError):  # pragma: no cover — не POSIX
         pass
     hub = Hub(config, state)
@@ -124,10 +142,13 @@ def _status(hub: Hub, args: list[str]) -> int:
     jobs = Jobs(hub)
     pos, _ = _parse(args)
     if pos:
-        print(json.dumps(jobs.snapshot(pos[0]), ensure_ascii=False, indent=1))
+        snap = jobs.snapshot(pos[0])
+        print(json.dumps(snap, ensure_ascii=False, indent=1))
+        hub._audit_code("cli_code_status", snap.get("project"), pos[0])
     else:
         for row in jobs.list(limit=20):
             print(f"{row['id']}  {row['state']:10}  {row['project']}  {row.get('cost_usd') or ''}")
+        hub._audit_code("cli_code_status", None, None)
     return 0
 
 
@@ -140,6 +161,7 @@ def _result(hub: Hub, args: list[str]) -> int:
     d = jobs.read(pos[0])
     print(json.dumps({"job": pos[0], "state": jobs.effective_state(d), "reason": d.get("reason"),
                       "result": d.get("result")}, ensure_ascii=False, indent=1))
+    hub._audit_code("cli_code_result", d.get("project"), pos[0])
     return 0
 
 
@@ -156,4 +178,5 @@ def _stop(hub: Hub, args: list[str]) -> int:
     for jid in targets:
         snap = jobs.cancel(jid)
         print(f"{jid}: {snap['state']}")
+        hub._audit_code("cli_code_stop", snap.get("project"), jid)
     return 0

@@ -5,9 +5,9 @@ ARG PYTHON=3.13
 FROM ghcr.io/astral-sh/uv:0.12.23 AS uv
 
 FROM python:${PYTHON}-slim
-# ripgrep — для веток grep через rg, shellcheck — для install.sh и scripts/*.sh
+# ripgrep — для веток grep через rg, shellcheck — для install.sh и scripts/*.sh, git — для тестов wshub-code
 # hadolint ignore=DL3008
-RUN if ! command -v rg >/dev/null || ! command -v shellcheck >/dev/null; then \
+RUN if ! command -v rg >/dev/null || ! command -v shellcheck >/dev/null || ! command -v git >/dev/null; then \
         apt-get update && apt-get install -y --no-install-recommends ripgrep shellcheck git \
         && rm -rf /var/lib/apt/lists/*; \
     fi

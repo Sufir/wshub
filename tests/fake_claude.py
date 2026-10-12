@@ -42,17 +42,32 @@ def main() -> int:
             json.dump({"argv": argv, "env": dict(os.environ), "cwd": os.getcwd()}, f, ensure_ascii=False)
 
     interrupted = {"v": False}
+    mode = os.environ.get("FAKE_SIGINT", "exit")  # exit | ignore (игнор SIGINT, смерть по SIGTERM) | ignore-all
+    mark = os.environ.get("FAKE_SIGMARK")
 
-    def on_int(signum, frame):
+    def _mark(name):
+        if mark:
+            try:
+                open(mark, "w").write(name)
+            except OSError:
+                pass
+
+    def on_sig(signum, frame):
         interrupted["v"] = True
-        if os.environ.get("FAKE_SIGINT", "exit") == "exit":
+        name = {signal.SIGINT: "INT", signal.SIGTERM: "TERM"}.get(signum, str(signum))
+        if signum == signal.SIGINT and mode in ("ignore", "ignore-all"):
+            return  # SIGINT игнорируем
+        if signum == signal.SIGTERM and mode == "ignore-all":
+            return  # SIGTERM тоже игнорируем — остановит только SIGKILL
+        _mark(name)
+        if signum == signal.SIGINT:
             emit({"type": "result", "subtype": "error_during_execution", "session_id": sid,
                   "total_cost_usd": 0.0, "num_turns": 1, "is_error": True, "result": "interrupted",
                   "permission_denials": []})
-            sys.exit(0)
+        sys.exit(0)
 
-    signal.signal(signal.SIGINT, on_int)
-    signal.signal(signal.SIGTERM, on_int if os.environ.get("FAKE_SIGINT") != "ignore" else signal.SIG_DFL)
+    signal.signal(signal.SIGINT, on_sig)
+    signal.signal(signal.SIGTERM, on_sig)
 
     emit({"type": "system", "subtype": "init", "session_id": sid, "tools": ["Read", "Edit", "Bash", "Task"],
           "permissionMode": "dontAsk", "cwd": os.getcwd()})

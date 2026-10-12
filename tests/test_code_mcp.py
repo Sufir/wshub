@@ -43,8 +43,12 @@ def test_registers_exactly_27_tools(code):
                                 "code_cancel", "code_resume", "code_jobs"}
 
 
-def test_answer_trimmed_to_20kb():
-    assert len(code_server._trim("x" * 30000)) == code_server.ANSWER_MAX
+def test_answer_trimmed_to_20kb_bytes():
+    # предел в БАЙТАХ (замечание 17): и для ASCII, и для кириллицы результат ≤ ANSWER_MAX байт, JSON не рвётся
+    for s in ("x" * 30000, "я" * 30000):
+        out = code_server._trim(s)
+        assert len(out.encode("utf-8")) <= code_server.ANSWER_MAX
+        assert out.endswith("…")
     assert code_server._trim("коротко") == "коротко"
 
 

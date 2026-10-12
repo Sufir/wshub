@@ -219,6 +219,8 @@ wshub code start <проект> <ТЗ>  — запустить задачу Clau
 wshub code status [job]   — список последних задач или снимок одной
 wshub code result <job>   — итог задачи
 wshub code stop <job>|--all     — остановить задачу
+wshub code-run <job>      — служебная: надзиратель задачи (запускает хаб, вручную не вызывается)
+wshub code-hook <кат>…    — служебная: PreToolUse-хук Bash (ставится в settings.json как python -m wshub.hook)
 wshub --version           — версия и коммит"""
 
 
@@ -246,7 +248,7 @@ def main(argv: list[str] | None = None) -> None:
     if cmd in ("setup", "uninstall", "update"):
         from .install import cli
         sys.exit(cli(cmd, rest, config, state))
-    if cmd in ("code", "code-run", "code-hook"):
+    if cmd in ("code", "code-run", "code-hook", "code-kill"):
         from .code_cli import code_main
         sys.exit(code_main(cmd, rest, config, state))
     print(USAGE, file=sys.stderr)

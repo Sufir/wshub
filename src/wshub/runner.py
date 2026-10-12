@@ -15,13 +15,19 @@ from datetime import datetime
 from pathlib import Path
 
 from . import gitsafe
-from .jobs import CANCEL_SIGKILL_AFTER, CANCEL_SIGTERM_AFTER, Jobs
+from .jobs import Jobs, cancel_timers
 from .runtime import atomic_write_text, proc_start
 
 PREFETCH_TIMEOUT = 120
 POLL = 1.0
 RESULT_MAX = 8 * 1024
 STATUS_LINES = 200
+
+
+def _clip_bytes(text: str, limit: int) -> str:
+    """Обрезка по БАЙТАМ UTF-8 (замечание 17): кириллица — 2 байта, символьный предел ломал бы лимит."""
+    b = (text or "").encode("utf-8")
+    return text if len(b) <= limit else b[:limit].decode("utf-8", "ignore")
 
 
 def _map_state(subtype: str | None, is_error: bool) -> tuple[str, str | None]:
@@ -90,6 +96,10 @@ class Supervisor:
         return (self.jdir / "cancel").exists()
 
     def run(self) -> None:
+        # перечитываем job.json под тем же flock, что держит старт: так гарантированно видим sup_pid/sup_start,
+        # записанные родителем после Popen (иначе наш _save затёр бы их → ложный orphaned/lost, замечание 20)
+        with self.jobs._flock():
+            self.d = self.jobs.read(self.jid)
         git = None
         environ = dict(os.environ)
         cwd = Path(self.d["dir"])
@@ -122,9 +132,10 @@ class Supervisor:
         return True
 
     def _fail(self, reason: str, message: str) -> None:
-        self._save(state="failed", reason=reason, error=message,
-                   finished=datetime.now().astimezone().isoformat(timespec="seconds"))
-        self._journal()
+        self.d.update(state="failed", reason=reason, error=message,
+                      finished=datetime.now().astimezone().isoformat(timespec="seconds"))
+        self._journal()  # журнал до записи терминального состояния (замечание 10)
+        self.jobs.write(self.jid, self.d)
 
     def _run_code(self, cwd: Path, environ: dict):
         argv = json.loads((self.jdir / "argv.json").read_text(encoding="utf-8"))
@@ -149,12 +160,13 @@ class Supervisor:
         stderr.close()
 
     def _escalate(self, proc) -> bool:
-        """SIGINT → 20 с → SIGTERM группе → 10 с → SIGKILL группе (п. 2.5.4)."""
-        pgid = self.d["pgid"]
-        for sig, wait in ((signal.SIGINT, CANCEL_SIGTERM_AFTER), (signal.SIGTERM, CANCEL_SIGKILL_AFTER),
-                          (signal.SIGKILL, 0)):
+        """SIGINT процессу Code → пауза → SIGTERM его группе → пауза → SIGKILL группе (п. 2.5.4)."""
+        pid, pgid = proc.pid, self.d["pgid"]
+        t_term, t_kill = cancel_timers()
+        steps = ((signal.SIGINT, False, t_term), (signal.SIGTERM, True, t_kill), (signal.SIGKILL, True, 0))
+        for sig, group, wait in steps:
             try:
-                os.killpg(pgid, sig)
+                os.killpg(pgid, sig) if group else os.kill(pid, sig)
             except (ProcessLookupError, PermissionError):
                 return True
             if not wait:
@@ -178,7 +190,7 @@ class Supervisor:
             "is_error": res_event.get("is_error"),
             "permission_denials_count": len(denials),
             "permission_denials": denials[:10],
-            "result": (res_event.get("result") or "")[:RESULT_MAX],
+            "result": _clip_bytes(res_event.get("result") or "", RESULT_MAX),
             "git": _git_snapshot(git, cwd, environ),
         }
         if self.d.get("state") == "cancelling":
@@ -188,12 +200,27 @@ class Supervisor:
         else:
             state, reason = _map_state(res_event.get("subtype"), res_event.get("is_error"))
         result["session_id"] = result["session_id"] or self.d.get("session_id")
-        status = _find_status(result["result"], self.d.get("status_regex"))
-        result["taskfile_status"] = status
+        result["taskfile_status"] = self._taskfile_status(cwd)
         atomic_write_text(self.jdir / "result.json", json.dumps(result, ensure_ascii=False, indent=1))
-        self._save(state=state, reason=reason, session_id=result["session_id"], result=result,
-                   finished=datetime.now().astimezone().isoformat(timespec="seconds"))
+        # журнал пишем до терминального состояния в job.json: читатель, увидевший терминал, уже видит строку
+        self.d.update(state=state, reason=reason, session_id=result["session_id"], result=result,
+                      finished=datetime.now().astimezone().isoformat(timespec="seconds"))
         self._journal()
+        self.jobs.write(self.jid, self.d)
+
+    def _taskfile_status(self, cwd: Path) -> str | None:
+        """Статус из ФАЙЛА ТЗ (а не из текста Code): тот же путь, внутри dir, ≤ 1 МБ (замечание 8)."""
+        regex = self.d.get("status_regex")
+        task = self.d.get("task")
+        if not regex or not task:
+            return None
+        p = Path(task)
+        try:
+            if not p.resolve().is_relative_to(cwd.resolve()) or p.stat().st_size > 1024 * 1024:
+                return None
+            return _find_status(p.read_text(encoding="utf-8", errors="replace"), regex)
+        except OSError:
+            return None
 
     def _journal(self):
         res = self.d.get("result") or {}
@@ -212,6 +239,12 @@ class Supervisor:
 
 
 def run_job(hub, jid: str) -> int:
+    # POSIX сохраняет SIG_IGN при exec: если сервер игнорировал SIGCHLD, надзиратель унаследовал бы игнор и
+    # его subprocess (git fetch, claude) получали бы ECHILD и код 0. Возвращаем штатное поведение.
+    try:
+        signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+    except (AttributeError, ValueError, OSError):  # pragma: no cover — не POSIX
+        pass
     try:
         Supervisor(hub, jid).run()
         return 0

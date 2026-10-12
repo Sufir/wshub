@@ -7,7 +7,7 @@ Desktop, не трогая доступ к файлам; у его инстру�
 
 Подключение: `wshub setup --code` добавляет запись `wshub-code` в конфиг Desktop (`uninstall` её убирает).
 Нужны `claude` (Claude Code) в PATH или по пути из реестра и пакеты песочницы `bubblewrap` и `socat`
-(`sudo apt-get install bubblewrap socat`) — без них песочница не стартует и задача отклоняется.
+(`sudo apt-get install bubblewrap socat`) — без них песочница не стартует (`failIfUnavailable: true`), и claude завершается с ошибкой, а задача — в состоянии `failed`.
 
 ## Реестр
 
@@ -26,7 +26,7 @@ pass_env = []            # имена переменных окружения с
 
 [workspace.payload.code]
 enabled = true
-dirs = ["org", "journal"]         # где можно запускать; "." — корень проекта
+dirs = ["org", "journal"]         # где можно запускать; каждый dir — КОРЕНЬ git-репозитория (есть .git)
 prompts = ".agents/templates/code-prompts"  # каталог шаблонов промптов, от корня проекта
 profiles = ["recon", "task", "review"]
 model_min = "sonnet"              # haiku < sonnet < opus < fable
@@ -101,7 +101,7 @@ budget_usd: 5
    Сеть — только `network`. Чтение сужено: `denyRead` включает `~/` и `/mnt/`, `allowRead` открывает рабочий
    каталог, `~/.gitconfig`, `~/.config/git/` и `allow_read` проекта. Запись в `./.git/config`, `./.git/hooks`,
    `./.git/info`, `./.git/modules` закрыта (`denyWrite` и deny `Edit`).
-3. **Хук `wshub code-hook`** на Bash закрывает формы, которые правила по тексту не ловят (git push в
+3. **Хук** на Bash (`python -m wshub.hook`) закрывает формы, которые правила по тексту не ловят (git push в
    подстановке, сетевые утилиты, пути к служебным каталогам). Ошибка разбора — отказ.
 4. **Окружение** — белый список: `HOME`, `USER`, `LOGNAME`, `PATH`, `LANG`, `LC_*`, `TZ`, `DOCKER_HOST`,
    `DOCKER_CONFIG`, плюс `pass_env`; `TERM=dumb`. Секретов (`SSH_AUTH_SOCK`, имена с `TOKEN`/`SECRET`/

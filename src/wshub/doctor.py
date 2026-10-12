@@ -277,17 +277,23 @@ def check_desktop(ctx: Ctx) -> dict:
 
 # ---------- процессы ----------
 
+# подкоманды, которые не являются файловым сервером wshub: doctor и всё семейство wshub-code
+_NOT_FILE_SERVER = {"doctor", "code", "code-run", "code-hook", "code-kill"}
+
+
 def _is_wshub_cmd(argv: list[str]) -> bool:
+    """Процесс файлового сервера wshub (без аргументов). Не считаются: doctor и wshub code* — у них свои
+    процессы (сервер wshub-code, надзиратель, хук), иначе doctor и «Обзор» ушли бы в «внимание»."""
     if not argv:
         return False
     rest = argv[1:]
     if Path(argv[0]).name == "wshub":
-        return not rest or rest[0] != "doctor"
+        return not rest or rest[0] not in _NOT_FILE_SERVER
     for i, a in enumerate(rest):
         if Path(a).name == "wshub" and Path(argv[0]).name.startswith("python"):
-            return rest[i + 1:i + 2] != ["doctor"]
+            return rest[i + 1:i + 2] == [] or rest[i + 1] not in _NOT_FILE_SERVER
         if a == "-m" and rest[i + 1:i + 2] == ["wshub"]:
-            return rest[i + 2:i + 3] != ["doctor"]
+            return rest[i + 2:i + 3] == [] or rest[i + 2] not in _NOT_FILE_SERVER
     return False
 
 

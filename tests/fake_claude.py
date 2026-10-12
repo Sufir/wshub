@@ -4,11 +4,18 @@
 
 Управление через окружение:
   FAKE_REC     — путь, куда записать {"argv", "env", "cwd"} (JSON)
-  FAKE_SLEEP   — сколько секунд «работать» (по умолчанию 0)
+  FAKE_SLEEP   — сколько секунд «работать» (по умолчанию 0); FAKE_SLEEP_PLAN — для --permission-mode plan
   FAKE_SIGINT  — "exit" (по SIGINT выйти с итогом error_during_execution) | "ignore" (игнорировать)
   FAKE_TOUCH   — имя файла, который создать в cwd (чтобы git status что-то показал)
-  FAKE_COST    — total_cost_usd в итоге (по умолчанию 0.5)
+  FAKE_COST    — стоимость этого запуска (по умолчанию 0.5); FAKE_COST_PLAN — для --permission-mode plan.
+                 total_cost_usd в итоге — накопительный за сессию, как у настоящего claude (PoC WSH-3, 0.3.3)
   FAKE_SUBTYPE — subtype итога (по умолчанию success)
+  FAKE_RECLOG  — файл, куда дописать строку {"argv", "cwd"} каждого запуска (цепочки фаз)
+  FAKE_NO_PLAN — в режиме plan не писать план (кейс no_plan)
+  FAKE_PLAN    — текст плана (по умолчанию короткий план)
+  FAKE_SELF_CANCEL — перед итогом создать файл cancel в каталоге задачи (отмена «между выходом и итогом»)
+В режиме plan фейк, как настоящий claude 2.1.291 (PoC WSH-3, 0.3.1), пишет план инструментом Write
+в $HOME/.claude/plans/<slug>.md и завершается success.
 """
 import json
 import os
@@ -40,8 +47,14 @@ def main() -> int:
     if rec:
         with open(rec, "w", encoding="utf-8") as f:
             json.dump({"argv": argv, "env": dict(os.environ), "cwd": os.getcwd()}, f, ensure_ascii=False)
+    reclog = os.environ.get("FAKE_RECLOG")
+    if reclog:
+        with open(reclog, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"argv": argv, "cwd": os.getcwd()}, ensure_ascii=False) + "\n")
+    mode = argv[argv.index("--permission-mode") + 1] if "--permission-mode" in argv else "dontAsk"
 
     interrupted = {"v": False}
+    perm_mode = mode
     mode = os.environ.get("FAKE_SIGINT", "exit")  # exit | ignore (игнор SIGINT, смерть по SIGTERM) | ignore-all
     mark = os.environ.get("FAKE_SIGMARK")
 
@@ -70,7 +83,7 @@ def main() -> int:
     signal.signal(signal.SIGTERM, on_sig)
 
     emit({"type": "system", "subtype": "init", "session_id": sid, "tools": ["Read", "Edit", "Bash", "Task"],
-          "permissionMode": "dontAsk", "cwd": os.getcwd()})
+          "permissionMode": perm_mode, "cwd": os.getcwd()})
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "начинаю"}]}})
     if os.environ.get("FAKE_TOUCH"):
         open(os.path.join(os.getcwd(), os.environ["FAKE_TOUCH"]), "w").close()
@@ -79,17 +92,47 @@ def main() -> int:
 
     slept = 0.0
     step = 0.05
-    target = float(os.environ.get("FAKE_SLEEP", "0"))
+    target = float(os.environ.get("FAKE_SLEEP_PLAN") if perm_mode == "plan" and os.environ.get("FAKE_SLEEP_PLAN")
+                   else os.environ.get("FAKE_SLEEP", "0"))
     while slept < target:
         time.sleep(step)
         slept += step
         if interrupted["v"] and os.environ.get("FAKE_SIGINT") == "ignore":
             continue
 
+    if perm_mode == "plan" and not os.environ.get("FAKE_NO_PLAN"):
+        plans = os.path.join(os.environ["HOME"], ".claude", "plans")
+        os.makedirs(plans, exist_ok=True)
+        path = os.path.join(plans, f"fake-{(sid or 'x')[:8]}-{os.getpid()}.md")
+        text = os.environ.get("FAKE_PLAN", "# План\n1. Сделать.\n2. Проверить.\n")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        uid = f"toolu_fake_{os.getpid()}"
+        emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": uid, "name": "Write",
+              "input": {"file_path": path, "content": text}}]}})
+        emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": uid,
+              "is_error": None, "content": f"File created successfully at: {path}"}]}})
+
+    if os.environ.get("FAKE_SELF_CANCEL") and "--settings" in argv:
+        open(os.path.join(os.path.dirname(argv[argv.index("--settings") + 1]), "cancel"), "w").close()
+
+    # накопительная стоимость сессии: total_cost_usd после --resume включает прежние запуски
+    cost = float(os.environ.get("FAKE_COST_PLAN" if perm_mode == "plan" and os.environ.get("FAKE_COST_PLAN")
+                                else "FAKE_COST", "0.5"))
+    ledger = os.path.join(os.environ.get("HOME", "/tmp"), ".fake_claude_sessions", sid or "none")
+    prev = 0.0
+    try:
+        prev = float(open(ledger).read())
+    except (OSError, ValueError):
+        pass
+    total = round(prev + cost, 6)
+    os.makedirs(os.path.dirname(ledger), exist_ok=True)
+    with open(ledger, "w") as f:
+        f.write(str(total))
     denials = [{"tool_name": t, "tool_input": {"command": t}}
                for t in os.environ.get("FAKE_DENIALS", "").split(",") if t]
     emit({"type": "result", "subtype": os.environ.get("FAKE_SUBTYPE", "success"), "session_id": sid,
-          "total_cost_usd": float(os.environ.get("FAKE_COST", "0.5")), "num_turns": 2, "duration_ms": 10,
+          "total_cost_usd": total, "num_turns": 2, "duration_ms": 10,
           "is_error": False, "result": "готово", "permission_denials": denials})
     return 0
 

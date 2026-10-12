@@ -71,9 +71,10 @@ def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home:
 
 
 def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
-             data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path) -> dict:
+             data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path, phase: str | None = None) -> dict:
     """settings.json задачи. cwd — dir (рабочий каталог Code), task_rel — путь к ТЗ от него; protected — все
-    служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук)."""
+    служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук).
+    phase="plan" — фаза плана (ТЗ WSH-3, решение 5): отличие от эталона профиля — ровно plan_overrides."""
     if RULE_UNSAFE.search(task_rel):
         raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
     allow = ["Read(./**)", f"Edit(./{task_rel})", *(f"Bash({c})" for c in RECON_BASH)]
@@ -115,17 +116,41 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     }
     if proj.claude_md_excludes:
         data["claudeMdExcludes"] = list(proj.claude_md_excludes)
+    if phase == "plan":
+        plan_overrides(data, cwd)
+    elif phase is not None:
+        raise CliError(f"неизвестная фаза {phase}")
     return data
 
 
+def plan_overrides(data: dict, cwd: Path) -> None:
+    """Фаза плана (PoC WSH-3, 0.3.2 и решение 5): в --permission-mode plan классификатор auto mode
+    пропускал любые Bash-команды мимо allow профиля. Выключаем его; allow — чтение и git на чтение (как recon,
+    без Edit и bash_allow); песочница не пишет в рабочий каталог и никого из себя не выпускает."""
+    data["useAutoModeDuringPlan"] = False
+    data["permissions"]["disableAutoMode"] = "disable"
+    data["permissions"]["allow"] = ["Read(./**)", *(f"Bash({c})" for c in RECON_BASH)]
+    data["sandbox"]["filesystem"]["denyWrite"] = [str(cwd)]
+    data["sandbox"]["excludedCommands"] = []
+
+
+PERMISSION_MODES = ("dontAsk", "plan")
+
+
 def argv(claude: str, prompt: str, *, job_dir: Path, model: str, effort: str, max_turns: int, budget_usd: float,
-         flags: dict, session_id: str | None = None, resume: str | None = None) -> list[str]:
+         flags: dict, session_id: str | None = None, resume: str | None = None, permission_mode: str = "dontAsk",
+         name: str | None = None) -> list[str]:
+    """name — имя сессии (--name, PoC WSH-3 0.3.4); permission_mode plan — только для фазы плана."""
     if (session_id is None) == (resume is None):
         raise CliError("нужен ровно один из session_id и resume")
+    if permission_mode not in PERMISSION_MODES:
+        raise CliError(f"режим прав {permission_mode} не поддерживается")
     out = [claude, "-p", prompt, "--output-format", "stream-json", "--verbose"]
     out += ["--session-id", session_id] if session_id else ["--resume", str(resume)]
+    if name:
+        out += ["--name", name]
     out += ["--model", model, "--effort", effort, "--max-turns", str(max_turns),
-            "--max-budget-usd", f"{budget_usd:g}", "--permission-mode", "dontAsk"]
+            "--max-budget-usd", f"{budget_usd:g}", "--permission-mode", permission_mode]
     if flags.get("permission_prompts"):
         out += ["--permission-prompts", "none"]
     out += ["--settings", str(job_dir / "settings.json")]
@@ -145,6 +170,32 @@ def environment(environ: dict, pass_env: tuple[str, ...]) -> dict:
 
 def _secret_name(name: str) -> bool:
     return name == "SSH_AUTH_SOCK" or re.search(r"TOKEN|SECRET|PASSWORD|KEY", name, re.IGNORECASE) is not None
+
+
+TMP_DEFAULT = "/tmp"
+
+
+def _uid() -> int:
+    return os.getuid()
+
+
+def tmpdir_problem(env: dict) -> str | None:
+    """Временный каталог claude (<CLAUDE_CODE_TMPDIR или /tmp>/claude-<uid>, ТЗ WSH-3, решение 8): нет — ок;
+    есть — должен принадлежать текущему пользователю и быть доступен на запись, иначе claude не стартует.
+    env — окружение, с которым запустится claude (белый список)."""
+    uid = _uid()
+    p = Path(env.get("CLAUDE_CODE_TMPDIR") or TMP_DEFAULT) / f"claude-{uid}"
+    try:
+        st = p.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as e:
+        return f"временный каталог claude {p} недоступен ({e})"
+    import stat
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != uid or not os.access(p, os.W_OK | os.X_OK):
+        return (f"временный каталог claude {p} принадлежит uid {st.st_uid} (нужен {uid}) или недоступен "
+                f"на запись — claude откажется стартовать; исправь: sudo rm -rf {shlex.quote(str(p))}")
+    return None
 
 
 def resolve_claude(claude: str, env: dict) -> str:

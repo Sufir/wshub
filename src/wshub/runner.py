@@ -2,6 +2,7 @@
 
 Запускается в своём сеансе (start_new_session). prefetch силами хаба, запуск Code в собственной группе
 процессов, слежение за отменой и пределом времени, разбор итога, снимок git, запись result.json и job.json.
+Фаза плана (ТЗ WSH-3, 2.3): копия плана в plan.md, состояние plan_ready, при plan = auto — запуск исполнения.
 """
 from __future__ import annotations
 
@@ -15,13 +16,14 @@ from datetime import datetime
 from pathlib import Path
 
 from . import gitsafe
-from .jobs import Jobs, cancel_timers
+from .jobs import JobError, Jobs, cancel_timers
 from .runtime import atomic_write_text, proc_start
 
 PREFETCH_TIMEOUT = 120
 POLL = 1.0
 RESULT_MAX = 8 * 1024
 STATUS_LINES = 200
+PLAN_MAX = 200 * 1024  # байт: копия плана в каталоге задачи
 
 
 def _clip_bytes(text: str, limit: int) -> str:
@@ -53,6 +55,49 @@ def _tail_result(events_path: Path) -> dict | None:
     except OSError:
         return None
     return last
+
+
+PLAN_TOOLS = ("Write", "Edit", "MultiEdit")
+
+
+def _plan_source(events_path: Path, plans_dir: Path, since: float | None = None) -> Path | None:
+    """Файл плана (решение 7): путь из последнего успешного вызова Write (или Edit того же файла — переделка
+    плана в той же сессии) внутрь ~/.claude/plans/ в потоке событий. Путь пишет модель — принимаем только .md,
+    который после resolve() лежит прямо в каталоге планов, вызов с парным tool_result без ошибки и файл,
+    изменённый не раньше старта звена (иначе — чужой или прошлый план)."""
+    plans = plans_dir.resolve()
+    uses: list[tuple[str, Path]] = []
+    ok: set[str] = set()
+    try:
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        msg = e.get("message") if isinstance(e, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        for c in content if isinstance(content, list) else []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "tool_result" and not c.get("is_error") and isinstance(c.get("tool_use_id"), str):
+                ok.add(c["tool_use_id"])
+            if not (e.get("type") == "assistant" and c.get("type") == "tool_use" and c.get("name") in PLAN_TOOLS):
+                continue
+            fp = (c.get("input") or {}).get("file_path") if isinstance(c.get("input"), dict) else None
+            if not isinstance(fp, str) or not os.path.isabs(fp) or not isinstance(c.get("id"), str):
+                continue
+            p = Path(fp).resolve()
+            if p.suffix == ".md" and p.parent == plans:
+                uses.append((c["id"], p))
+    good = [p for uid, p in uses if uid in ok]
+    if not good or not good[-1].is_file():
+        return None
+    if since is not None and good[-1].stat().st_mtime < since - 1:
+        return None
+    return good[-1]
 
 
 def _git_snapshot(git: str, cwd: Path, environ: dict) -> dict:
@@ -201,12 +246,82 @@ class Supervisor:
             state, reason = _map_state(res_event.get("subtype"), res_event.get("is_error"))
         result["session_id"] = result["session_id"] or self.d.get("session_id")
         result["taskfile_status"] = self._taskfile_status(cwd)
+        result["phase_cost_usd"] = self._phase_cost(result.get("total_cost_usd"))
+        if self.d.get("phase") == "plan" and state == "completed":
+            if self._cancelled():  # отмена пришла после выхода claude — план не идёт дальше (ни в plan_ready)
+                state, reason = "cancelled", "cancel"
+            else:
+                state, reason = self._save_plan(result)
         atomic_write_text(self.jdir / "result.json", json.dumps(result, ensure_ascii=False, indent=1))
         # журнал пишем до терминального состояния в job.json: читатель, увидевший терминал, уже видит строку
         self.d.update(state=state, reason=reason, session_id=result["session_id"], result=result,
                       finished=datetime.now().astimezone().isoformat(timespec="seconds"))
         self._journal()
         self.jobs.write(self.jid, self.d)
+        if state == "plan_ready" and self.d.get("plan_mode") == "auto":
+            self._auto_execute()
+
+    def _phase_cost(self, total) -> float | None:
+        """Стоимость звена (решение 6): после --resume total_cost_usd накопительный за сессию (факт PoC 0.3.3),
+        поэтому вычитаем накопленное к концу предыдущего звена той же сессии."""
+        if not isinstance(total, (int, float)):
+            return None
+        prev = None
+        parent, sid, hops = self.d.get("parent"), self.d.get("session_id"), 0
+        # ближайший предок той же сессии с числовым итогом: у звена без итога (lost, no_result) его нет
+        while self.d.get("resume") and parent and hops < 100:
+            try:
+                pd = self.jobs.read(parent)
+            except JobError:
+                break
+            if pd.get("session_id") != sid:
+                break
+            prev = (pd.get("result") or {}).get("total_cost_usd")
+            if isinstance(prev, (int, float)):
+                break
+            prev, parent, hops = None, pd.get("parent"), hops + 1
+        if isinstance(prev, (int, float)) and 0 <= prev <= total:
+            return round(total - prev, 6)
+        return float(total)
+
+    def _save_plan(self, result: dict) -> tuple[str, str | None]:
+        """Копия плана в plan.md каталога задачи (≤ 200 КБ). Нет вызова Write в каталог планов — no_plan."""
+        try:
+            env = json.loads((self.jdir / "env.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            env = {}
+        base = Path(env["CLAUDE_CONFIG_DIR"]) if env.get("CLAUDE_CONFIG_DIR") else \
+            Path(env.get("HOME") or Path.home()) / ".claude"
+        src = _plan_source(self.jdir / "events.jsonl", base / "plans", self.d.get("started"))
+        if src is None:
+            return "failed", "no_plan"
+        try:
+            with src.open("rb") as fh:
+                data = fh.read(PLAN_MAX + 1)
+        except OSError:
+            return "failed", "no_plan"
+        if len(data) > PLAN_MAX:
+            data = data[:PLAN_MAX]
+            self.d.setdefault("warnings", []).append("план длиннее 200 КБ — в plan.md обрезан")
+        atomic_write_text(self.jdir / "plan.md", data.decode("utf-8", "ignore"))
+        result.update(plan_file=str(src), plan_bytes=len(data))
+        return "plan_ready", None
+
+    def _auto_execute(self) -> None:
+        """plan = auto (2.3.4): исполнение тем же путём, что code_approve — под тем же flock, с проверками
+        max_parallel и дневного бюджета. Не вышло — план остаётся plan_ready с причиной, решает человек."""
+        try:
+            child = self.jobs.approve(self.jid, auto=True)
+            self.hub._audit_code("code_approve", self.d.get("project"), self.jid, params={"auto": True,
+                                                                                         "next": child["id"]})
+        except Exception as e:  # noqa: BLE001 — любой отказ оставляет план ждать решения
+            with self.jobs._flock():
+                d = self.jobs.read(self.jid)
+                if d.get("state") == "plan_ready" and not d.get("next"):
+                    d["chain_error"] = str(e)[:500]
+                    self.jobs.write(self.jid, d)
+            self.hub._audit_code("code_approve", self.d.get("project"), self.jid, status="error",
+                                 error=str(e), params={"auto": True})
 
     def _taskfile_status(self, cwd: Path) -> str | None:
         """Статус из ФАЙЛА ТЗ (а не из текста Code): тот же путь, внутри dir, ≤ 1 МБ (замечание 8)."""
@@ -231,11 +346,12 @@ class Supervisor:
         except OSError:
             pass
         self.hub._audit_code("code_finish", self.d.get("project"), self.jid, prompt_sha=sha,
-                             status="error" if self.d.get("state") != "completed" else "ok",
+                             status="ok" if self.d.get("state") in ("completed", "plan_ready") else "error",
                              error=self.d.get("error"), params={
                                  "state": self.d.get("state"), "reason": self.d.get("reason"),
-                                 "cost_usd": res.get("total_cost_usd"), "num_turns": res.get("num_turns"),
-                                 "session_id": res.get("session_id")})
+                                 "cost_usd": res.get("phase_cost_usd", res.get("total_cost_usd")),
+                                 "session_cost_usd": res.get("total_cost_usd"), "num_turns": res.get("num_turns"),
+                                 "session_id": res.get("session_id"), "phase": self.d.get("phase")})
 
 
 def run_job(hub, jid: str) -> int:

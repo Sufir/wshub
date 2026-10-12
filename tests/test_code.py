@@ -19,8 +19,9 @@ from wshub.registry import RegistryError, parse
 
 FAKE = Path(__file__).parent / "fake_claude.py"
 FAKE_ENV = ["FAKE_REC", "FAKE_SLEEP", "FAKE_SIGINT", "FAKE_TOUCH", "FAKE_COST", "FAKE_SUBTYPE",
-            "FAKE_DENIALS", "FAKE_SIGMARK"]
-TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost")
+            "FAKE_DENIALS", "FAKE_SIGMARK", "FAKE_RECLOG", "FAKE_NO_PLAN", "FAKE_PLAN", "FAKE_COST_PLAN",
+            "FAKE_SLEEP_PLAN", "FAKE_SELF_CANCEL"]
+TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost", "plan_ready")
 
 
 def git(repo: Path, *args: str):
@@ -58,6 +59,10 @@ def registry_text(root: Path, prompts="prompts", claude=None, **code_over) -> st
 
 @pytest.fixture
 def code(tmp_path, monkeypatch):
+    return make_code(tmp_path, monkeypatch)
+
+
+def make_code(tmp_path, monkeypatch):
     """Проект-репозиторий, реестр с [code], шаблоны промптов, фейковый claude, Hub на временных путях."""
     root = make_repo(tmp_path / "proj")
     prompts = root / "prompts"
@@ -66,6 +71,12 @@ def code(tmp_path, monkeypatch):
     (prompts / "recon.md").write_text("Разведка {ticket}: {task}\n")
     (prompts / "review.md").write_text("Ревью {ticket}: {task}\n")
     (prompts / "cont.md").write_text("Продолжи {ticket}: {task}. {note}\n")
+    (prompts / "execute.md").write_text("Исполни утверждённый план {ticket} по {task}.\n")
+    (prompts / "replan.md").write_text("Переделай план {ticket}: {note}\n")
+    # фейк пишет планы в $HOME/.claude/plans и журнал стоимости сессий — только во временный HOME
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
     cfg = tmp_path / "cfg" / "workspaces.toml"
     cfg.parent.mkdir(parents=True)
     state = tmp_path / "state"
@@ -89,9 +100,13 @@ def code(tmp_path, monkeypatch):
             self.hub = Hub(cfg, state)
             self.jobs = Jobs(self.hub)
 
-        def taskfile(self, rel="TASK.md", profile="task", ticket="PAY-1", prompt=None, extra=""):
+        def taskfile(self, rel="TASK.md", profile="task", ticket="PAY-1", prompt=None, extra="", size="S",
+                     risk="low"):
+            """size/risk по умолчанию S/low — строка политики без плана (ТЗ WSH-3); None — ключа нет."""
             p = root / rel
             hdr = f"---\nticket: {ticket}\ndir: .\nprofile: {profile}\n"
+            hdr += f"size: {size}\n" if size else ""
+            hdr += f"risk: {risk}\n" if risk else ""
             if prompt:
                 hdr += f"prompt: {prompt}\n"
             hdr += extra + "---\n# Задача\n"
@@ -227,7 +242,9 @@ def test_ceilings(code):
         code.jobs.plan("proj", t, max_turns=200)
     with pytest.raises(JobError, match="budget"):
         code.jobs.plan("proj", t, budget_usd=99)
-    p = code.jobs.plan("proj", t, model="sonnet", effort="medium", max_turns=10, budget_usd=1)
+    # model/effort без признака оператора — отступление чата: в пределах потолков и с причиной (WSH-3, 2.2.3)
+    p = code.jobs.plan("proj", t, model="sonnet", effort="medium", max_turns=10, budget_usd=1,
+                       reason="проверка потолков реестра")
     assert p.model == "sonnet" and p.max_turns == 10
 
 
@@ -722,7 +739,8 @@ def test_status_regex_reads_taskfile_not_output(code, monkeypatch):
     """Замечание 8: статус берётся из ФАЙЛА ТЗ, не из текста Code."""
     code.write(status_regex=r"'\*\*Статус:\*\*\s*(\S+)'")
     t = "ST.md"
-    (code.root / t).write_text("---\nticket: P\ndir: .\nprofile: task\n---\n**Статус:** ГОТОВ\n", encoding="utf-8")
+    (code.root / t).write_text("---\nticket: P\ndir: .\nprofile: task\nsize: S\nrisk: low\n---\n**Статус:** ГОТОВ\n",
+                               encoding="utf-8")
     monkeypatch.setenv("FAKE_COST", "0.1")  # текст Code — «готово», слова «Статус» там нет
     d = code.jobs.start(code.jobs.plan("proj", t))
     wait_terminal(code.jobs, d["id"])

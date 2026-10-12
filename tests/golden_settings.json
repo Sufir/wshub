@@ -392,5 +392,387 @@
         "--strict-mcp-config",
         "--mcp-config",
         "/j/mcp.json"
+    ],
+    "plan": {
+        "recon": {
+            "permissions": {
+                "allow": [
+                    "Read(./**)",
+                    "Bash(git status *)",
+                    "Bash(git log *)",
+                    "Bash(git show *)",
+                    "Bash(git diff *)",
+                    "Bash(git grep *)"
+                ],
+                "deny": [
+                    "Bash(git push *)",
+                    "Bash(git remote *)",
+                    "Bash(git clean *)",
+                    "Bash(ssh *)",
+                    "Bash(scp *)",
+                    "Bash(sudo *)",
+                    "Bash(curl *)",
+                    "Bash(wget *)",
+                    "Read(**/.env*)",
+                    "WebFetch",
+                    "WebSearch",
+                    "Edit(docker-compose*.yml)",
+                    "Edit(./.git/config)",
+                    "Edit(./.git/hooks/**)",
+                    "Edit(./.git/info/**)",
+                    "Edit(./.git/modules/**)",
+                    "Read(//home/u/.ssh)",
+                    "Edit(//home/u/.ssh)",
+                    "Read(//home/u/.ssh/**)",
+                    "Edit(//home/u/.ssh/**)",
+                    "Read(//home/u/.aws)",
+                    "Edit(//home/u/.aws)",
+                    "Read(//home/u/.aws/**)",
+                    "Edit(//home/u/.aws/**)",
+                    "Read(//home/u/.gnupg)",
+                    "Edit(//home/u/.gnupg)",
+                    "Read(//home/u/.gnupg/**)",
+                    "Edit(//home/u/.gnupg/**)",
+                    "Read(//home/u/.config/wshub)",
+                    "Edit(//home/u/.config/wshub)",
+                    "Read(//home/u/.config/wshub/**)",
+                    "Edit(//home/u/.config/wshub/**)",
+                    "Read(//home/u/.local/state/wshub)",
+                    "Edit(//home/u/.local/state/wshub)",
+                    "Read(//home/u/.local/state/wshub/**)",
+                    "Edit(//home/u/.local/state/wshub/**)",
+                    "Read(//home/u/.claude/.credentials.json)",
+                    "Edit(//home/u/.claude/.credentials.json)",
+                    "Read(//home/u/.claude/.credentials.json/**)",
+                    "Edit(//home/u/.claude/.credentials.json/**)",
+                    "Read(//home/u/.claude.json)",
+                    "Edit(//home/u/.claude.json)",
+                    "Read(//home/u/.claude.json/**)",
+                    "Edit(//home/u/.claude.json/**)"
+                ],
+                "disableAutoMode": "disable"
+            },
+            "sandbox": {
+                "enabled": true,
+                "failIfUnavailable": true,
+                "allowUnsandboxedCommands": false,
+                "autoAllowBashIfSandboxed": false,
+                "excludedCommands": [],
+                "network": {
+                    "allowedDomains": []
+                },
+                "filesystem": {
+                    "denyRead": [
+                        "~/.ssh",
+                        "~/.aws",
+                        "~/.gnupg",
+                        "~/.config/wshub",
+                        "~/.local/state/wshub",
+                        "~/.claude/.credentials.json",
+                        "~/.claude.json",
+                        "~/",
+                        "/mnt/",
+                        "/home/u/.config/wshub",
+                        "/home/u/.local/state/wshub"
+                    ],
+                    "allowRead": [
+                        "/home/u/proj",
+                        "~/.gitconfig",
+                        "~/.config/git/"
+                    ],
+                    "denyWrite": [
+                        "/home/u/proj"
+                    ]
+                }
+            },
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "useAutoModeDuringPlan": false
+        },
+        "task": {
+            "permissions": {
+                "allow": [
+                    "Read(./**)",
+                    "Bash(git status *)",
+                    "Bash(git log *)",
+                    "Bash(git show *)",
+                    "Bash(git diff *)",
+                    "Bash(git grep *)"
+                ],
+                "deny": [
+                    "Bash(git push *)",
+                    "Bash(git remote *)",
+                    "Bash(git clean *)",
+                    "Bash(ssh *)",
+                    "Bash(scp *)",
+                    "Bash(sudo *)",
+                    "Bash(curl *)",
+                    "Bash(wget *)",
+                    "Read(**/.env*)",
+                    "WebFetch",
+                    "WebSearch",
+                    "Edit(docker-compose*.yml)",
+                    "Edit(./.git/config)",
+                    "Edit(./.git/hooks/**)",
+                    "Edit(./.git/info/**)",
+                    "Edit(./.git/modules/**)",
+                    "Read(//home/u/.ssh)",
+                    "Edit(//home/u/.ssh)",
+                    "Read(//home/u/.ssh/**)",
+                    "Edit(//home/u/.ssh/**)",
+                    "Read(//home/u/.aws)",
+                    "Edit(//home/u/.aws)",
+                    "Read(//home/u/.aws/**)",
+                    "Edit(//home/u/.aws/**)",
+                    "Read(//home/u/.gnupg)",
+                    "Edit(//home/u/.gnupg)",
+                    "Read(//home/u/.gnupg/**)",
+                    "Edit(//home/u/.gnupg/**)",
+                    "Read(//home/u/.config/wshub)",
+                    "Edit(//home/u/.config/wshub)",
+                    "Read(//home/u/.config/wshub/**)",
+                    "Edit(//home/u/.config/wshub/**)",
+                    "Read(//home/u/.local/state/wshub)",
+                    "Edit(//home/u/.local/state/wshub)",
+                    "Read(//home/u/.local/state/wshub/**)",
+                    "Edit(//home/u/.local/state/wshub/**)",
+                    "Read(//home/u/.claude/.credentials.json)",
+                    "Edit(//home/u/.claude/.credentials.json)",
+                    "Read(//home/u/.claude/.credentials.json/**)",
+                    "Edit(//home/u/.claude/.credentials.json/**)",
+                    "Read(//home/u/.claude.json)",
+                    "Edit(//home/u/.claude.json)",
+                    "Read(//home/u/.claude.json/**)",
+                    "Edit(//home/u/.claude.json/**)"
+                ],
+                "disableAutoMode": "disable"
+            },
+            "sandbox": {
+                "enabled": true,
+                "failIfUnavailable": true,
+                "allowUnsandboxedCommands": false,
+                "autoAllowBashIfSandboxed": false,
+                "excludedCommands": [],
+                "network": {
+                    "allowedDomains": []
+                },
+                "filesystem": {
+                    "denyRead": [
+                        "~/.ssh",
+                        "~/.aws",
+                        "~/.gnupg",
+                        "~/.config/wshub",
+                        "~/.local/state/wshub",
+                        "~/.claude/.credentials.json",
+                        "~/.claude.json",
+                        "~/",
+                        "/mnt/",
+                        "/home/u/.config/wshub",
+                        "/home/u/.local/state/wshub"
+                    ],
+                    "allowRead": [
+                        "/home/u/proj",
+                        "~/.gitconfig",
+                        "~/.config/git/"
+                    ],
+                    "denyWrite": [
+                        "/home/u/proj"
+                    ]
+                }
+            },
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "useAutoModeDuringPlan": false
+        },
+        "review": {
+            "permissions": {
+                "allow": [
+                    "Read(./**)",
+                    "Bash(git status *)",
+                    "Bash(git log *)",
+                    "Bash(git show *)",
+                    "Bash(git diff *)",
+                    "Bash(git grep *)"
+                ],
+                "deny": [
+                    "Bash(git push *)",
+                    "Bash(git remote *)",
+                    "Bash(git clean *)",
+                    "Bash(ssh *)",
+                    "Bash(scp *)",
+                    "Bash(sudo *)",
+                    "Bash(curl *)",
+                    "Bash(wget *)",
+                    "Read(**/.env*)",
+                    "WebFetch",
+                    "WebSearch",
+                    "Edit(docker-compose*.yml)",
+                    "Edit(./.git/config)",
+                    "Edit(./.git/hooks/**)",
+                    "Edit(./.git/info/**)",
+                    "Edit(./.git/modules/**)",
+                    "Read(//home/u/.ssh)",
+                    "Edit(//home/u/.ssh)",
+                    "Read(//home/u/.ssh/**)",
+                    "Edit(//home/u/.ssh/**)",
+                    "Read(//home/u/.aws)",
+                    "Edit(//home/u/.aws)",
+                    "Read(//home/u/.aws/**)",
+                    "Edit(//home/u/.aws/**)",
+                    "Read(//home/u/.gnupg)",
+                    "Edit(//home/u/.gnupg)",
+                    "Read(//home/u/.gnupg/**)",
+                    "Edit(//home/u/.gnupg/**)",
+                    "Read(//home/u/.config/wshub)",
+                    "Edit(//home/u/.config/wshub)",
+                    "Read(//home/u/.config/wshub/**)",
+                    "Edit(//home/u/.config/wshub/**)",
+                    "Read(//home/u/.local/state/wshub)",
+                    "Edit(//home/u/.local/state/wshub)",
+                    "Read(//home/u/.local/state/wshub/**)",
+                    "Edit(//home/u/.local/state/wshub/**)",
+                    "Read(//home/u/.claude/.credentials.json)",
+                    "Edit(//home/u/.claude/.credentials.json)",
+                    "Read(//home/u/.claude/.credentials.json/**)",
+                    "Edit(//home/u/.claude/.credentials.json/**)",
+                    "Read(//home/u/.claude.json)",
+                    "Edit(//home/u/.claude.json)",
+                    "Read(//home/u/.claude.json/**)",
+                    "Edit(//home/u/.claude.json/**)"
+                ],
+                "disableAutoMode": "disable"
+            },
+            "sandbox": {
+                "enabled": true,
+                "failIfUnavailable": true,
+                "allowUnsandboxedCommands": false,
+                "autoAllowBashIfSandboxed": false,
+                "excludedCommands": [],
+                "network": {
+                    "allowedDomains": []
+                },
+                "filesystem": {
+                    "denyRead": [
+                        "~/.ssh",
+                        "~/.aws",
+                        "~/.gnupg",
+                        "~/.config/wshub",
+                        "~/.local/state/wshub",
+                        "~/.claude/.credentials.json",
+                        "~/.claude.json",
+                        "~/",
+                        "/mnt/",
+                        "/home/u/.config/wshub",
+                        "/home/u/.local/state/wshub"
+                    ],
+                    "allowRead": [
+                        "/home/u/proj",
+                        "~/.gitconfig",
+                        "~/.config/git/"
+                    ],
+                    "denyWrite": [
+                        "/home/u/proj"
+                    ]
+                }
+            },
+            "hooks": {
+                "PreToolUse": [
+                    {
+                        "matcher": "Bash",
+                        "hooks": [
+                            {
+                                "type": "command",
+                                "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                            }
+                        ]
+                    }
+                ]
+            },
+            "useAutoModeDuringPlan": false
+        }
+    },
+    "argv_plan": [
+        "/claude",
+        "-p",
+        "PROMPT",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--session-id",
+        "SID",
+        "--name",
+        "proj/PAY-1/plan",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+        "--max-turns",
+        "40",
+        "--max-budget-usd",
+        "1.5",
+        "--permission-mode",
+        "plan",
+        "--permission-prompts",
+        "none",
+        "--settings",
+        "/j/settings.json",
+        "--setting-sources",
+        "project,local",
+        "--strict-mcp-config",
+        "--mcp-config",
+        "/j/mcp.json"
+    ],
+    "argv_execute": [
+        "/claude",
+        "-p",
+        "PROMPT",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--resume",
+        "SID",
+        "--name",
+        "proj/PAY-1",
+        "--model",
+        "sonnet",
+        "--effort",
+        "high",
+        "--max-turns",
+        "60",
+        "--max-budget-usd",
+        "3.5",
+        "--permission-mode",
+        "dontAsk",
+        "--permission-prompts",
+        "none",
+        "--settings",
+        "/j/settings.json",
+        "--setting-sources",
+        "project,local",
+        "--strict-mcp-config",
+        "--mcp-config",
+        "/j/mcp.json"
     ]
 }

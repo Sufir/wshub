@@ -36,12 +36,17 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PROFILES = ("recon", "task", "review")
 CODE_DENY_READ = ("~/.ssh", "~/.aws", "~/.gnupg", "~/.config/wshub", "~/.local/state/wshub",
                   "~/.claude/.credentials.json", "~/.claude.json")
-CODE_KEYS = {"claude", "max_wait_s", "network", "deny_read", "pass_env"}
+CODE_KEYS = {"claude", "max_wait_s", "network", "deny_read", "pass_env", "policy"}
 WS_CODE_LISTS = ("bash_allow", "sandbox_exclude", "network", "deny_read", "allow_read", "deny_edit",
                  "claude_md_excludes")
 WS_CODE_KEYS = {"enabled", "dirs", "prompts", "profiles", "model_min", "model_max", "effort_max", "max_turns",
                 "max_budget_usd", "daily_budget_usd", "max_parallel", "max_hours", "prefetch", "status_regex",
-                *WS_CODE_LISTS}
+                "policy", "plan_budget_share", "plan_max_turns", "execute_prompt", *WS_CODE_LISTS}
+# строка политики выбора модели, effort и плана (ТЗ WSH-3, п. 2.1); «*» в size/risk — любое значение
+SIZES = ("S", "M", "L")
+RISKS = ("low", "high")
+PLAN_MODES = ("no", "auto", "review")
+POLICY_KEYS = ("profile", "size", "risk", "model", "effort", "plan", "plan_model", "plan_effort")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
 
@@ -81,12 +86,30 @@ class Outbox:
 
 
 @dataclass(frozen=True)
+class PolicyRow:
+    profile: str
+    size: str
+    risk: str
+    model: str
+    effort: str
+    plan: str
+    plan_model: str | None = None
+    plan_effort: str | None = None
+    origin: str = "builtin"  # builtin | global | project
+
+    @property
+    def key(self) -> str:
+        return f"{self.profile}/{self.size}/{self.risk}"
+
+
+@dataclass(frozen=True)
 class CodeGlobal:
     claude: str = "claude"
     max_wait_s: int = 40
     network: tuple[str, ...] = ()
     deny_read: tuple[str, ...] = CODE_DENY_READ
     pass_env: tuple[str, ...] = ()
+    policy: tuple[PolicyRow, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -112,6 +135,10 @@ class ProjectCode:
     allow_read: tuple[str, ...] = ()  # sandbox.filesystem.allowRead сверх рабочего каталога и настроек git
     deny_edit: tuple[str, ...] = ()
     claude_md_excludes: tuple[str, ...] = ()
+    policy: tuple[PolicyRow, ...] = ()
+    plan_budget_share: float = 0.3  # доля бюджета задачи на фазу плана
+    plan_max_turns: int = 40
+    execute_prompt: str = "execute"  # шаблон фазы исполнения в каталоге prompts
 
 
 @dataclass(frozen=True)
@@ -259,7 +286,38 @@ def _code(t, warnings: list[str]) -> CodeGlobal:
                 raise RegistryError(f"code.pass_env: {n} — секреты (TOKEN, SECRET, PASSWORD, KEY, SSH_AUTH_SOCK) "
                                     "в Claude Code не передаются")
         vals["pass_env"] = names
+    if "policy" in t:
+        vals["policy"] = _policy(t["policy"], "[[code.policy]]", "global")
     return CodeGlobal(**vals)
+
+
+def _policy(v, where: str, origin: str) -> tuple[PolicyRow, ...]:
+    """[[code.policy]] / [[workspace.<имя>.code.policy]]: строки таблицы политики. Ключи строки — строгие."""
+    if not isinstance(v, list) or not all(isinstance(r, dict) for r in v):
+        raise RegistryError(f"{where}: ожидается массив таблиц [[…policy]]")
+    rows: list[PolicyRow] = []
+    for i, r in enumerate(v, start=1):
+        w = f"{where} строка {i}"
+        bad = [k for k in r if k not in POLICY_KEYS]
+        if bad:
+            raise RegistryError(f"{w}: неизвестные ключи {', '.join(bad)}")
+        for k, order in (("profile", PROFILES), ("size", (*SIZES, "*")), ("risk", (*RISKS, "*")),
+                         ("model", MODELS), ("effort", EFFORTS), ("plan", PLAN_MODES)):
+            if r.get(k) not in order:
+                raise RegistryError(f"{w}: {k} — одно из {', '.join(order)}")
+        if r["plan"] == "no":
+            if "plan_model" in r or "plan_effort" in r:
+                raise RegistryError(f"{w}: plan_model и plan_effort — только при plan = auto или review")
+        else:
+            if r.get("plan_model") not in MODELS or r.get("plan_effort") not in EFFORTS:
+                raise RegistryError(f"{w}: при plan = {r['plan']} нужны plan_model ({', '.join(MODELS)}) "
+                                    f"и plan_effort ({', '.join(EFFORTS)})")
+        row = PolicyRow(r["profile"], r["size"], r["risk"], r["model"], r["effort"], r["plan"],
+                        r.get("plan_model"), r.get("plan_effort"), origin)
+        if any(x.key == row.key for x in rows):
+            raise RegistryError(f"{w}: строка {row.key} повторяется")
+        rows.append(row)
+    return tuple(rows)
 
 
 def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
@@ -306,6 +364,19 @@ def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
     for k in WS_CODE_LISTS:
         if k in t:
             vals[k] = _str_list(t[k], f"{where} {k}")
+    if "policy" in t:
+        vals["policy"] = _policy(t["policy"], f"[[workspace.{name}.code.policy]]", "project")
+    if "plan_budget_share" in t:
+        v = t["plan_budget_share"]
+        if not isinstance(v, (int, float)) or isinstance(v, bool) or not 0 < v < 1:
+            raise RegistryError(f"{where} plan_budget_share: число больше 0 и меньше 1")
+        vals["plan_budget_share"] = float(v)
+    if "plan_max_turns" in t:
+        vals["plan_max_turns"] = _number(t["plan_max_turns"], f"{where} plan_max_turns", integer=True)
+    if "execute_prompt" in t:
+        if not isinstance(t["execute_prompt"], str) or not NAME_RE.match(t["execute_prompt"]):
+            raise RegistryError(f"{where} execute_prompt: имя шаблона — латиница, цифры, «_», «-»")
+        vals["execute_prompt"] = t["execute_prompt"]
     pc = ProjectCode(**vals)
     if MODELS.index(pc.model_min) > MODELS.index(pc.model_max):
         raise RegistryError(f"{where}: model_min ({pc.model_min}) выше model_max ({pc.model_max})")

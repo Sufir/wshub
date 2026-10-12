@@ -8,6 +8,10 @@ Desktop, не трогая доступ к файлам; у его инстру�
 Подключение: `wshub setup --code` добавляет запись `wshub-code` в конфиг Desktop (`uninstall` её убирает).
 Нужны `claude` (Claude Code) в PATH или по пути из реестра и пакеты песочницы `bubblewrap` и `socat`
 (`sudo apt-get install bubblewrap socat`) — без них песочница не стартует (`failIfUnavailable: true`), и claude завершается с ошибкой, а задача — в состоянии `failed`.
+Временный каталог claude (`/tmp/claude-<uid>`, или `<CLAUDE_CODE_TMPDIR>/claude-<uid>`, если переменная
+проходит в окружение задачи) должен отсутствовать или принадлежать пользователю и быть доступен на запись —
+иначе claude отказывается стартовать. Старт задачи и `wshub doctor` это проверяют и называют команду
+исправления (`sudo rm -rf /tmp/claude-<uid>`).
 
 ## Реестр
 
@@ -46,11 +50,35 @@ deny_read = ["~/.config/payload"] # добавка к [code].deny_read
 allow_read = []                   # sandbox.filesystem.allowRead сверх рабочего каталога и настроек git
 deny_edit = ["docker-compose*.yml", "Dockerfile*", ".gitlab-ci.yml"]
 claude_md_excludes = []           # claudeMdExcludes
+plan_budget_share = 0.3           # доля бюджета задачи на фазу плана
+plan_max_turns = 40               # ходы фазы плана
+execute_prompt = "execute"        # шаблон фазы исполнения в каталоге prompts
+
+[[code.policy]]                   # строка политики для всех проектов (сильнее встроенной)
+profile = "task"
+size = "M"
+risk = "low"
+model = "sonnet"
+effort = "high"
+plan = "auto"
+plan_model = "opus"
+plan_effort = "high"
+
+[[workspace.payload.code.policy]] # строка политики проекта (сильнее глобальной)
+profile = "task"
+size = "M"
+risk = "high"
+model = "opus"
+effort = "high"
+plan = "review"
+plan_model = "opus"
+plan_effort = "high"
 ```
 
 Умолчания: `enabled = false`; при `enabled = true` обязательны `dirs` и `prompts`; `profiles` — все три;
 `model_min = "haiku"`, `model_max = "opus"`, `effort_max = "high"`, `max_turns = 100`, `max_budget_usd = 10`,
-`daily_budget_usd = 30`, `max_parallel = 1`, `max_hours = 4`, `prefetch = false`; списки пустые. Каждый
+`daily_budget_usd = 30`, `max_parallel = 1`, `max_hours = 4`, `prefetch = false`, `plan_budget_share = 0.3`,
+`plan_max_turns = 40`, `execute_prompt = "execute"`; списки пустые. Каждый
 элемент `dirs` после `resolve()` лежит внутри корня проекта, существует и строго не пересекается со
 служебными каталогами wshub (код, реестр, состояние) — иначе ошибка реестра для `wshub-code`.
 
@@ -64,23 +92,120 @@ claude_md_excludes = []           # claudeMdExcludes
 ticket: PAY-1101
 dir: org
 profile: task        # recon | task | review
+size: M              # S | M | L — для task и recon обязателен
+risk: low            # low | high — для task обязателен
 prompt: task         # имя шаблона в каталоге prompts; по умолчанию = profile
-model: sonnet
-effort: high
 max_turns: 80
 budget_usd: 5
+# model: opus        # model, effort, plan — только чтобы отступить от политики:
+# choice: operator   #   с choice: operator — выбор оператора, иначе нужен choice_reason
+# choice_reason: …   #   (причина отступления чата, ≥ 15 символов)
 ---
 ```
 
-Обязательны `ticket`, `dir`, `profile`. Файл ТЗ лежит внутри `dir`, `dir` есть в `code.dirs`, профиль — в
-`code.profiles`, файл обычный и ≤ 1 МБ. Аргументы `code_start`/`wshub code start` переопределяют шапку;
-итоговые значения проверяются по потолкам и полу реестра — нарушение отклоняется, а не урезается молча.
+Обязательны `ticket`, `dir`, `profile`; для `task` — `size` и `risk`, для `recon` — `size` (без них задача не
+стартует, отказ объясняет, по чему выбирается модель, и приводит строки политики профиля). Файл ТЗ лежит
+внутри `dir`, `dir` есть в `code.dirs`, профиль — в `code.profiles`, файл обычный и ≤ 1 МБ. Бюджет и ходы
+проверяются по потолкам реестра всегда; модель, effort и план выбирает политика (ниже).
+
+## Политика выбора: модель, effort, план
+
+Политика — таблица строк. Встроенная таблица — стартовые значения, их калибруют по `code_stats` строками
+реестра: `[[code.policy]]` глобально и `[[workspace.<имя>.code.policy]]` для проекта.
+
+| profile | size | risk | model | effort | plan | plan_model | plan_effort |
+|---|---|---|---|---|---|---|---|
+| recon | S | * | sonnet | medium | no | — | — |
+| recon | M | * | sonnet | high | no | — | — |
+| recon | L | * | opus | medium | no | — | — |
+| review | * | * | opus | medium | no | — | — |
+| task | S | low | sonnet | medium | no | — | — |
+| task | S | high | sonnet | high | auto | opus | high |
+| task | M | low | sonnet | high | auto | opus | high |
+| task | M | high | opus | high | review | opus | high |
+| task | L | low | opus | high | review | opus | high |
+| task | L | high | opus | xhigh | review | opus | high |
+
+- `size`: S — правка в одном слое, ≤ 3 файлов, рядом эталон; M — несколько файлов или слоёв, без смены
+  контрактов; L — контракт API, схема БД, перенос ответственности или больше одного сервиса. `risk: high` —
+  безопасность, деньги, данные пользователей, необратимые миграции.
+- `plan`: `no` — без плана; `auto` — план, затем исполнение без остановки; `review` — план, остановка,
+  решение архитектора.
+- Совпадение: сначала строки проекта, затем глобальные, затем встроенные; в слое — самая точная строка
+  (`*` слабее значения, при равной точности `size` весомее `risk`). Нет строки — отказ с указанием строки.
+- Строки реестра проверяются строго: неизвестный ключ, значение вне списка, `plan` без `plan_model` и
+  `plan_effort` или повтор строки — ошибка `[code]` или проекта (ломает только `wshub-code`).
+- Встроенная `task/L/high` даёт `effort = xhigh`: при `effort_max = "high"` (умолчание) задача отказывает —
+  поднимите `effort_max` проекта или задайте строку политики проекта.
+
+**Источники выбора**, по приоритету:
+
+1. **Оператор — безусловно.** Флаги `wshub code start --model --effort --plan`; поля `model`, `effort`, `plan`
+   в шапке вместе с `choice: operator`; аргументы `code_start` вместе с `chosen_by: "operator"`. Пол и потолок
+   (`model_min`, `model_max`, `effort_max`) на выбор оператора не действуют — и для фазы плана той же задачи;
+   бюджеты и ходы — действуют.
+2. **Политика** — если оператор не выбирал. Её выбор подчиняется полу и потолку: строка за потолком —
+   отказ с подсказкой, а не тихая подрезка.
+3. **Чат.** Поля `model`, `effort`, `plan` в шапке без `choice: operator` или в аргументах без `chosen_by` —
+   отступление от политики: только в пределах пола и потолка и только с причиной (`choice_reason` в шапке
+   или `reason` в `code_start`, ≥ 15 символов без непечатаемых и краевых пробелов). Без причины — отказ
+   «укажи причину отступления от политики
+   или оставь выбор политике». Старые шапки с `model`/`effort` без `choice` попадают сюда.
+
+Итог (модель, effort, план, источник `operator` | `policy` | `chat`, строка политики, причина) пишется в
+`job.json`, в журнал wshub (`model_source`) и отдаётся в ответах `code_start`, `code_status`, `code_result`.
+`code_resume` наследует выбор родителя; сменить модель или effort — по тем же правилам (`reason` или
+`chosen_by`).
 
 ## Шаблоны промптов
 
 Файл `<prompts>/<prompt>.md` (каталог от корня проекта, может лежать вне `dir`: его читает хаб, не Code).
 Подстановки: `{ticket}`, `{task}` (путь к ТЗ относительно `dir`), `{note}` (строка оператора для
 продолжения после BLOCKED, ≤ 300 символов, без перевода строки). Другие `{…}` — ошибка.
+
+Задача с планом использует ещё два шаблона, их кладёт проект (хаб их не сочиняет): `execute.md` (имя меняет
+`execute_prompt`) — промпт фазы исполнения; `replan.md` — промпт переделки плана, `{note}` в нём обязателен.
+Нет `execute` (а при `plan = review` — `replan` с `{note}`) — отказ на старте задачи с планом, а не после фазы
+плана; при `plan = auto` шаблону `execute` нельзя ждать `{note}` (его некому передать).
+
+## Режим планирования
+
+Задача с `plan = auto` или `review` идёт двумя фазами одной сессии Claude Code:
+
+1. **Фаза плана** — `--permission-mode plan`, `--session-id`, модель и effort — `plan_model`/`plan_effort`,
+   бюджет — `plan_budget_share` от бюджета задачи, ходы — `plan_max_turns`, промпт — шаблон из шапки.
+   settings.json фазы отличается от эталона профиля ровно этим: `useAutoModeDuringPlan: false` и
+   `permissions.disableAutoMode: "disable"` (без классификатора auto mode Bash вне allow получает отказ);
+   allow — чтение и git только на чтение (как `recon`, без Edit и без `bash_allow`);
+   `sandbox.filesystem.denyWrite` — весь рабочий каталог; `sandbox.excludedCommands` — пусто. Хук, deny и
+   остальная песочница — как у профиля.
+2. **План.** Claude Code в `-p` пишет план инструментом `Write` в `~/.claude/plans/<slug>.md`. Хаб берёт путь
+   из потока событий — последний успешный (с парным `tool_result` без ошибки) `Write` или `Edit` файла `.md`
+   прямо в каталоге планов, изменённого не раньше старта звена, — читает файл и кладёт копию в `plan.md`
+   каталога задачи (≤ 200 КБ). Такого вызова нет — задача `failed`, причина `no_plan`, исполнения нет.
+3. **Фаза исполнения** — дочерняя задача: `--resume` той же сессии, `--permission-mode dontAsk`, settings —
+   эталон профиля, модель и effort исполнения, шаблон `execute`, бюджет и ходы — остаток задачи.
+
+`plan = auto`: надзиратель фазы плана сам запускает исполнение тем же путём, что `code_approve` (тот же
+лок, проверки `max_parallel` и дневного бюджета). Не прошли проверки — план остаётся в `plan_ready`
+с причиной (`chain_error`), дальше решает человек. `plan = review`: фаза плана останавливается в `plan_ready`
+и ждёт: `code_plan` — текст плана, `code_approve` — исполнение, `code_replan(note)` — новая фаза плана в той
+же сессии с шаблоном `replan`.
+
+**Стоимость.** После `--resume` claude отдаёт `total_cost_usd` накопительно за сессию, а `--max-budget-usd`
+считает только текущий запуск. Поэтому стоимость звена — разность `total_cost_usd` с предыдущим звеном
+(`phase_cost_usd` в итоге), бюджет исполнения — остаток бюджета задачи; дневной бюджет и `code_stats`
+считают каждую фазу один раз (это касается и обычного `code_resume`).
+
+**Цепочка.** Снимок корневой задачи (`code_status`, `code_wait`, `code_result`) показывает фазу, id активного
+звена, все звенья со стоимостью и общую стоимость. `code_cancel`, `code_plan`, `code_approve`, `code_replan`
+по корню работают с активным звеном. `code_cancel` останавливает активное звено, в `plan_ready` — отменяет
+цепочку; отмена, пришедшая к концу фазы плана, тоже до исполнения не доходит. `code_wait` возвращается и на
+`plan_ready`.
+
+**Имя сессии и вход руками.** Каждый запуск получает `--name "<проект>/<тикет>"` (фаза плана —
+`…/plan`). `code_result` и `wshub code result` дают строку `cd <dir> && claude --resume <session_id>` —
+открыть сессию в терминале и продолжить руками.
 
 ## Профили и модель безопасности
 
@@ -138,23 +263,31 @@ budget_usd: 5
 ## Состояния задачи
 
 `starting`, `prefetch`, `running`, `cancelling` → `completed` (успех), `failed`, `max_turns`, `max_budget`,
-`timeout`, `cancelled`, `orphaned` (надзиратель мёртв, Code жив), `lost` (оба мертвы, итога нет). `orphaned`
+`timeout`, `cancelled`, `plan_ready` (фаза плана готова и ждёт решения; терминально для звена, не для
+цепочки), `orphaned` (надзиратель мёртв, Code жив), `lost` (оба мертвы, итога нет). `orphaned`
 и `lost` вычисляются при любом чтении снимка. Отмена: SIGINT процессу Code, через 20 с SIGTERM его группе,
 ещё через 10 с SIGKILL группе. Продолжение (`code_resume`) — новая задача с `--resume <session_id>`
-родителя; `session_id` известен с первой секунды, поэтому продолжить можно даже задачу в `lost`.
+родителя; `session_id` известен с первой секунды, поэтому продолжить можно даже задачу в `lost`. Фазу плана
+`code_resume` не продолжает — только `code_approve` или `code_replan`.
 
 ## Инструменты MCP и CLI
 
-Инструменты сервера `wshub-code`: `code_projects`, `code_start`, `code_status`, `code_wait`, `code_result`,
-`code_cancel`, `code_resume`, `code_jobs`. Все вызовы — в журнал wshub; текст промпта — только sha256.
+Инструменты сервера `wshub-code`: `code_projects` (с действующей политикой проекта), `code_start`,
+`code_status`, `code_wait`, `code_result`, `code_cancel`, `code_resume`, `code_jobs`, `code_plan`,
+`code_approve`, `code_replan`, `code_stats`. Все вызовы — в журнал wshub; текст промпта — только sha256.
+
+`code_stats(project?, days=30)` — калибровка политики: по каждой строке политики и источнику выбора число
+задач (цепочек), средние стоимость и ходы, доля `completed`, доля планов, отправленных на `replan`.
 
 То же из терминала:
 
 ```sh
-wshub code start <project> <task> [--model M] [--effort E] [--max-turns N] [--budget-usd B] [--follow]
+wshub code start <project> <task> [--model M] [--effort E] [--plan no|auto|review] [--max-turns N]
+                  [--budget-usd B] [--follow]   # --model/--effort/--plan — выбор оператора
 wshub code status [job]      # без job — список последних задач
-wshub code result <job>
+wshub code result <job>      # плюс строка «открыть сессию: cd … && claude --resume …»
 wshub code stop <job> | wshub code stop --all
+wshub code stats [project] [--days N]
 ```
 
 `wshub code` без аргументов — сам MCP-сервer (его запускает Desktop). `wshub code-run` и `wshub code-hook` —

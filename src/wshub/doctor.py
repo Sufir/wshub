@@ -498,6 +498,14 @@ def check_code(ctx: Ctx, reg, hub) -> dict:
     else:
         lines.append("bwrap и socat: найдены")
 
+    # временный каталог claude (ТЗ WSH-3, решение 8) — с тем окружением, с каким его запустит задача
+    from .claude_cli import environment, tmpdir_problem
+    tmp_problem = tmpdir_problem(environment(dict(os.environ), code.glob.pass_env))
+    if tmp_problem:
+        need(tmp_problem)
+    else:
+        lines.append("временный каталог claude: свободен или наш")
+
     if entries:
         lines.append("запись wshub-code в Desktop: есть")
     else:

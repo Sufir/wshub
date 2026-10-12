@@ -10,7 +10,7 @@ from .core import Hub, WsError
 from .registry import RegistryError
 from .taskfile import TaskError
 
-TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost")
+TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost", "plan_ready")
 USER_ERR = (WsError, TaskError, RegistryError, OSError)
 
 
@@ -35,12 +35,14 @@ def code_main(cmd: str, rest: list[str], config: Path, state: Path) -> int:
     if not rest:
         return _serve(config, state)
     sub, args = rest[0], rest[1:]
-    if sub not in ("start", "status", "result", "stop"):
-        print("wshub code [start|status|result|stop] (без аргументов — MCP-сервер wshub-code)", file=sys.stderr)
+    if sub not in ("start", "status", "result", "stop", "stats"):
+        print("wshub code [start|status|result|stop|stats] (без аргументов — MCP-сервер wshub-code)",
+              file=sys.stderr)
         return 2
     hub = Hub(config, state)
     try:
-        return {"start": _start, "status": _status, "result": _result, "stop": _stop}[sub](hub, args)
+        return {"start": _start, "status": _status, "result": _result, "stop": _stop, "stats": _stats}[sub](
+            hub, args)
     except USER_ERR as e:
         hub._audit_code(f"cli_code_{sub}", None, None, status="error", error=str(e))
         print(f"wshub code: отказ: {e}", file=sys.stderr)  # без трассировки (замечание 14)
@@ -77,10 +79,11 @@ def _serve(config: Path, state: Path) -> None:
 
 
 def _parse(args: list[str]) -> tuple[list[str], dict]:
-    """Позиционные аргументы и опции --model/--effort/--max-turns/--budget-usd/--follow."""
+    """Позиционные аргументы и опции --model/--effort/--plan/--max-turns/--budget-usd/--days/--follow."""
     pos, opts = [], {}
     i = 0
-    val = {"--model": "model", "--effort": "effort", "--max-turns": "max_turns", "--budget-usd": "budget_usd"}
+    val = {"--model": "model", "--effort": "effort", "--plan": "plan", "--max-turns": "max_turns",
+           "--budget-usd": "budget_usd", "--days": "days"}
     while i < len(args):
         a = args[i]
         if a == "--follow":
@@ -106,14 +109,16 @@ def _start(hub: Hub, args: list[str]) -> int:
     from .jobs import Jobs
     pos, opts = _parse(args)
     if len(pos) != 2:
-        raise WsError("нужно: wshub code start <project> <task> [--model M --effort E --max-turns N "
-                      "--budget-usd B --follow]")
+        raise WsError("нужно: wshub code start <project> <task> [--model M --effort E --plan no|auto|review "
+                      "--max-turns N --budget-usd B --follow]")
     jobs = Jobs(hub)
-    plan = jobs.plan(pos[0], pos[1], model=opts.get("model"), effort=opts.get("effort"),
-                     max_turns=int(opts["max_turns"]) if "max_turns" in opts else None,
+    # флаги терминала — выбор оператора (ТЗ WSH-3, 2.2.1): применяется как есть, без пола и потолка
+    plan = jobs.plan(pos[0], pos[1], model=opts.get("model"), effort=opts.get("effort"), plan=opts.get("plan"),
+                     chosen_by="operator", max_turns=int(opts["max_turns"]) if "max_turns" in opts else None,
                      budget_usd=float(opts["budget_usd"]) if "budget_usd" in opts else None)
     d = jobs.start(plan)
     print(d["id"])
+    print(f"  {plan.choice.line()}", file=sys.stderr)
     for w in plan.warnings:
         print(f"  предупреждение: {w}", file=sys.stderr)
     if opts.get("follow"):
@@ -158,10 +163,30 @@ def _result(hub: Hub, args: list[str]) -> int:
     pos, _ = _parse(args)
     if len(pos) != 1:
         raise WsError("нужно: wshub code result <job>")
-    d = jobs.read(pos[0])
-    print(json.dumps({"job": pos[0], "state": jobs.effective_state(d), "reason": d.get("reason"),
-                      "result": d.get("result")}, ensure_ascii=False, indent=1))
-    hub._audit_code("cli_code_result", d.get("project"), pos[0])
+    out = jobs.result_view(pos[0])
+    print(json.dumps(out, ensure_ascii=False, indent=1))
+    if out.get("open_in_terminal"):
+        print(f"открыть сессию: {out['open_in_terminal']}")
+    hub._audit_code("cli_code_result", out.get("project"), pos[0])
+    return 0
+
+
+def _stats(hub: Hub, args: list[str]) -> int:
+    from .jobs import Jobs
+    pos, opts = _parse(args)
+    if len(pos) > 1:
+        raise WsError("нужно: wshub code stats [project] [--days N]")
+    days = int(opts.get("days", 30))
+    rows = Jobs(hub).stats(pos[0] if pos else None, days)
+    print(f"{'проект':12} {'строка политики':34} {'источник':9} {'задач':>5} {'ср. $':>8} {'ср. ходов':>9} "
+          f"{'completed':>9} {'replan':>6}")
+    for r in rows:
+        rp = "—" if r["replan_share"] is None else f"{r['replan_share']:.0%}"
+        print(f"{r['project'] or '':12} {r['row']:34} {r['source']:9} {r['tasks']:>5} {r['avg_cost_usd']:>8.2f} "
+              f"{r['avg_turns']:>9} {r['completed_share']:>9.0%} {rp:>6}")
+    if not rows:
+        print(f"(задач за {days} дн. нет)")
+    hub._audit_code("cli_code_stats", pos[0] if pos else None, None)
     return 0
 
 

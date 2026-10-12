@@ -7,8 +7,13 @@ from __future__ import annotations
 
 import re
 
-HEADER_KEYS = ("ticket", "dir", "profile", "prompt", "model", "effort", "max_turns", "budget_usd")
+HEADER_KEYS = ("ticket", "dir", "profile", "prompt", "model", "effort", "max_turns", "budget_usd",
+               "size", "risk", "plan", "choice", "choice_reason")
 REQUIRED = ("ticket", "dir", "profile")
+# по ним политика выбирает модель и план (ТЗ WSH-3, п. 2.4.1); отказ с объяснением строит jobs.plan
+REQUIRED_BY_PROFILE = {"task": ("size", "risk"), "recon": ("size",)}
+HEADER_CHOICES = {"size": ("S", "M", "L"), "risk": ("low", "high"), "plan": ("no", "auto", "review"),
+                  "choice": ("operator", "chat")}
 NOTE_MAX = 300
 TICKET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")  # имя шаблона промпта: файл <prompts>/<имя>.md
@@ -73,6 +78,9 @@ def parse_header(text: str) -> dict:
         raise TaskError("ticket — латиница, цифры, «.», «_», «-»")
     if "prompt" in out and not NAME_RE.match(out["prompt"]):
         raise TaskError("prompt — имя шаблона: латиница, цифры, «_», «-»")
+    for k, allowed in HEADER_CHOICES.items():
+        if k in out and out[k] not in allowed:
+            raise TaskError(f"{k} — одно из {', '.join(allowed)}")
     if "max_turns" in out:
         try:
             out["max_turns"] = int(out["max_turns"])
@@ -84,6 +92,11 @@ def parse_header(text: str) -> dict:
         except ValueError:
             raise TaskError("budget_usd — число") from None
     return out
+
+
+def missing_for_profile(header: dict) -> list[str]:
+    """Ключи шапки, обязательные для профиля (size/risk), которых нет."""
+    return [k for k in REQUIRED_BY_PROFILE.get(header.get("profile"), ()) if k not in header]
 
 
 def check_note(note: str | None) -> str | None:

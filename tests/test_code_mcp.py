@@ -40,7 +40,8 @@ def _tool_names(mcp) -> set[str]:
 def test_registers_exactly_27_tools(code):
     mcp = code_server.build_code_server(code.hub)
     assert _tool_names(mcp) == {"code_projects", "code_start", "code_status", "code_wait", "code_result",
-                                "code_cancel", "code_resume", "code_jobs"}
+                                "code_cancel", "code_resume", "code_jobs",
+                                "code_plan", "code_approve", "code_replan", "code_stats"}  # WSH-3
 
 
 def test_answer_trimmed_to_20kb_bytes():

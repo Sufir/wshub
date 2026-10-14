@@ -3,7 +3,8 @@
 Ограничения задаёт хаб, а не текст промпта: профиль прав (allow/deny), песочница, хук на Bash, белый список
 окружения. Ключи настроек сверены с Claude Code 2.1.291 и документацией от 2026-10-08 (ТЗ WSH-2, раздел 0.3).
 Встроенные Read/Edit/Write песочница не ограничивает — только правила permissions, поэтому файловые
-инструменты разрешены лишь с путём от рабочего каталога, а служебные каталоги и deny_read закрыты явно.
+инструменты разрешены лишь с путём от рабочего каталога (и Read — по read_extra проекта), а служебные каталоги
+и deny_read закрыты явно.
 """
 from __future__ import annotations
 
@@ -71,13 +72,15 @@ def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home:
 
 
 def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
-             data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path, phase: str | None = None) -> dict:
+             data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path, phase: str | None = None,
+             read_extra: list[str] = ()) -> dict:
     """settings.json задачи. cwd — dir (рабочий каталог Code), task_rel — путь к ТЗ от него; protected — все
     служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук).
-    phase="plan" — фаза плана (ТЗ WSH-3, решение 5): отличие от эталона профиля — ровно plan_overrides."""
+    phase="plan" — фаза плана (ТЗ WSH-3, решение 5): отличие от эталона профиля — ровно plan_overrides.
+    read_extra — абсолютные пути и шаблоны, проверенные jobs (ТЗ WSH-3.1, п. 2.2): Read вне cwd."""
     if RULE_UNSAFE.search(task_rel):
         raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
-    allow = ["Read(./**)", f"Edit(./{task_rel})", *(f"Bash({c})" for c in RECON_BASH)]
+    allow = ["Read(./**)", *_read_extra_rules(read_extra), f"Edit(./{task_rel})", *(f"Bash({c})" for c in RECON_BASH)]
     if profile == "task":
         allow += ["Edit(./**)", SUBAGENT_TOOL, *(f"Bash({c})" for c in TASK_BASH),
                   *(f"Bash({c})" for c in proj.bash_allow)]
@@ -107,9 +110,10 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
                 "denyRead": list(dict.fromkeys([*glob.deny_read, *proj.deny_read, *SANDBOX_DENY_READ,
                                                 *(str(p) for p in protected)])),
                 "allowRead": list(dict.fromkeys([str(cwd), *SANDBOX_ALLOW_READ, *proj.allow_read])),
-                # читающие профили не пишут через Bash вовсе (ТЗ WSH-3, решение 9: git log --output=<файл>);
-                # их Edit ТЗ и .agents/ — файловые инструменты, песочница их не касается
-                "denyWrite": [str(cwd / g) for g in GIT_PROTECTED] if profile == "task" else [str(cwd)],
+                # у всех профилей — только исполняемая часть git (ТЗ WSH-3.1): весь cwd в denyWrite не даёт bwrap
+                # смонтировать защищённый <cwd>/.gitconfig, и падает любой Bash. Запись читающих профилей
+                # закрывают права (Edit, перенаправления) и хук (--output, -O)
+                "denyWrite": [str(cwd / g) for g in GIT_PROTECTED],
             },
         },
         # хук запускается на каждую Bash-команду: python -m wshub.hook (~0.03 с) без тяжёлых импортов сервера
@@ -120,21 +124,27 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     if proj.claude_md_excludes:
         data["claudeMdExcludes"] = list(proj.claude_md_excludes)
     if phase == "plan":
-        plan_overrides(data, cwd)
+        plan_overrides(data, read_extra)
     elif phase is not None:
         raise CliError(f"неизвестная фаза {phase}")
     return data
 
 
-def plan_overrides(data: dict, cwd: Path) -> None:
+def plan_overrides(data: dict, read_extra: list[str] = ()) -> None:
     """Фаза плана (PoC WSH-3, 0.3.2 и решение 5): в --permission-mode plan классификатор auto mode
-    пропускал любые Bash-команды мимо allow профиля. Выключаем его; allow — чтение и git на чтение (как recon,
-    без Edit и bash_allow); песочница не пишет в рабочий каталог и никого из себя не выпускает."""
+    пропускал любые Bash-команды мимо allow профиля. Выключаем его; allow — чтение (с read_extra) и git на
+    чтение (как recon, без Edit и bash_allow); песочница никого из себя не выпускает. denyWrite — как у
+    профиля, исполняемая часть git (ТЗ WSH-3.1)."""
     data["useAutoModeDuringPlan"] = False
     data["permissions"]["disableAutoMode"] = "disable"
-    data["permissions"]["allow"] = ["Read(./**)", *(f"Bash({c})" for c in RECON_BASH)]
-    data["sandbox"]["filesystem"]["denyWrite"] = [str(cwd)]
+    data["permissions"]["allow"] = ["Read(./**)", *_read_extra_rules(read_extra),
+                                    *(f"Bash({c})" for c in RECON_BASH)]
     data["sandbox"]["excludedCommands"] = []
+
+
+def _read_extra_rules(read_extra: list[str]) -> list[str]:
+    """Read(//<абсолютный путь или шаблон>) — read_extra проекта; в allowRead песочницы не идут."""
+    return [f"Read({_abs_rule(p)})" for p in read_extra]
 
 
 PERMISSION_MODES = ("dontAsk", "plan")

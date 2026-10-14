@@ -38,7 +38,8 @@ CODE_DENY_READ = ("~/.ssh", "~/.aws", "~/.gnupg", "~/.config/wshub", "~/.local/s
                   "~/.claude/.credentials.json", "~/.claude.json")
 CODE_KEYS = {"claude", "max_wait_s", "network", "deny_read", "pass_env", "policy"}
 WS_CODE_LISTS = ("bash_allow", "sandbox_exclude", "network", "deny_read", "allow_read", "deny_edit",
-                 "claude_md_excludes")
+                 "claude_md_excludes", "read_extra")
+READ_EXTRA_BAD = re.compile(r"[?\[\]{}()\\]")  # в read_extra из символов шаблона допустима только «*»
 WS_CODE_KEYS = {"enabled", "dirs", "prompts", "profiles", "model_min", "model_max", "effort_max", "max_turns",
                 "max_budget_usd", "daily_budget_usd", "max_parallel", "max_hours", "prefetch", "status_regex",
                 "policy", "plan_budget_share", "plan_max_turns", "execute_prompt", *WS_CODE_LISTS}
@@ -135,6 +136,7 @@ class ProjectCode:
     allow_read: tuple[str, ...] = ()  # sandbox.filesystem.allowRead сверх рабочего каталога и настроек git
     deny_edit: tuple[str, ...] = ()
     claude_md_excludes: tuple[str, ...] = ()
+    read_extra: tuple[str, ...] = ()  # Read вне dir: пути и glob от корня проекта (ТЗ WSH-3.1)
     policy: tuple[PolicyRow, ...] = ()
     plan_budget_share: float = 0.3  # доля бюджета задачи на фазу плана
     plan_max_turns: int = 40
@@ -364,6 +366,11 @@ def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
     for k in WS_CODE_LISTS:
         if k in t:
             vals[k] = _str_list(t[k], f"{where} {k}")
+    for e in vals.get("read_extra", ()):
+        _rel_path(e, f"{where} read_extra")
+        if ".." in Path(e).parts or READ_EXTRA_BAD.search(e):
+            raise RegistryError(f"{where} read_extra: {e!r} — путь от корня проекта без «..» и без символов "
+                                "шаблона, кроме *")
     if "policy" in t:
         vals["policy"] = _policy(t["policy"], f"[[workspace.{name}.code.policy]]", "project")
     if "plan_budget_share" in t:

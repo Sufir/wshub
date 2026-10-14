@@ -440,7 +440,7 @@ def test_plan_and_execute_settings_files(code):
     sp = json.loads((code.jobs.job_dir(snap["chain"][0]["id"]) / "settings.json").read_text())
     se = json.loads((code.jobs.job_dir(snap["chain"][1]["id"]) / "settings.json").read_text())
     assert sp["useAutoModeDuringPlan"] is False and sp["permissions"]["disableAutoMode"] == "disable"
-    assert sp["sandbox"]["filesystem"]["denyWrite"] == [str(code.root)]
+    assert sp["sandbox"]["filesystem"]["denyWrite"] == [str(code.root / g) for g in claude_cli.GIT_PROTECTED]
     assert not any(a.startswith("Edit") for a in sp["permissions"]["allow"])
     assert "useAutoModeDuringPlan" not in se and "Edit(./**)" in se["permissions"]["allow"]
     assert sp["hooks"] == se["hooks"] and sp["permissions"]["deny"] == se["permissions"]["deny"]
@@ -499,7 +499,8 @@ def test_replan(code, monkeypatch):
     assert code.jobs.plan_text(root)[1].parent.name == out["job"]  # code_plan по корню — последний план
     # звено переделки — с settings фазы плана, а не исполнения (ревью, находка 5)
     sr = json.loads((code.jobs.job_dir(out["job"]) / "settings.json").read_text())
-    assert sr["useAutoModeDuringPlan"] is False and sr["sandbox"]["filesystem"]["denyWrite"] == [str(code.root)]
+    assert sr["useAutoModeDuringPlan"] is False and sr["sandbox"]["filesystem"]["denyWrite"] == \
+        [str(code.root / g) for g in claude_cli.GIT_PROTECTED]
     assert "Edit(./**)" not in sr["permissions"]["allow"]
     assert _call(code, "code_replan", {"job": root, "note": "   "}).startswith("отказ:")  # одни пробелы
     child = code.jobs.approve(root)  # по корню — активное звено (ревью, находка 8)
@@ -660,8 +661,8 @@ def test_max_parallel_checked_on_auto_transition(code, monkeypatch):
 
 @pytest.mark.parametrize("profile", ["recon", "task", "review"])
 def test_plan_settings_golden(profile):
-    """Кейс 8 и решение 5: settings фазы плана — эталон целиком (мутации «нет denyWrite рабочего каталога»
-    и «нет useAutoModeDuringPlan: false» краснят)."""
+    """Кейс 8 и решение 5: settings фазы плана — эталон целиком (мутации «denyWrite — весь рабочий каталог»
+    (ТЗ WSH-3.1) и «нет useAutoModeDuringPlan: false» краснят)."""
     from test_code import _golden_settings
     s = claude_cli.settings(profile, "org/TASK.md", CodeGlobal(),
                             ProjectCode(enabled=True, dirs=(".",), prompts="p", deny_edit=("docker-compose*.yml",)),
@@ -692,13 +693,19 @@ def test_plan_settings_clear_project_bash_and_exclusions():
 
 @pytest.mark.parametrize("profile", ["recon", "review"])
 def test_reading_profiles_clear_project_exclusions(profile):
-    """Решение 9.2 (правка 2026-10-14): у recon и review excludedCommands пуст и при sandbox_exclude проекта,
-    denyWrite — весь каталог; у task — как в WSH-2 (мутация «recon с excludedCommands проекта»)."""
+    """Решение 9.2 (правка 2026-10-14): у recon и review excludedCommands пуст и при sandbox_exclude проекта;
+    у task — как в WSH-2 (мутация «recon с excludedCommands проекта»). denyWrite у всех — исполняемая часть git,
+    а не весь каталог: иначе bwrap не монтирует защищённый <dir>/.gitconfig (ТЗ WSH-3.1, мутация «recon
+    с denyWrite: [<dir>]»)."""
     proj = ProjectCode(sandbox_exclude=("docker",))
+    git_protected = ["/d/.git/config", "/d/.git/hooks", "/d/.git/info", "/d/.git/modules"]
     s = claude_cli.settings(profile, "T.md", CodeGlobal(), proj, [], [], ["/w"], Path("/h"), Path("/d"))
-    assert s["sandbox"]["excludedCommands"] == [] and s["sandbox"]["filesystem"]["denyWrite"] == ["/d"]
+    assert s["sandbox"]["excludedCommands"] == [] and s["sandbox"]["filesystem"]["denyWrite"] == git_protected
+    sp = claude_cli.settings(profile, "T.md", CodeGlobal(), proj, [], [], ["/w"], Path("/h"), Path("/d"),
+                             phase="plan")
+    assert sp["sandbox"]["excludedCommands"] == [] and sp["sandbox"]["filesystem"]["denyWrite"] == git_protected
     t = claude_cli.settings("task", "T.md", CodeGlobal(), proj, [], [], ["/w"], Path("/h"), Path("/d"))
-    assert t["sandbox"]["excludedCommands"] == ["docker"] and "/d" not in t["sandbox"]["filesystem"]["denyWrite"]
+    assert t["sandbox"]["excludedCommands"] == ["docker"] and t["sandbox"]["filesystem"]["denyWrite"] == git_protected
 
 
 def test_argv_plan_execute_golden():

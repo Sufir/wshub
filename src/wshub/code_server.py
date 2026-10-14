@@ -77,6 +77,7 @@ def build_code_server(hub) -> FastMCP:
                         "daily_budget_usd": proj.daily_budget_usd, "max_parallel": proj.max_parallel,
                         "live_jobs": live, "plan_budget_share": proj.plan_budget_share,
                         "plan_max_turns": proj.plan_max_turns, "execute_prompt": proj.execute_prompt,
+                        "read_extra": list(proj.read_extra),  # как в реестре: от корня проекта
                         # действующая политика: строки проекта, глобальные, встроенные — от сильной к слабой
                         "policy": code_policy.effective(reg.code.glob, proj)})
         for name, err in reg.code.project_errors.items():

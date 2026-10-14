@@ -136,6 +136,24 @@ class Jobs:
             out.append(p)
         return out
 
+    def _read_extra(self, root: Path, proj: ProjectCode) -> list[str]:
+        """read_extra для Read(//…) (ТЗ WSH-3.1, п. 2.2): база — компоненты пути до первого с «*», после
+        resolve() — внутри корня и без пересечения со служебными каталогами wshub; правило — разрешённая база
+        плюс хвост шаблона. Нарушение — ошибка реестра для wshub-code."""
+        out = []
+        for e in proj.read_extra:
+            parts = Path(e).parts
+            i = next((k for k, x in enumerate(parts) if "*" in x), len(parts))
+            base = root.joinpath(*parts[:i]).resolve()
+            if not (base == root or base.is_relative_to(root)):
+                raise RegistryError(f"code.read_extra: {e} вне корня проекта {root}")
+            if self.hub.protected_kind(base) is not None:
+                raise RegistryError(f"code.read_extra: {e} пересекается со служебным каталогом wshub")
+            if claude_cli.RULE_UNSAFE.search(base.as_posix()):  # иначе разрешённая база станет шаблоном в Read(…)
+                raise RegistryError(f"code.read_extra: {e} ведёт в {base} — путь с символами шаблона")
+            out.append(base.joinpath(*parts[i:]).as_posix())
+        return out
+
     def plan(self, project: str, task: str, *, model=None, effort=None, plan=None, chosen_by=None, reason=None,
              max_turns=None, budget_usd=None, note=None, prompt_override: str | None = None,
              inherit: dict | None = None, channel: str = "mcp") -> Plan:
@@ -349,6 +367,7 @@ class Jobs:
         проверяем, что план всё ещё plan_ready и не утверждён, и отмечаем его (code_approve/replan/auto)."""
         import json
         glob = self.hub.registry.get().code.glob
+        read_extra = self._read_extra(plan.root, plan.proj)  # до каталога задачи: отказ не оставляет файлов
         # claude и его флаги (вызовы подпроцесса) — до flock: не трогают общее состояние, не держат лок
         claude = claude_cli.resolve_claude(glob.claude, dict(os.environ))
         env = claude_cli.environment(dict(os.environ), glob.pass_env)
@@ -398,7 +417,7 @@ class Jobs:
             hook_cmd = [sys.executable, "-m", "wshub.hook"]  # лёгкий запуск хука (замечание 9)
             settings = claude_cli.settings(plan.profile, plan.task_rel, glob, plan.proj, protected,
                                            self.hub.protected_data, hook_cmd, Path.home(), plan.dir,
-                                           phase="plan" if plan.phase == "plan" else None)
+                                           phase="plan" if plan.phase == "plan" else None, read_extra=read_extra)
             claude_cli.write_job_files(jdir, settings, plan.prompt)
             argv = claude_cli.argv(claude, plan.prompt, job_dir=jdir, model=plan.model, effort=plan.effort,
                                    max_turns=plan.max_turns, budget_usd=plan.budget_usd, flags=flags,

@@ -51,6 +51,7 @@ deny_read = ["~/.config/payload"] # добавка к [code].deny_read
 allow_read = []                   # sandbox.filesystem.allowRead сверх рабочего каталога и настроек git
 deny_edit = ["docker-compose*.yml", "Dockerfile*", ".gitlab-ci.yml"]
 claude_md_excludes = []           # claudeMdExcludes
+read_extra = ["CLAUDE.md", ".agents/*.md"]   # Read вне dir: пути и glob от корня проекта, только чтение
 plan_budget_share = 0.3           # доля бюджета задачи на фазу плана
 plan_max_turns = 40               # ходы фазы плана
 execute_prompt = "execute"        # шаблон фазы исполнения в каталоге prompts
@@ -187,8 +188,8 @@ header. У источника `policy` канала нет. **`choice_fields`** 
    settings.json фазы отличается от эталона профиля ровно этим: `useAutoModeDuringPlan: false` и
    `permissions.disableAutoMode: "disable"` (без классификатора auto mode Bash вне allow получает отказ);
    allow — чтение и git только на чтение (как `recon`, без Edit и без `bash_allow`);
-   `sandbox.filesystem.denyWrite` — весь рабочий каталог; `sandbox.excludedCommands` — пусто. Хук, deny и
-   остальная песочница — как у профиля.
+   `sandbox.excludedCommands` — пусто. Хук, deny и остальная песочница (в том числе `denyWrite`) — как у
+   профиля.
 2. **План.** Claude Code в `-p` пишет план инструментом `Write` в `~/.claude/plans/<slug>.md`. Хаб берёт путь
    из потока событий — последний успешный (с парным `tool_result` без ошибки) `Write` или `Edit` файла `.md`
    прямо в каталоге планов, изменённого не раньше старта звена, — читает файл и кладёт копию в `plan.md`
@@ -236,10 +237,31 @@ header. У источника `policy` канала нет. **`choice_fields`** 
 2. **Песочница** (`sandbox`, нужны bwrap и socat). Включена, `failIfUnavailable: true`,
    `allowUnsandboxedCommands: false`, `autoAllowBashIfSandboxed: false` — Bash идёт только по allow-правилам.
    Сеть — только `network`. Чтение сужено: `denyRead` включает `~/` и `/mnt/`, `allowRead` открывает рабочий
-   каталог, `~/.gitconfig`, `~/.config/git/` и `allow_read` проекта. Запись: у `task` закрыты `./.git/config`,
-   `./.git/hooks`, `./.git/info`, `./.git/modules` (`denyWrite` и deny `Edit`); у `recon` и `review` Bash не
-   пишет в рабочий каталог вовсе (`denyWrite` — весь каталог), а `excludedCommands` у них пуст: `sandbox_exclude`
-   проекта действует только в `task`. Их `Edit` ТЗ и `.agents/` — файловый инструмент вне песочницы, он работает.
+   каталог, `~/.gitconfig`, `~/.config/git/` и `allow_read` проекта. Запись: у всех профилей и в фазе плана
+   закрыты `./.git/config`, `./.git/hooks`, `./.git/info`, `./.git/modules` (`denyWrite` и deny `Edit`), запись
+   вне рабочего каталога закрыта песочницей. `excludedCommands` у `recon` и `review` пуст: `sandbox_exclude`
+   проекта действует только в `task`.
+
+   **Запись у читающих профилей** (`recon`, `review`, фаза плана) закрывают права и хук, а не песочница:
+   Bash — только git на чтение из allow (остальное — отказ в `dontAsk` и в фазе плана без auto mode);
+   перенаправление `> файл` сверяется с правилами `Edit` и получает отказ; `--output` и `-O` у git ловит хук.
+   Весь рабочий каталог в `denyWrite` не ставится: `<dir>/.gitconfig` — защищённый путь песочницы Claude Code,
+   bwrap монтирует его в рабочий каталог и при `denyWrite: [<dir>]` не может создать точку монтирования
+   (`bwrap: Can't create file at <dir>/.gitconfig: Read-only file system`) — так падает любой Bash, git тоже
+   (проверено на 2.1.291, рабочий каталог под `~`). Их `Edit` ТЗ и `.agents/` — файловый инструмент вне
+   песочницы.
+
+   **`read_extra`** — что ещё, кроме рабочего каталога, можно читать встроенными файловыми инструментами
+   (Read, Grep, Glob): пути и glob от корня проекта, например правила проекта в Payload —
+   `read_extra = ["CLAUDE.md", ".agents/*.md"]`. Каждый элемент даёт allow `Read(//<абсолютный путь>)` во всех
+   профилях и в фазе плана; база (часть пути до первого компонента с `*`) берётся после `resolve()`.
+   Каталог целиком — `dir/**`: элемент `dir` даёт правило только на сам путь. В `allowRead` песочницы элементы
+   не попадают: Bash у читающих профилей — только git. Deny-правила (`Read(**/.env*)`, `deny_read`, служебные
+   каталоги) сильнее. Ошибка реестра для `wshub-code`: при разборе — абсолютный путь, `..`, символы шаблона
+   кроме `*` (`? [ ] { } ( ) \`); при запуске задачи, как у `dirs`, — база вне корня проекта (в том числе
+   через симлинк), пересекается со служебными каталогами wshub (база — корень, например у `*.md`, — значит,
+   ни одного служебного каталога внутри корня) или после `resolve()` содержит символы шаблона. По умолчанию
+   список пуст — лишних правил нет.
 3. **Хук** на Bash (`python -m wshub.hook`) закрывает формы, которые правила по тексту не ловят (git push в
    подстановке, сетевые утилиты, пути к служебным каталогам; `--output` у любой подкоманды git; `-O` /
    `--open-files-in-pager` у `git grep`, включая сокращения и склейки; `GIT_*`, `PAGER`, `LESSOPEN`,

@@ -15,6 +15,7 @@ from .registry import EFFORTS, MODELS, CodeGlobal, PolicyRow, ProjectCode
 REASON_MIN = 15
 FIELDS = ("model", "effort", "plan")
 SOURCES = ("operator", "policy", "chat")
+CHANNELS = ("cli", "mcp", "header")  # откуда пришли поля выбора: флаги терминала, аргументы MCP, шапка ТЗ
 ORIGIN_RU = {"project": "проекта", "global": "глобальная", "builtin": "встроенная"}
 
 BUILTIN: tuple[PolicyRow, ...] = (
@@ -27,7 +28,7 @@ BUILTIN: tuple[PolicyRow, ...] = (
     PolicyRow("task", "M", "low", "sonnet", "high", "auto", "opus", "high"),
     PolicyRow("task", "M", "high", "opus", "high", "review", "opus", "high"),
     PolicyRow("task", "L", "low", "opus", "high", "review", "opus", "high"),
-    PolicyRow("task", "L", "high", "opus", "xhigh", "review", "opus", "high"),
+    PolicyRow("task", "L", "high", "opus", "high", "review", "opus", "high"),
 )
 
 GUIDE = """\
@@ -38,8 +39,9 @@ risk: high — безопасность, деньги, данные пользо
 plan: no — без плана; auto — Code сначала строит план, затем исполняет; review — план, остановка,
 решение архитектора (code_plan → code_approve или code_replan).
 Отступить от политики (model/effort/plan) чат может только в пределах потолков проекта и только с причиной
-(reason, ≥ 15 символов). Выбор оператора (chosen_by: "operator" или choice: operator в шапке) исполняется
-как есть — передавай его, только когда так сказал оператор."""
+(reason, ≥ 15 символов); понизить план ниже строки политики — только оператор. Выбор оператора
+(chosen_by: "operator" или choice: operator в шапке) исполняется как есть — передавай его, только когда
+так сказал оператор."""
 
 
 class PolicyError(WsError):
@@ -57,14 +59,20 @@ class Choice:
     row: str | None  # «task/M/low (встроенная)» — строка политики, по которой выбрано
     reason: str | None
     fields: dict  # поле → источник: operator | policy | chat
+    channel: str | None = None  # cli | mcp | header, несколько — через «+»; у источника policy — None
+    choice_fields: dict | None = None  # поле не из политики → «источник:канал», например «chat:mcp»
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        out = asdict(self)
+        if out["channel"] is None:  # у источника policy поля нет (решение 12)
+            del out["channel"]
+        return out
 
     def line(self) -> str:
         """Строка для ответа code_start (2.4.4)."""
         plan = self.plan if self.plan == "no" else f"{self.plan} (план: {self.plan_model}/{self.plan_effort})"
-        out = (f"модель/effort/план: {self.model}/{self.effort}/{plan}, источник: {self.source}, "
+        out = (f"модель/effort/план: {self.model}/{self.effort}/{plan}, источник: {self.source}"
+               f"{f' ({self.channel})' if self.channel else ''}, "
                f"строка политики: {self.row or '—'}")
         if self.source == "chat":
             out += f"; чат отступил от политики: {self.reason}"
@@ -166,6 +174,10 @@ def choose(glob: CodeGlobal, proj: ProjectCode, profile: str, size: str | None, 
         except PolicyError as ex:
             raise PolicyError(_bounds_hint(str(ex), "policy")) from None
 
+    # план понижает только оператор (решение 10): строки нет — понижать не от чего
+    if row is not None and fields["plan"] == "chat" and PLAN_MODES.index(vals["plan"]) < PLAN_MODES.index(row.plan):
+        raise PolicyError(f"понизить план ниже политики (строка {label}: plan {row.plan}) может только оператор: "
+                          "`choice: operator` в шапке, `chosen_by: \"operator\"` или флаг `--plan` в терминале")
     chat = [f for f in FIELDS if fields[f] == "chat"]
     if chat:
         r = clean_reason(reason)

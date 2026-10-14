@@ -86,10 +86,7 @@
                     "~/.config/git/"
                 ],
                 "denyWrite": [
-                    "/home/u/proj/.git/config",
-                    "/home/u/proj/.git/hooks",
-                    "/home/u/proj/.git/info",
-                    "/home/u/proj/.git/modules"
+                    "/home/u/proj"
                 ]
             }
         },
@@ -314,10 +311,7 @@
                     "~/.config/git/"
                 ],
                 "denyWrite": [
-                    "/home/u/proj/.git/config",
-                    "/home/u/proj/.git/hooks",
-                    "/home/u/proj/.git/info",
-                    "/home/u/proj/.git/modules"
+                    "/home/u/proj"
                 ]
             }
         },

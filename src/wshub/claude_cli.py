@@ -98,7 +98,8 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
             "failIfUnavailable": True,
             "allowUnsandboxedCommands": False,
             "autoAllowBashIfSandboxed": False,  # Bash — только по allow-правилам профиля
-            "excludedCommands": list(proj.sandbox_exclude),
+            # читающие профили никого не выпускают из песочницы (решение 9.2, правка 2026-10-14)
+            "excludedCommands": list(proj.sandbox_exclude) if profile == "task" else [],
             "network": {"allowedDomains": [*glob.network, *proj.network]},
             "filesystem": {
                 # служебные каталоги wshub — абсолютными путями тоже: при нестандартном WSHUB_STATE/CONFIG
@@ -106,7 +107,9 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
                 "denyRead": list(dict.fromkeys([*glob.deny_read, *proj.deny_read, *SANDBOX_DENY_READ,
                                                 *(str(p) for p in protected)])),
                 "allowRead": list(dict.fromkeys([str(cwd), *SANDBOX_ALLOW_READ, *proj.allow_read])),
-                "denyWrite": [str(cwd / g) for g in GIT_PROTECTED],
+                # читающие профили не пишут через Bash вовсе (ТЗ WSH-3, решение 9: git log --output=<файл>);
+                # их Edit ТЗ и .agents/ — файловые инструменты, песочница их не касается
+                "denyWrite": [str(cwd / g) for g in GIT_PROTECTED] if profile == "task" else [str(cwd)],
             },
         },
         # хук запускается на каждую Bash-команду: python -m wshub.hook (~0.03 с) без тяжёлых импортов сервера

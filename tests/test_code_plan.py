@@ -113,12 +113,25 @@ def test_policy_row_errors_scoped(code, row, msg):
 
 
 def test_policy_above_ceiling_refused(code):
-    """Строка политики подчиняется потолкам реестра; встроенная task/L/high (xhigh) при effort_max=high."""
+    """Строка политики подчиняется потолкам реестра: строка проекта с xhigh при effort_max=high — отказ."""
+    row = ('\n[[workspace.proj.code.policy]]\nprofile = "task"\nsize = "L"\nrisk = "high"\nmodel = "opus"\n'
+           'effort = "xhigh"\nplan = "review"\nplan_model = "opus"\nplan_effort = "high"\n')
+    _with_policy(code, row)
     t = code.taskfile(size="L", risk="high")
-    with pytest.raises(JobError, match="строка политики task/L/high.*effort xhigh выше effort_max"):
+    with pytest.raises(JobError, match="строка политики task/L/high \\(проекта\\).*effort xhigh выше effort_max"):
         code.jobs.plan("proj", t)
-    code.write(effort_max='"xhigh"')
+    _with_policy(code, row, effort_max='"xhigh"')
     assert code.jobs.plan("proj", t).choice.effort == "xhigh"
+
+
+def test_builtin_rows_within_default_bounds():
+    """Решение 11: каждая встроенная строка проходит пол и потолок ProjectCode() по умолчанию."""
+    p = ProjectCode()
+    for r in code_policy.BUILTIN:
+        code_policy._check_bounds(p, r.model, r.effort, r.key)
+        if r.plan != "no":
+            code_policy._check_bounds(p, r.plan_model, r.plan_effort, f"{r.key} (план)")
+    assert code_policy.match(CodeGlobal(), p, "task", "L", "high").effort == "high"
 
 
 # ---------- 2. источники выбора ----------
@@ -198,6 +211,160 @@ def test_chat_deviation_in_answer_and_journal(code):
     assert rec["params"]["policy_row"] == "task/S/low (встроенная)"
     out = _call(code, "code_start", {"project": "proj", "task": code.taskfile(), "model": "opus"})
     assert out.startswith("отказ:") and "укажи причину" in out
+
+
+# ---------- решение 10: чат не понижает план ----------
+
+def test_chat_cannot_lower_plan(code, capsys):
+    """Решение 10 (мутация «чат понижает план»): no < auto < review; понижает только оператор."""
+    big = code.taskfile("L.md", size="L", risk="high")  # строка review
+    for kw in ({}, {"reason": "план тут не нужен, правка тривиальная"}):
+        with pytest.raises(JobError, match=r"понизить план ниже политики \(строка task/L/high \(встроенная\): "
+                                           r"plan review\) может только оператор"):
+            code.jobs.plan("proj", big, plan="no", **kw)
+    with pytest.raises(JobError, match="может только оператор"):  # шапкой без choice: operator — тоже чат
+        code.jobs.plan("proj", code.taskfile("LH.md", size="L", risk="high",
+                                             extra="plan: no\nchoice_reason: план тут не нужен, правка простая\n"))
+    with pytest.raises(JobError, match="plan auto\\) может только оператор"):  # auto → no (ревью круга, находка 3)
+        code.jobs.plan("proj", code.taskfile("ML.md", size="M", risk="low"), plan="no",
+                       reason="план тут не нужен, правка тривиальная")
+    with pytest.raises(JobError, match="plan review\\) может только оператор"):  # review → auto — тоже понижение
+        code.jobs.plan("proj", code.taskfile("MH.md", size="M", risk="high"), plan="auto",
+                       reason="хватит плана без остановки")
+    p = code.jobs.plan("proj", code.taskfile(), plan="review", reason="затронут расчёт комиссий, нужен план")
+    assert (p.choice.plan, p.choice.source) == ("review", "chat")  # поднять — можно, с причиной
+    p = code.jobs.plan("proj", big, plan="no", chosen_by="operator")
+    assert (p.choice.plan, p.choice.source, p.phase) == ("no", "operator", None)
+    p = code.jobs.plan("proj", code.taskfile("LO.md", size="L", risk="high", extra="plan: no\nchoice: operator\n"))
+    assert (p.choice.plan, p.choice.source) == ("no", "operator")
+    rc = code_cli.code_main("code", ["start", "proj", code.taskfile("LC.md", size="L", risk="high"), "--plan", "no"],
+                            code.cfg, code.state)
+    assert rc == 0
+    jid = capsys.readouterr().out.strip().splitlines()[0]
+    wait_terminal(code.jobs, jid)
+    assert code.jobs.read(jid)["choice"]["plan"] == "no"
+    out = _call(code, "code_start", {"project": "proj", "task": big, "plan": "no",
+                                     "reason": "план тут не нужен, правка тривиальная"})
+    assert out.startswith("отказ:") and "может только оператор" in out
+    # строки политики нет (чат задал все три поля) — понижать не от чего
+    c = code_policy.choose(CodeGlobal(), ProjectCode(), "task", None, None,
+                           {"model": ("sonnet", "chat"), "effort": ("low", "chat"), "plan": ("no", "chat")},
+                           "строки нет, выбираю всё сам")
+    assert (c.plan, c.source, c.row) == ("no", "chat", None)
+    # строка политики проекта — правило то же
+    _with_policy(code, '\n[[workspace.proj.code.policy]]\nprofile = "task"\nsize = "S"\nrisk = "low"\n'
+                       'model = "sonnet"\neffort = "low"\nplan = "auto"\nplan_model = "sonnet"\nplan_effort = "low"\n')
+    with pytest.raises(JobError, match=r"строка task/S/low \(проекта\): plan auto\) может только оператор"):
+        code.jobs.plan("proj", code.taskfile("PS.md"), plan="no", reason="план тут не нужен, правка тривиальная")
+
+
+def test_resume_refuses_changed_size_risk(code):
+    """Ревью круга, находка 1: resume не обходит план правкой size/risk в шапке."""
+    t = code.taskfile()
+    d = code.jobs.start(code.jobs.plan("proj", t))
+    wait_terminal(code.jobs, d["id"])
+    code.taskfile(size="L", risk="high")  # тот же файл ТЗ, разметка крупной задачи
+    with pytest.raises(JobError, match="size/risk"):
+        code.jobs.resume(d["id"], "task")
+
+
+# ---------- решение 12: канал выбора ----------
+
+def _audit_start(code, jid) -> dict:
+    return [json.loads(x) for x in (code.state / "audit.jsonl").read_text().splitlines()
+            if '"code_start"' in x and jid in x][0]
+
+
+def test_choice_channel_operator_and_chat(code, capsys):
+    """Решение 12 (мутация «channel не пишется»): канал в job.json, журнале и ответе code_start."""
+    def check(jid, source, channel):
+        wait_terminal(code.jobs, jid)
+        c = code.jobs.read(jid)["choice"]
+        rec = _audit_start(code, jid)["params"]
+        if channel is None:  # у источника policy поля нет
+            assert c["source"] == rec["model_source"] == source and "channel" not in c and "channel" not in rec
+        else:
+            assert (c["source"], c["channel"]) == (source, channel)
+            assert (rec["model_source"], rec["channel"]) == (source, channel)
+
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": code.taskfile("M1.md"),
+                                                "model": "opus", "chosen_by": "operator"}))
+    assert "источник: operator (mcp)" in out["choice"]
+    check(out["job"], "operator", "mcp")
+    assert code_cli.code_main("code", ["start", "proj", code.taskfile("C1.md"), "--model", "opus"],
+                              code.cfg, code.state) == 0
+    cap = capsys.readouterr()
+    assert "источник: operator (cli)" in cap.err
+    check(cap.out.strip().splitlines()[0], "operator", "cli")
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": code.taskfile(
+        "H1.md", extra="model: opus\nchoice: operator\n")}))
+    assert "источник: operator (header)" in out["choice"]
+    check(out["job"], "operator", "header")
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": code.taskfile(
+        "H2.md", extra="effort: low\nchoice: operator\n"), "model": "opus", "chosen_by": "operator"}))
+    check(out["job"], "operator", "mcp+header")
+    assert code_cli.code_main("code", ["start", "proj", code.taskfile("C2.md", extra="effort: low\nchoice: operator\n"),
+                                       "--model", "opus"], code.cfg, code.state) == 0
+    check(capsys.readouterr().out.strip().splitlines()[0], "operator", "cli+header")
+
+    why = "сложная логика расчёта комиссий"
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": code.taskfile("M2.md"),
+                                                "model": "opus", "reason": why}))
+    assert "источник: chat (mcp)" in out["choice"]
+    check(out["job"], "chat", "mcp")
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": code.taskfile(
+        "H3.md", extra=f"model: opus\nchoice_reason: {why}\n")}))
+    check(out["job"], "chat", "header")
+    # флаги терминала — всегда оператор (2.2.1): чат в канале cli невозможен; без флагов из CLI —
+    # чат только шапкой; канал — объединение каналов всех полей не из политики (уточнение решения 12)
+    t = code.taskfile("C3.md", extra=f"model: opus\nchoice_reason: {why}\n")
+    assert code_cli.code_main("code", ["start", "proj", t, "--effort", "low"], code.cfg, code.state) == 0
+    check(capsys.readouterr().out.strip().splitlines()[0], "chat", "cli+header")
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": code.taskfile(
+        "H4.md", extra="effort: low\n"), "model": "opus", "reason": why}))
+    check(out["job"], "chat", "mcp+header")
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": code.taskfile("P1.md")}))
+    assert "источник: policy," in out["choice"]
+    check(out["job"], "policy", None)
+    assert code.jobs.read(out["job"])["choice"]["choice_fields"] == {}
+    assert _audit_start(code, out["job"])["params"]["choice_fields"] == {}
+
+
+def test_mixed_choice_channel_and_fields(code):
+    """Уточнение решения 12: оператор понижает план шапкой, чат задаёт модель аргументами — источник chat,
+    канал — каналы всех полей не из политики, choice_fields — источник и канал каждого поля."""
+    t = code.taskfile("MX.md", size="L", risk="high", extra="plan: no\nchoice: operator\n")
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": t, "model": "opus",
+                                                "reason": "нужна модель сильнее для разбора"}))
+    assert "источник: chat (mcp+header)" in out["choice"]
+    jid = out["job"]
+    wait_terminal(code.jobs, jid)
+    c = code.jobs.read(jid)["choice"]
+    want = {"model": "chat:mcp", "plan": "operator:header"}
+    assert (c["source"], c["channel"], c["plan"], c["choice_fields"]) == ("chat", "mcp+header", "no", want)
+    rec = _audit_start(code, jid)["params"]
+    assert (rec["model_source"], rec["channel"], rec["choice_fields"]) == ("chat", "mcp+header", want)
+    # зеркально: аргументы оператора понижают план, поле шапки без choice — чат
+    p = code.jobs.plan("proj", code.taskfile("MY.md", size="L", risk="high",
+                                             extra="effort: medium\nchoice_reason: дешевле для разбора логов\n"),
+                       plan="no", chosen_by="operator")
+    assert (p.choice.source, p.choice.channel, p.choice.choice_fields) == \
+        ("chat", "mcp+header", {"plan": "operator:mcp", "effort": "chat:header"})
+
+
+def test_resume_channel(code):
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile(), model="opus", chosen_by="operator", channel="cli"))
+    wait_terminal(code.jobs, d["id"])
+    r = code.jobs.resume(d["id"], "task")  # без смены — выбор и канал родителя
+    assert (r["choice"]["source"], r["choice"]["channel"]) == ("operator", "cli")
+    wait_terminal(code.jobs, r["id"])
+    assert r["choice"]["choice_fields"] == {"model": "operator:cli"}
+    r = code.jobs.resume(d["id"], "task", effort="low", reason="нужно дешевле для мелкой правки")
+    assert (r["choice"]["source"], r["choice"]["channel"]) == ("chat", "cli+mcp")
+    assert r["choice"]["choice_fields"] == {"model": "operator:cli", "effort": "chat:mcp"}
+    wait_terminal(code.jobs, r["id"])
+    with pytest.raises(JobError, match="канал выбора"):
+        code.jobs.plan("proj", code.taskfile(), channel="header")
 
 
 def test_policy_answer_line(code):
@@ -347,6 +514,9 @@ def test_no_plan_fails_without_execution(code, monkeypatch):
     root = code.jobs.start(code.jobs.plan("proj", code.taskfile(size="M", risk="low")))["id"]
     snap = _wait_state(code.jobs, root, ("failed", "completed", "plan_ready"))
     assert (snap["state"], code.jobs.read(root)["reason"]) == ("failed", "no_plan")
+    hint = "план ищется только в ~/.claude/plans/: настройка plansDirectory в .claude/settings*.json проекта " \
+           "не поддерживается"
+    assert snap["reason_hint"] == hint and code.jobs.result_view(root)["reason_hint"] == hint  # решение 13
     time.sleep(0.5)
     assert len(code.jobs.chain(root)) == 1
 
@@ -520,6 +690,17 @@ def test_plan_settings_clear_project_bash_and_exclusions():
     assert "Bash(docker compose *)" in full["permissions"]["allow"]  # исполнение — как в WSH-2
 
 
+@pytest.mark.parametrize("profile", ["recon", "review"])
+def test_reading_profiles_clear_project_exclusions(profile):
+    """Решение 9.2 (правка 2026-10-14): у recon и review excludedCommands пуст и при sandbox_exclude проекта,
+    denyWrite — весь каталог; у task — как в WSH-2 (мутация «recon с excludedCommands проекта»)."""
+    proj = ProjectCode(sandbox_exclude=("docker",))
+    s = claude_cli.settings(profile, "T.md", CodeGlobal(), proj, [], [], ["/w"], Path("/h"), Path("/d"))
+    assert s["sandbox"]["excludedCommands"] == [] and s["sandbox"]["filesystem"]["denyWrite"] == ["/d"]
+    t = claude_cli.settings("task", "T.md", CodeGlobal(), proj, [], [], ["/w"], Path("/h"), Path("/d"))
+    assert t["sandbox"]["excludedCommands"] == ["docker"] and "/d" not in t["sandbox"]["filesystem"]["denyWrite"]
+
+
 def test_argv_plan_execute_golden():
     flags = {"permission_prompts": True, "setting_sources": True}
     a = claude_cli.argv("/claude", "PROMPT", job_dir=Path("/j"), model="opus", effort="high", max_turns=40,
@@ -600,6 +781,23 @@ def test_code_stats_aggregates(code, capsys):
     assert code_cli.code_main("code", ["stats", "proj", "--days", "30"], code.cfg, code.state) == 0
     text = capsys.readouterr().out
     assert "task/M/low (встроенная)" in text and "policy" in text and "2.25" in text
+
+
+def test_code_stats_by_channel(code, capsys):
+    """Решение 12: operator/cli и operator/mcp — отдельные строки code_stats."""
+    row = "task/S/low (встроенная)"
+    _job(code, "o1", choice={"row": row, "source": "operator", "channel": "cli"}, cost=1.0, turns=1)
+    _job(code, "o2", choice={"row": row, "source": "operator", "channel": "mcp"}, cost=3.0, turns=1)
+    _job(code, "o3", choice={"row": row, "source": "operator", "channel": "mcp"}, cost=5.0, turns=1)
+    _job(code, "p1", choice={"row": row, "source": "policy"}, cost=2.0, turns=1)
+    rows = {(r["source"], r["channel"]): r for r in code.jobs.stats("proj", 30)}
+    assert set(rows) == {("operator", "cli"), ("operator", "mcp"), ("policy", "—")}
+    assert (rows[("operator", "cli")]["tasks"], rows[("operator", "mcp")]["tasks"]) == (1, 2)
+    assert rows[("operator", "mcp")]["avg_cost_usd"] == 4.0
+    assert code_cli.code_main("code", ["stats", "proj"], code.cfg, code.state) == 0
+    lines = capsys.readouterr().out.splitlines()
+    assert "канал" in lines[0]
+    assert any("operator" in x and " cli " in x for x in lines) and any("operator" in x and " mcp " in x for x in lines)
 
 
 def test_phase_cost_skips_parent_without_result(code):

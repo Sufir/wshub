@@ -114,7 +114,8 @@ def _start(hub: Hub, args: list[str]) -> int:
     jobs = Jobs(hub)
     # флаги терминала — выбор оператора (ТЗ WSH-3, 2.2.1): применяется как есть, без пола и потолка
     plan = jobs.plan(pos[0], pos[1], model=opts.get("model"), effort=opts.get("effort"), plan=opts.get("plan"),
-                     chosen_by="operator", max_turns=int(opts["max_turns"]) if "max_turns" in opts else None,
+                     chosen_by="operator", channel="cli",
+                     max_turns=int(opts["max_turns"]) if "max_turns" in opts else None,
                      budget_usd=float(opts["budget_usd"]) if "budget_usd" in opts else None)
     d = jobs.start(plan)
     print(d["id"])
@@ -178,12 +179,12 @@ def _stats(hub: Hub, args: list[str]) -> int:
         raise WsError("нужно: wshub code stats [project] [--days N]")
     days = int(opts.get("days", 30))
     rows = Jobs(hub).stats(pos[0] if pos else None, days)
-    print(f"{'проект':12} {'строка политики':34} {'источник':9} {'задач':>5} {'ср. $':>8} {'ср. ходов':>9} "
-          f"{'completed':>9} {'replan':>6}")
+    print(f"{'проект':12} {'строка политики':34} {'источник':9} {'канал':10} {'задач':>5} {'ср. $':>8} "
+          f"{'ср. ходов':>9} {'completed':>9} {'replan':>6}")
     for r in rows:
         rp = "—" if r["replan_share"] is None else f"{r['replan_share']:.0%}"
-        print(f"{r['project'] or '':12} {r['row']:34} {r['source']:9} {r['tasks']:>5} {r['avg_cost_usd']:>8.2f} "
-              f"{r['avg_turns']:>9} {r['completed_share']:>9.0%} {rp:>6}")
+        print(f"{r['project'] or '':12} {r['row']:34} {r['source']:9} {r['channel']:10} {r['tasks']:>5} "
+              f"{r['avg_cost_usd']:>8.2f} {r['avg_turns']:>9} {r['completed_share']:>9.0%} {rp:>6}")
     if not rows:
         print(f"(задач за {days} дн. нет)")
     hub._audit_code("cli_code_stats", pos[0] if pos else None, None)

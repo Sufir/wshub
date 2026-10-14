@@ -91,12 +91,13 @@ def build_code_server(hub) -> FastMCP:
         """Запустить задачу Claude Code по файлу ТЗ с шапкой (ticket, dir, profile, size, risk). Модель, effort
         и план (no | auto | review) выбирает политика по profile/size/risk — не передавай их без нужды.
         model/effort/plan от себя — отступление от политики: только в пределах потолков и с reason (≥ 15
-        символов). chosen_by="operator" — только когда выбор сделал оператор: исполняется как есть.
-        Ответ: job, модель/effort/план, источник выбора и строка политики, предупреждения."""
+        символов). Понизить план ниже политики — только оператор. chosen_by="operator" — только когда выбор
+        сделал оператор: исполняется как есть. Ответ: job, модель/effort/план, источник выбора и канал, строка
+        политики, предупреждения."""
         try:
             p = jobs.plan(project, task, model=model or None, effort=effort or None, plan=plan or None,
                           chosen_by=chosen_by or None, reason=reason or None, max_turns=max_turns or None,
-                          budget_usd=budget_usd or None, note=note or None)
+                          budget_usd=budget_usd or None, note=note or None, channel="mcp")
             d = jobs.start(p)  # start сам пишет строку code_start со всеми параметрами, источником и job
         except USER_ERR as e:
             _audit("code_start", project=project, status="error", error=str(e))
@@ -223,7 +224,7 @@ def build_code_server(hub) -> FastMCP:
 
     @mcp.tool()
     def code_stats(project: str = "", days: int = 30) -> str:
-        """Калибровка политики: по строке политики и источнику выбора — число задач, средние стоимость и ходы,
+        """Калибровка политики: по строке политики, источнику и каналу выбора — число задач, средние стоимость и ходы,
         доля completed, доля планов, отправленных на replan."""
         try:
             rows = jobs.stats(project or None, days)

@@ -138,9 +138,10 @@ class Jobs:
 
     def plan(self, project: str, task: str, *, model=None, effort=None, plan=None, chosen_by=None, reason=None,
              max_turns=None, budget_usd=None, note=None, prompt_override: str | None = None,
-             inherit: dict | None = None) -> Plan:
+             inherit: dict | None = None, channel: str = "mcp") -> Plan:
         """Проверить задачу и выбрать модель/effort/план. chosen_by="operator" — аргументы model/effort/plan
-        выбрал оператор (2.2.1); иначе это отступление чата. inherit — job.json родителя при resume."""
+        выбрал оператор (2.2.1); иначе это отступление чата. inherit — job.json родителя при resume.
+        channel — откуда пришли аргументы: «cli» (флаги wshub code) или «mcp» (решение 12)."""
         ws, proj, glob = self._project(project)
         root = ws.path.resolve()
         dirs = self._dirs(root, proj)
@@ -172,6 +173,8 @@ class Jobs:
             raise JobError(f"профиль {profile} не разрешён проекту (profiles = {', '.join(proj.profiles)})")
         if chosen_by not in (None, "", "operator", "chat"):
             raise JobError("chosen_by — \"operator\" (выбор оператора) или пусто")
+        if channel not in ("cli", "mcp"):
+            raise JobError(f"канал выбора {channel!r} не поддерживается")
 
         max_turns = int(max_turns or header.get("max_turns") or proj.max_turns)
         budget_usd = float(budget_usd if budget_usd is not None else header.get("budget_usd", proj.max_budget_usd))
@@ -182,9 +185,9 @@ class Jobs:
                 rows = "; ".join(code_policy.profile_rows(glob, proj, profile))
                 raise JobError(f"в шапке нет {', '.join(missing)} — по ним политика выбирает модель, effort "
                                f"и нужен ли план (профиль {profile}: {rows}). {code_policy.GUIDE}")
-            choice = self._choose(glob, proj, header, profile, model, effort, plan, chosen_by, reason)
+            choice = self._choose(glob, proj, header, profile, model, effort, plan, chosen_by, reason, channel)
         else:
-            choice = self._inherit(proj, inherit, model, effort, chosen_by, reason)
+            choice = self._inherit(proj, inherit, model, effort, chosen_by, reason, channel)
 
         # промпт — только из шаблона (п. 2.3, 8): имя из override (resume) или из шапки, литерального текста нет
         prompt_name = prompt_override or header.get("prompt") or profile
@@ -223,23 +226,29 @@ class Jobs:
             raise JobError(f"шаблон промпта{' ' + what if what else ''} не найден: {proj.prompts}/{name}.md")
         return taskfile.render(template_path.read_text(encoding="utf-8"), ticket=ticket, task=task_rel, note=note)
 
-    def _choose(self, glob, proj, header, profile, model, effort, plan, chosen_by, reason) -> code_policy.Choice:
-        """Источники выбора (2.2): аргументы, затем шапка, затем политика; у каждого поля — свой источник."""
+    def _choose(self, glob, proj, header, profile, model, effort, plan, chosen_by, reason,
+                channel) -> code_policy.Choice:
+        """Источники выбора (2.2): аргументы, затем шапка, затем политика; у каждого поля — свой источник
+        и канал (решение 12)."""
         arg_src = "operator" if chosen_by == "operator" else "chat"
         head_src = "operator" if header.get("choice") == "operator" else "chat"
-        given = {}
+        given, chan = {}, {}
         for f, v in (("model", model), ("effort", effort), ("plan", plan)):
             if v:
-                given[f] = (v, arg_src)
+                given[f], chan[f] = (v, arg_src), channel
             elif header.get(f):
-                given[f] = (header[f], head_src)
+                given[f], chan[f] = (header[f], head_src), "header"
         why = reason or header.get("choice_reason")
         try:
-            return code_policy.choose(glob, proj, profile, header.get("size"), header.get("risk"), given, why)
+            c = code_policy.choose(glob, proj, profile, header.get("size"), header.get("risk"), given, why)
         except code_policy.PolicyError as e:
             raise JobError(str(e)) from None
+        # каналы всех полей не из политики, а не только итогового источника (уточнение решения 12)
+        c.channel = _channel(chan.values())
+        c.choice_fields = {f: f"{src}:{chan[f]}" for f, (_, src) in given.items()}
+        return c
 
-    def _inherit(self, proj, parent: dict, model, effort, chosen_by, reason) -> code_policy.Choice:
+    def _inherit(self, proj, parent: dict, model, effort, chosen_by, reason, channel) -> code_policy.Choice:
         """resume: выбор родителя; явные model/effort — по тем же правилам источника, что у code_start."""
         base = parent.get("choice") or {}
         vals = {"model": parent.get("model"), "effort": parent.get("effort")}
@@ -249,7 +258,8 @@ class Jobs:
             if v and v != vals[f]:
                 vals[f], fields[f] = v, src
         changed = [f for f in ("model", "effort") if fields[f] in ("operator", "chat")]
-        source, why = base.get("source") or "policy", base.get("reason")
+        source, why, chan = base.get("source") or "policy", base.get("reason"), base.get("channel")
+        cf = dict(base.get("choice_fields") or {})
         if changed:
             if src == "chat":
                 try:
@@ -262,9 +272,11 @@ class Jobs:
                     raise JobError(f"чат задал {', '.join(changed)} в обход выбора задачи: укажи причину "
                                    f"(reason, ≥ {code_policy.REASON_MIN} символов) или не меняй их")
             source = src
+            cf.update({f: f"{src}:{channel}" for f in changed})
+            chan = _channel(x.split(":", 1)[1] for x in cf.values())
             why = code_policy.clean_reason(reason) or why
         return code_policy.Choice(vals["model"], vals["effort"], "no", None, None, source, base.get("row"), why,
-                                  fields)
+                                  fields, chan, cf or None)
 
     def _check_limits(self, proj: ProjectCode, max_turns: int, budget_usd: float):
         """Бюджеты и ходы — в силе для любого источника выбора (2.2.1); модель и effort проверяет политика."""
@@ -408,7 +420,9 @@ class Jobs:
         self.hub._audit_code("code_start", plan.project, jid, params={
             "model": plan.model, "effort": plan.effort, "max_turns": plan.max_turns,
             "budget_usd": plan.budget_usd, "profile": plan.profile, "phase": plan.phase, "plan": plan.plan_mode,
-            "model_source": c.source if c else None, "policy_row": c.row if c else None,
+            "model_source": c.source if c else None, **({"channel": c.channel} if c and c.channel else {}),
+            "choice_fields": c.choice_fields or {} if c else None,
+            "policy_row": c.row if c else None,
             "reason": c.reason if c else None, "parent": parent})
         return data
 
@@ -449,6 +463,8 @@ class Jobs:
                 "task": d.get("task"), "profile": d.get("profile"), "model": d.get("model"),
                 "elapsed_s": max(elapsed, 0), "session_id": d.get("session_id"), "parent": d.get("parent"),
                 "result": d.get("result"), "warnings": d.get("warnings") or []}
+        if d.get("reason") in REASON_HINT:
+            snap["reason_hint"] = REASON_HINT[d["reason"]]
         if d.get("choice"):
             snap["choice"] = d["choice"]
         if d.get("phase"):
@@ -586,6 +602,11 @@ class Jobs:
         if str(plan.dir) != d.get("dir") or plan.profile != d.get("profile"):
             raise JobError(f"шапка ТЗ изменилась с момента родителя (dir/profile): было "
                            f"{d.get('dir')}/{d.get('profile')}, стало {plan.dir}/{plan.profile}")
+        # size/risk — тоже: resume наследует план родителя, иначе задача L/high пошла бы без плана (решение 10)
+        if (plan.size, plan.risk) != (d.get("size"), d.get("risk")):
+            raise JobError(f"шапка ТЗ изменилась с момента родителя (size/risk): было "
+                           f"{d.get('size')}/{d.get('risk')}, стало {plan.size}/{plan.risk} — новая задача "
+                           "через code_start, план выберет политика")
         return self.start(plan, parent=jid, resume=sid, chain_root=d.get("chain_root") or jid)
 
     # ---------- фазы плана и исполнения (ТЗ WSH-3, 2.3) ----------
@@ -680,6 +701,7 @@ class Jobs:
         sid = d.get("session_id")
         out = {"job": job, "project": snap.get("project"), "state": snap["state"], "reason": d.get("reason"),
                "choice": snap.get("choice"), "result": d.get("result") or {},
+               **({"reason_hint": REASON_HINT[d["reason"]]} if d.get("reason") in REASON_HINT else {}),
                "files": {"events": str(jdir / "events.jsonl"), "stderr": str(jdir / "stderr.log"),
                          "task": d.get("task")}}
         if snap.get("chain"):
@@ -712,7 +734,7 @@ class Jobs:
             if (first.get("created_ts") or 0) < since:
                 continue
             c = first.get("choice") or {}
-            key = (first.get("project"), c.get("row") or "—", c.get("source") or "—")
+            key = (first.get("project"), c.get("row") or "—", c.get("source") or "—", c.get("channel") or "—")
             a = agg.setdefault(key, {"tasks": 0, "cost": 0.0, "turns": 0, "completed": 0, "plans": 0,
                                      "replanned": 0})
             a["tasks"] += 1
@@ -722,7 +744,7 @@ class Jobs:
             plans = [x for x in links if x.get("phase") == "plan"]
             a["plans"] += len(plans)
             a["replanned"] += sum(x.get("reason") == "replanned" for x in plans)
-        return [{"project": k[0], "row": k[1], "source": k[2], "tasks": a["tasks"],
+        return [{"project": k[0], "row": k[1], "source": k[2], "channel": k[3], "tasks": a["tasks"],
                  "avg_cost_usd": round(a["cost"] / a["tasks"], 4), "avg_turns": round(a["turns"] / a["tasks"], 1),
                  "completed_share": round(a["completed"] / a["tasks"], 3),
                  "replan_share": round(a["replanned"] / a["plans"], 3) if a["plans"] else None}
@@ -730,6 +752,15 @@ class Jobs:
 
 
 REPLAN_PROMPT = "replan"
+# подсказки к коду причины — в снимке и итоге рядом с reason
+REASON_HINT = {"no_plan": "план ищется только в ~/.claude/plans/: настройка plansDirectory в "
+                          ".claude/settings*.json проекта не поддерживается"}  # решение 13
+
+
+def _channel(chans) -> str | None:
+    """Каналы через «+» в порядке cli, mcp, header (решение 12)."""
+    got = set(chans)
+    return "+".join(c for c in code_policy.CHANNELS if c in got) or None
 
 
 def phase_cost(d: dict) -> float | None:

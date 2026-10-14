@@ -5,7 +5,10 @@ sandbox_exclude, которые идут вне песочницы. Отказ, 
 
 1. git с подкомандой, которая ходит в сеть, меняет remote или конфигурацию, удаляет неотслеживаемые файлы
    (push, fetch, pull, remote, clean, config на запись и т. п.), или с глобальной опцией, подменяющей
-   конфигурацию (-c, --config-env, --exec-path=…);
+   конфигурацию (-c, --config-env, --exec-path=…); git с опцией, которая пишет файл или запускает программу
+   из «читающей» подкоманды (--output у log/show/diff, -O/--open-files-in-pager у grep, в том числе
+   сокращения и склейки коротких опций); git с переменной окружения GIT_*, PAGER, LESSOPEN, LESSCLOSE перед ним
+   (внешний diff, пейджер, чужой каталог git);
 2. сетевой клиент (ssh, scp, rsync, curl, wget, nc …);
 3. путь внутрь служебных каталогов wshub (реестр, состояние) — их передаёт settings.json аргументами;
 4. оболочка, читающая команды из stdin, или интерпретатор с кодом в строке, где упомянуто запрещённое.
@@ -43,6 +46,13 @@ GIT_CONFIG_WRITE = {"--add", "--unset", "--unset-all", "--replace-all", "--renam
                     "--edit", "-e", "set", "unset", "rename-section", "remove-section", "edit"}
 # глобальные опции git, за которыми идёт значение отдельным аргументом
 GIT_OPT_WITH_VALUE = {"-C", "--git-dir", "--work-tree", "--namespace", "--super-prefix", "--attr-source"}
+# «читающие» подкоманды (allow профилей recon/review и фазы плана), которые пишут файл или запускают программу:
+# git log/show/diff --output=<файл>; git grep -O<программа> / --open-files-in-pager[=<программа>] — git
+# принимает однозначные сокращения длинных опций (--op=…) и склейку коротких (-nO…)
+GIT_GREP_PAGER = "open-files-in-pager"
+GIT_GREP_SHORT_WITH_VALUE = set("efABCm")  # после них в склейке идёт значение, а не опции
+# переменные окружения перед git, которые задают ему программу, конфигурацию или чужой каталог
+GIT_ENV_DENY = re.compile(r"^(GIT_[A-Za-z0-9_]*|PAGER|LESSOPEN|LESSCLOSE)\+?=")
 
 NET_TOOLS = {
     "ssh", "scp", "sftp", "rsync", "curl", "wget", "nc", "ncat", "netcat", "socat", "telnet", "ftp", "lftp",
@@ -192,11 +202,17 @@ def _is_git(tok: str) -> bool:
 
 
 def _check_git(tokens: list[str], j: int) -> None:
+    for t in tokens[:j]:
+        m = GIT_ENV_DENY.match(t)
+        if m:
+            raise _Deny(f"переменная {m.group(1)} перед git задаёт ему программу, конфигурацию или каталог — "
+                        "в задачах запрещено")
     n = _base(tokens[j])
     if n.startswith("git-"):  # прямой вызов исполняемого файла подкоманды: git-push, git-remote-https …
         sub = n[4:]
         if sub in GIT_DENY or sub.startswith("remote") or sub == "config":
             raise _Deny(f"{n}: {_git_reason(sub)}")
+        _check_git_args(sub, tokens[j + 1:])
         return
     k = j + 1
     while k < len(tokens):
@@ -223,6 +239,28 @@ def _check_git(tokens: list[str], j: int) -> None:
         args = set(tokens[k + 1:])
         if args & GIT_CONFIG_WRITE or not args & GIT_CONFIG_READ:
             raise _Deny("git config: в задачах разрешено только чтение (--get, --list)")
+    _check_git_args(sub, tokens[k + 1:])
+
+
+def _check_git_args(sub: str, args: list[str]) -> None:
+    """Опции подкоманды, которые пишут файл или запускают программу. После «--» — пути, не опции."""
+    for t in args:
+        if t == "--":
+            return
+        if t == "--output" or t.startswith("--output="):
+            raise _Deny(f"git {sub} --output пишет файл — в задачах запрещено")
+        if sub != "grep" or not t.startswith("-") or t == "-":
+            continue
+        if t.startswith("--"):
+            name = t[2:].split("=", 1)[0]
+            if len(name) >= 2 and GIT_GREP_PAGER.startswith(name):
+                raise _Deny("git grep --open-files-in-pager запускает программу — в задачах запрещено")
+            continue
+        for ch in t[1:]:
+            if ch == "O":
+                raise _Deny("git grep -O запускает программу — в задачах запрещено")
+            if ch in GIT_GREP_SHORT_WITH_VALUE:
+                break
 
 
 def _git_reason(sub: str) -> str:

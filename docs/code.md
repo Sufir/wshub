@@ -11,7 +11,8 @@ Desktop, не трогая доступ к файлам; у его инстру�
 Временный каталог claude (`/tmp/claude-<uid>`, или `<CLAUDE_CODE_TMPDIR>/claude-<uid>`, если переменная
 проходит в окружение задачи) должен отсутствовать или принадлежать пользователю и быть доступен на запись —
 иначе claude отказывается стартовать. Старт задачи и `wshub doctor` это проверяют и называют команду
-исправления (`sudo rm -rf /tmp/claude-<uid>`).
+исправления (`sudo rm -rf /tmp/claude-<uid>`). Проверка не учитывает `TMPDIR`; добавил его в `pass_env` —
+проверь каталог сам.
 
 ## Реестр
 
@@ -124,7 +125,7 @@ budget_usd: 5
 | task | M | low | sonnet | high | auto | opus | high |
 | task | M | high | opus | high | review | opus | high |
 | task | L | low | opus | high | review | opus | high |
-| task | L | high | opus | xhigh | review | opus | high |
+| task | L | high | opus | high | review | opus | high |
 
 - `size`: S — правка в одном слое, ≤ 3 файлов, рядом эталон; M — несколько файлов или слоёв, без смены
   контрактов; L — контракт API, схема БД, перенос ответственности или больше одного сервиса. `risk: high` —
@@ -135,8 +136,8 @@ budget_usd: 5
   (`*` слабее значения, при равной точности `size` весомее `risk`). Нет строки — отказ с указанием строки.
 - Строки реестра проверяются строго: неизвестный ключ, значение вне списка, `plan` без `plan_model` и
   `plan_effort` или повтор строки — ошибка `[code]` или проекта (ломает только `wshub-code`).
-- Встроенная `task/L/high` даёт `effort = xhigh`: при `effort_max = "high"` (умолчание) задача отказывает —
-  поднимите `effort_max` проекта или задайте строку политики проекта.
+- Встроенные строки укладываются в пол и потолок по умолчанию. Нужен `xhigh` — строка политики проекта
+  плюс `effort_max = "xhigh"`.
 
 **Источники выбора**, по приоритету:
 
@@ -151,9 +152,18 @@ budget_usd: 5
    или `reason` в `code_start`, ≥ 15 символов без непечатаемых и краевых пробелов). Без причины — отказ
    «укажи причину отступления от политики
    или оставь выбор политике». Старые шапки с `model`/`effort` без `choice` попадают сюда.
+   План чат может только поднять (`no < auto < review`); понизить план — только оператор, любым из трёх
+   способов выше. Строки политики нет (чат задал все три поля) — понижать не от чего.
 
-Итог (модель, effort, план, источник `operator` | `policy` | `chat`, строка политики, причина) пишется в
-`job.json`, в журнал wshub (`model_source`) и отдаётся в ответах `code_start`, `code_status`, `code_result`.
+**Канал** (`channel`) — откуда пришли все поля выбора не из политики: `cli` — флаги `wshub code start`,
+`mcp` — аргументы `code_start`/`code_resume`, `header` — шапка; несколько — через `+` в порядке cli, mcp,
+header. У источника `policy` канала нет. **`choice_fields`** — поле → «источник:канал», например
+`{"model": "chat:mcp", "plan": "operator:header"}`: оператор понизил план шапкой, чат задал модель — итоговый
+источник `chat`, канал `mcp+header`.
+
+Итог (модель, effort, план, источник `operator` | `policy` | `chat`, канал, строка политики, причина)
+пишется в `job.json`, в журнал wshub (`model_source`, `channel`, `choice_fields`) и отдаётся в ответах `code_start`
+(«источник: operator (mcp)»), `code_status`, `code_result`.
 `code_resume` наследует выбор родителя; сменить модель или effort — по тем же правилам (`reason` или
 `chosen_by`).
 
@@ -183,6 +193,8 @@ budget_usd: 5
    из потока событий — последний успешный (с парным `tool_result` без ошибки) `Write` или `Edit` файла `.md`
    прямо в каталоге планов, изменённого не раньше старта звена, — читает файл и кладёт копию в `plan.md`
    каталога задачи (≤ 200 КБ). Такого вызова нет — задача `failed`, причина `no_plan`, исполнения нет.
+   План ищется только в `~/.claude/plans/`: настройка `plansDirectory` в `.claude/settings*.json` проекта не
+   поддерживается (задача с ней честно упадёт в `no_plan`, подсказка — в `reason_hint`).
 3. **Фаза исполнения** — дочерняя задача: `--resume` той же сессии, `--permission-mode dontAsk`, settings —
    эталон профиля, модель и effort исполнения, шаблон `execute`, бюджет и ходы — остаток задачи.
 
@@ -224,10 +236,14 @@ budget_usd: 5
 2. **Песочница** (`sandbox`, нужны bwrap и socat). Включена, `failIfUnavailable: true`,
    `allowUnsandboxedCommands: false`, `autoAllowBashIfSandboxed: false` — Bash идёт только по allow-правилам.
    Сеть — только `network`. Чтение сужено: `denyRead` включает `~/` и `/mnt/`, `allowRead` открывает рабочий
-   каталог, `~/.gitconfig`, `~/.config/git/` и `allow_read` проекта. Запись в `./.git/config`, `./.git/hooks`,
-   `./.git/info`, `./.git/modules` закрыта (`denyWrite` и deny `Edit`).
+   каталог, `~/.gitconfig`, `~/.config/git/` и `allow_read` проекта. Запись: у `task` закрыты `./.git/config`,
+   `./.git/hooks`, `./.git/info`, `./.git/modules` (`denyWrite` и deny `Edit`); у `recon` и `review` Bash не
+   пишет в рабочий каталог вовсе (`denyWrite` — весь каталог), а `excludedCommands` у них пуст: `sandbox_exclude`
+   проекта действует только в `task`. Их `Edit` ТЗ и `.agents/` — файловый инструмент вне песочницы, он работает.
 3. **Хук** на Bash (`python -m wshub.hook`) закрывает формы, которые правила по тексту не ловят (git push в
-   подстановке, сетевые утилиты, пути к служебным каталогам). Ошибка разбора — отказ.
+   подстановке, сетевые утилиты, пути к служебным каталогам; `--output` у любой подкоманды git; `-O` /
+   `--open-files-in-pager` у `git grep`, включая сокращения и склейки; `GIT_*`, `PAGER`, `LESSOPEN`,
+   `LESSCLOSE` перед git). Ошибка разбора — отказ.
 4. **Окружение** — белый список: `HOME`, `USER`, `LOGNAME`, `PATH`, `LANG`, `LC_*`, `TZ`, `DOCKER_HOST`,
    `DOCKER_CONFIG`, плюс `pass_env`; `TERM=dumb`. Секретов (`SSH_AUTH_SOCK`, имена с `TOKEN`/`SECRET`/
    `PASSWORD`/`KEY`) нет даже из `pass_env`. SSH-агента у Code нет — запушить нечем.
@@ -257,8 +273,8 @@ budget_usd: 5
   `git_config_unsafe`. Если `.git` — файл (worktree) или рядом есть `.git/commondir`, prefetch и снимок в v0
   отклоняются.
 
-Команды docker выполняются вне песочницы только через `sandbox_exclude` проекта, который правит человек;
-правка compose-файлов и Dockerfile закрыта `deny_edit`. Это принятый остаточный риск v0.
+Команды docker выполняются вне песочницы только через `sandbox_exclude` проекта (только профиль `task`),
+который правит человек; правка compose-файлов и Dockerfile закрыта `deny_edit`. Это принятый остаточный риск v0.
 
 ## Состояния задачи
 
@@ -276,7 +292,7 @@ budget_usd: 5
 `code_status`, `code_wait`, `code_result`, `code_cancel`, `code_resume`, `code_jobs`, `code_plan`,
 `code_approve`, `code_replan`, `code_stats`. Все вызовы — в журнал wshub; текст промпта — только sha256.
 
-`code_stats(project?, days=30)` — калибровка политики: по каждой строке политики и источнику выбора число
+`code_stats(project?, days=30)` — калибровка политики: по каждой строке политики, источнику и каналу выбора число
 задач (цепочек), средние стоимость и ходы, доля `completed`, доля планов, отправленных на `replan`.
 
 То же из терминала:

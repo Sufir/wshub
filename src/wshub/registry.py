@@ -371,6 +371,9 @@ def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
         if ".." in Path(e).parts or READ_EXTRA_BAD.search(e):
             raise RegistryError(f"{where} read_extra: {e!r} — путь от корня проекта без «..» и без символов "
                                 "шаблона, кроме *")
+        if "**" in e:
+            raise RegistryError(f"{where} read_extra: {e!r} — рекурсивный шаблон `**` запрещён — перечисли каталоги "
+                                "или используй `*` по уровням")
     if "policy" in t:
         vals["policy"] = _policy(t["policy"], f"[[workspace.{name}.code.policy]]", "project")
     if "plan_budget_share" in t:

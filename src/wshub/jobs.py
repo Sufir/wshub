@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import math
 import os
 import secrets
@@ -139,18 +140,40 @@ class Jobs:
     def _read_extra(self, root: Path, proj: ProjectCode) -> list[str]:
         """read_extra для Read(//…) (ТЗ WSH-3.1, п. 2.2): база — компоненты пути до первого с «*», после
         resolve() — внутри корня и без пересечения со служебными каталогами wshub; правило — разрешённая база
-        плюс хвост шаблона. Нарушение — ошибка реестра для wshub-code."""
+        плюс хвост шаблона. Хвост раскрывается по ФС, один уровень на компонент, и каждое совпадение после
+        resolve() проверяется так же, как база (симлинк наружу в хвосте). Нарушение — ошибка реестра для
+        wshub-code. Файлы, появившиеся после старта, проверка не видит."""
+        def checked(e: str, p: Path) -> Path:
+            try:
+                q = p.resolve()
+            except (OSError, RuntimeError) as err:  # цикл симлинков и т. п.
+                raise RegistryError(f"code.read_extra: {e} — путь {p} не разрешается ({err})") from None
+            if not (q == root or q.is_relative_to(root)):
+                via = "" if p == q else f" ({p} → {q})"
+                raise RegistryError(f"code.read_extra: {e} вне корня проекта {root}{via}")
+            if self.hub.protected_kind(q) is not None:
+                raise RegistryError(f"code.read_extra: {e} пересекается со служебным каталогом wshub ({q})")
+            return q
+
         out = []
         for e in proj.read_extra:
             parts = Path(e).parts
             i = next((k for k, x in enumerate(parts) if "*" in x), len(parts))
-            base = root.joinpath(*parts[:i]).resolve()
-            if not (base == root or base.is_relative_to(root)):
-                raise RegistryError(f"code.read_extra: {e} вне корня проекта {root}")
-            if self.hub.protected_kind(base) is not None:
-                raise RegistryError(f"code.read_extra: {e} пересекается со служебным каталогом wshub")
+            base = checked(e, root.joinpath(*parts[:i]))
             if claude_cli.RULE_UNSAFE.search(base.as_posix()):  # иначе разрешённая база станет шаблоном в Read(…)
                 raise RegistryError(f"code.read_extra: {e} ведёт в {base} — путь с символами шаблона")
+            level = [base]
+            for comp in parts[i:]:
+                nxt = []
+                for d in level:
+                    if not d.is_dir():
+                        continue
+                    try:
+                        names = sorted(c.name for c in d.iterdir())
+                    except OSError as err:
+                        raise RegistryError(f"code.read_extra: {e} — каталог {d} не читается ({err})") from None
+                    nxt += [checked(e, d / n) for n in names if fnmatch.fnmatchcase(n, comp)]
+                level = nxt
             out.append(base.joinpath(*parts[i:]).as_posix())
         return out
 

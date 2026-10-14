@@ -115,12 +115,103 @@ def test_read_extra_symlink_outside_refused(code, tmp_path):
 
 
 def test_read_extra_glob_resolved_base(code):
-    """glob внутри корня — правило с разрешённой базой: симлинк на каталог внутри корня раскрывается."""
+    """glob внутри корня — правило с разрешённой базой: симлинк на каталог внутри корня раскрывается;
+    `svc/**` — отказ при разборе реестра (решение 2 ревью, круг 1)."""
     (code.root / "rules").symlink_to(code.root / ".agents")
-    code.write(read_extra='["rules/*.md", "*.md", "svc/**"]')
+    code.write(read_extra='["rules/*.md", "*.md", "svc/*/*"]')
     plan = code.jobs.plan("proj", code.taskfile())
     root = code.root.resolve()
-    assert code.jobs._read_extra(plan.root, plan.proj) == [f"{root}/.agents/*.md", f"{root}/*.md", f"{root}/svc/**"]
+    assert code.jobs._read_extra(plan.root, plan.proj) == [f"{root}/.agents/*.md", f"{root}/*.md", f"{root}/svc/*/*"]
+    code.write(read_extra='["svc/**"]')
+    assert "рекурсивный шаблон `**` запрещён" in parse(code.cfg.read_text()).code.project_errors["proj"]
+
+
+@pytest.mark.parametrize("item", ["**", "svc/**", "**/CLAUDE.md", "a/**/b.md", "a**"])
+def test_read_extra_recursive_glob_refused(code, item):
+    """`**` запрещён при разборе реестра (решение 2 ревью, круг 1; мутация «`**` принимается»)."""
+    code.write(read_extra=json.dumps([item]))
+    err = parse(code.cfg.read_text()).code.project_errors["proj"]
+    assert "рекурсивный шаблон `**` запрещён — перечисли каталоги или используй `*` по уровням" in err
+
+
+def test_read_extra_tail_symlink_outside_refused(code, tmp_path):
+    """Симлинк наружу в хвосте шаблона — отказ при запуске, до создания файлов задачи (решение 1 ревью, круг 1;
+    мутация «хвост шаблона не проверяется»): файл-симлинк, каталог-симлинк на промежуточном уровне."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.md").write_text("x")
+    (code.root / "rules").mkdir()
+    (code.root / "rules" / "ok.md").write_text("ok")
+    (code.root / "rules" / "x.md").symlink_to(outside / "secret.md")
+    (code.root / "lnk").symlink_to(outside)
+    t = code.taskfile()
+    for item in ("rules/*.md", "rules/*", "*/secret.md", "*/*"):
+        code.write(read_extra=json.dumps([item]))
+        before = sorted(code.jobs.root.iterdir()) if code.jobs.root.exists() else []
+        with pytest.raises(RegistryError, match="вне корня проекта"):
+            code.jobs.start(code.jobs.plan("proj", t))
+        assert (sorted(code.jobs.root.iterdir()) if code.jobs.root.exists() else []) == before
+    (code.root / "rules" / "x.md").unlink()
+    root = code.root.resolve()
+    assert code.jobs._read_extra(root, ProjectCode(read_extra=("rules/*.md",))) == [f"{root}/rules/*.md"]
+    # совпадений нет — проверять нечего, правило остаётся
+    assert code.jobs._read_extra(root, ProjectCode(read_extra=("nope/*.md",))) == [f"{root}/nope/*.md"]
+
+
+def test_read_extra_tail_last_level_symlink_refused(code, tmp_path):
+    """Симлинк наружу на втором уровне раскрытия хвоста, под `*`, в том числе со скрытым именем; первый
+    уровень чист, а файл CLAUDE.md в корне идёт раньше каталога rules (мутации «раскрыт только первый
+    компонент», «break на не-каталоге», «скрытые имена пропущены» — ревью субагента, круг 2)."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.md").write_text("x")
+    root = code.root.resolve()
+    (root / "rules").mkdir()
+    for name in ("x.md", ".x.md"):
+        (root / "rules" / name).symlink_to(outside / "x.md")
+        with pytest.raises(RegistryError, match="вне корня проекта"):
+            code.jobs._read_extra(root, ProjectCode(read_extra=("*/*.md",)))
+        (root / "rules" / name).unlink()
+    assert code.jobs._read_extra(root, ProjectCode(read_extra=("*/*.md",))) == [f"{root}/*/*.md"]
+
+
+def test_read_extra_symlink_loop_refused(code):
+    """Цикл симлинков в хвосте не роняет запуск чужим исключением: на 3.10 resolve() бросает RuntimeError —
+    отказ RegistryError; на 3.13 resolve() цикл не раскрывает и путь остаётся внутри корня — правило."""
+    root = code.root.resolve()
+    (root / "rules").mkdir()
+    (root / "rules" / "a").symlink_to(root / "rules" / "b")
+    (root / "rules" / "b").symlink_to(root / "rules" / "a")
+    try:
+        assert code.jobs._read_extra(root, ProjectCode(read_extra=("rules/*",))) == [f"{root}/rules/*"]
+    except RegistryError as e:
+        assert "не разрешается" in str(e)
+
+
+def test_read_extra_checked_on_approve(code, tmp_path):
+    """Хвост проверяется и при переходе план → исполнение (approve идёт через start мимо plan())."""
+    code.write(read_extra='["rules/*.md"]')
+    (code.root / "rules").mkdir()
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(size="L", risk="low")))["id"]
+    assert wait_terminal(code.jobs, root)["state"] == "plan_ready"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "x.md").write_text("x")
+    (code.root / "rules" / "x.md").symlink_to(outside / "x.md")
+    with pytest.raises(RegistryError, match="вне корня проекта"):
+        code.jobs.approve(root)
+    assert len(code.jobs.chain(root)) == 1
+
+
+def test_read_extra_tail_protected_refused(code):
+    """Совпадение хвоста ведёт симлинком в служебный каталог wshub — отказ, хотя база с ним не пересекается."""
+    root = code.root.resolve()
+    (root / "svc" / "state").mkdir()
+    (root / "rules").mkdir()
+    (root / "rules" / "st").symlink_to(root / "svc" / "state")
+    code.hub.protected_data = [*code.hub.protected_data, root / "svc" / "state"]
+    with pytest.raises(RegistryError, match="служебным каталогом"):
+        code.jobs._read_extra(root, ProjectCode(read_extra=("rules/*",)))
 
 
 def test_read_extra_base_with_pattern_chars_refused(code, tmp_path):

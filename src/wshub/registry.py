@@ -42,7 +42,11 @@ WS_CODE_LISTS = ("bash_allow", "sandbox_exclude", "network", "deny_read", "allow
 READ_EXTRA_BAD = re.compile(r"[?\[\]{}()\\]")  # в read_extra из символов шаблона допустима только «*»
 WS_CODE_KEYS = {"enabled", "dirs", "prompts", "profiles", "model_min", "model_max", "effort_max", "max_turns",
                 "max_budget_usd", "daily_budget_usd", "max_parallel", "max_hours", "prefetch", "status_regex",
-                "policy", "plan_budget_share", "plan_max_turns", "execute_prompt", *WS_CODE_LISTS}
+                "policy", "plan_budget_share", "plan_max_turns", "execute_prompt", *WS_CODE_LISTS,
+                *("push", "push_protect", "forge", "forge_access", "forge_write", "forge_url", "forge_token")}
+# регламент пуша и API хостинга (ТЗ WSH-3.4, А1): no — закрыто, task — по разрешению задачи, always — всем
+GRANT_MODES = ("no", "task", "always")
+FORGE_URL_RE = re.compile(r"^(https://[^/\s?#@]+|http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?)(/[^\s?#]*)?$")
 # строка политики выбора модели, effort и плана (ТЗ WSH-3, п. 2.1); «*» в size/risk — любое значение
 SIZES = ("S", "M", "L")
 RISKS = ("low", "high")
@@ -141,6 +145,13 @@ class ProjectCode:
     plan_budget_share: float = 0.3  # доля бюджета задачи на фазу плана
     plan_max_turns: int = 40
     execute_prompt: str = "execute"  # шаблон фазы исполнения в каталоге prompts
+    push: str = "no"  # регламент пуша: no | task | always (ТЗ WSH-3.4, А1)
+    push_protect: tuple[str, ...] = ("main", "master")  # шаблоны веток, куда пуш запрещён всегда
+    forge: str | None = None  # тип хостинга — имя пресета из wshub.forges
+    forge_access: str = "no"  # доступ к API хостинга через хаб: no | task | always
+    forge_write: bool = False  # POST, PUT, PATCH; DELETE — никогда
+    forge_url: str | None = None  # адрес API; None — адрес пресета по умолчанию
+    forge_token: str | None = None  # путь к файлу токена, как в реестре (~ раскрывается при чтении)
 
 
 @dataclass(frozen=True)
@@ -387,12 +398,64 @@ def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
         if not isinstance(t["execute_prompt"], str) or not NAME_RE.match(t["execute_prompt"]):
             raise RegistryError(f"{where} execute_prompt: имя шаблона — латиница, цифры, «_», «-»")
         vals["execute_prompt"] = t["execute_prompt"]
+    vals.update(_forge(where, t))
     pc = ProjectCode(**vals)
     if MODELS.index(pc.model_min) > MODELS.index(pc.model_max):
         raise RegistryError(f"{where}: model_min ({pc.model_min}) выше model_max ({pc.model_max})")
     if pc.enabled and (not pc.dirs or not pc.prompts):
         raise RegistryError(f"{where}: при enabled = true нужны dirs и prompts")
     return pc
+
+
+def _forge(where: str, t: dict) -> dict:
+    """Регламент пуша и API хостинга (ТЗ WSH-3.4, А1). Значение токена реестр не видит — только путь."""
+    from .forges import PRESETS
+    vals: dict = {}
+    for k in ("push", "forge_access"):
+        if k in t:
+            if t[k] not in GRANT_MODES:
+                raise RegistryError(f"{where} {k}: одно из {', '.join(GRANT_MODES)}")
+            vals[k] = t[k]
+    if "push_protect" in t:
+        vals["push_protect"] = _str_list(t["push_protect"], f"{where} push_protect")
+    if "forge" in t:
+        if t["forge"] not in PRESETS:
+            raise RegistryError(f"{where} forge: одно из {', '.join(PRESETS)}")
+        vals["forge"] = t["forge"]
+    if "forge_write" in t:
+        if not isinstance(t["forge_write"], bool):
+            raise RegistryError(f"{where} forge_write: true или false")
+        vals["forge_write"] = t["forge_write"]
+    if "forge_url" in t:
+        u = t["forge_url"]
+        if not isinstance(u, str) or not FORGE_URL_RE.match(u):
+            raise RegistryError(f"{where} forge_url: адрес API https://… (http:// — только localhost)")
+        vals["forge_url"] = u.rstrip("/")
+    if "forge_token" in t:
+        if not isinstance(t["forge_token"], str) or not t["forge_token"].strip() or "\x00" in t["forge_token"]:
+            raise RegistryError(f"{where} forge_token: путь к файлу токена")
+        tok = t["forge_token"]
+        if not (Path(tok).is_absolute() or tok == "~" or tok.startswith("~/")):
+            raise RegistryError(f"{where} forge_token: абсолютный путь или ~/…")
+        vals["forge_token"] = tok
+    if vals.get("forge_access", "no") != "no":
+        if "forge" not in vals:
+            raise RegistryError(f"{where}: forge_access = {vals['forge_access']} без forge — укажи тип хостинга "
+                                f"({', '.join(PRESETS)})")
+        if "forge_token" not in vals:
+            raise RegistryError(f"{where}: forge_access = {vals['forge_access']} без forge_token — путь к файлу "
+                                "токена")
+    if "forge" in vals and "forge_url" not in vals and PRESETS[vals["forge"]].default_url is None:
+        raise RegistryError(f"{where}: для forge = {vals['forge']} нужен forge_url — адрес API")
+    return vals
+
+
+def forge_url(proj: ProjectCode) -> str | None:
+    """Адрес API хостинга проекта: из реестра или адрес пресета по умолчанию."""
+    from .forges import PRESETS
+    if proj.forge_url:
+        return proj.forge_url
+    return PRESETS[proj.forge].default_url if proj.forge in PRESETS else None
 
 
 def _outbox(t, warnings: list[str]) -> Outbox:

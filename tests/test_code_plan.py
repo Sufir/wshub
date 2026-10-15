@@ -443,7 +443,9 @@ def test_plan_and_execute_settings_files(code):
     assert sp["sandbox"]["filesystem"]["denyWrite"] == [str(code.root / g) for g in claude_cli.GIT_PROTECTED]
     assert not any(a.startswith("Edit") for a in sp["permissions"]["allow"])
     assert "useAutoModeDuringPlan" not in se and "Edit(./**)" in se["permissions"]["allow"]
-    assert sp["hooks"] == se["hooks"] and sp["permissions"]["deny"] == se["permissions"]["deny"]
+    # хук тот же, профиль у фазы плана — plan (ТЗ WSH-3.4, А4.3)
+    assert json.dumps(sp["hooks"]).replace("--profile plan", "--profile task") == json.dumps(se["hooks"])
+    assert sp["permissions"]["deny"] == se["permissions"]["deny"]
     # argv обеих фаз из задачи: план — новая сессия в plan, исполнение — --resume той же сессии в dontAsk
     ap = json.loads((code.jobs.job_dir(snap["chain"][0]["id"]) / "argv.json").read_text())
     ae = json.loads((code.jobs.job_dir(snap["chain"][1]["id"]) / "argv.json").read_text())
@@ -680,7 +682,8 @@ def test_plan_settings_golden(profile):
         {k: v for k, v in base["sandbox"].items() if k not in ("filesystem", "excludedCommands")}
     assert {k: v for k, v in s["sandbox"]["filesystem"].items() if k != "denyWrite"} == \
         {k: v for k, v in base["sandbox"]["filesystem"].items() if k != "denyWrite"}
-    assert s["hooks"] == base["hooks"]
+    # хук — тот же, профиль фазы плана — plan (ТЗ WSH-3.4, А4.3)
+    assert json.dumps(s["hooks"]).replace("--profile plan", f"--profile {profile}") == json.dumps(base["hooks"])
 
 
 def test_plan_settings_clear_project_bash_and_exclusions():

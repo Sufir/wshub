@@ -57,7 +57,15 @@ DENY = [
     "git --config-env=core.pager=X log",
     "git --exec-path=/tmp/x status",
     "git remote set-url origin x",
-    "git remote -v",
+    "git remote show origin",
+    "git remote add x https://x",
+    "git remote -v add x y",
+    "git remote prune origin",
+    "git remote update",
+    "git remote set-head origin -a",
+    "git remote get-url",
+    "git remote get-url a b",
+    "git remote rename origin x",
     "git fetch --all",
     "git pull --ff-only",
     "git ls-remote origin",
@@ -215,6 +223,12 @@ ALLOW = [
     "git commit -m push",
     "git switch -c PAY-1 --no-track origin/master",
     "git rev-parse --abbrev-ref --symbolic-full-name @{u}",
+    "git remote",
+    "git remote -v",
+    "git remote --verbose",
+    "git remote get-url origin",
+    "git remote get-url --push master",
+    "echo wshub push origin x",
     "git -C . status",
     "git config --get user.name",
     "git config --list",
@@ -338,3 +352,146 @@ def test_main_data_dirs_from_argv():
     event = {"tool_name": "Bash", "tool_input": {"command": "cat /srv/state/x"}, "cwd": CWD}
     assert _run(event, argv=["/srv/state"])[0] == 2
     assert _run(event, argv=[])[0] == 0
+
+
+# ---------- ТЗ WSH-3.4: помощник хаба, --output по профилю, --profile ----------
+
+HELPER_ALLOW = [
+    "wshub push origin feat-x",
+    "wshub push origin PAY-1 -o merge_request.create -o merge_request.target=master",
+    'wshub push master PAY-1 -o merge_request.title="PAY-1: суть; правка | ещё"',
+    'wshub push origin x -o merge_request.description="Сделано\\n\\nПроверено"',
+    "wshub forge GET /api/v4/projects/1/merge_requests/2/changes",
+    "wshub forge GET projects/1/pipelines --out .agents/p.json",
+    "wshub forge GET projects/1/pipelines --out=out/p.json",
+    "wshub forge POST repos/o/r/pulls --data .agents/pr.json",
+    f"wshub forge GET x --out {CWD}/p.json",
+]
+
+HELPER_DENY = [
+    # не целиком: звенья, фон, перенаправления, подстановки, обёртки, присваивания
+    "wshub push origin x && git status",
+    "wshub push origin x; ls",
+    "git status && wshub push origin x",
+    "wshub push origin x | tee log",
+    "wshub push origin x > out.txt",
+    "wshub push origin x 2>/dev/null",
+    "wshub push origin x &",
+    "wshub push origin x\nls",
+    "wshub push origin $BR",
+    "wshub push origin `git branch --show-current`",
+    'wshub push origin "$(git branch --show-current)"',
+    "FOO=1 wshub push origin x",
+    "WSHUB_JOB=other wshub push origin x",
+    "env wshub push origin x",
+    "timeout 60 wshub push origin x",
+    "nohup wshub forge GET x",
+    "xargs wshub push origin < b",
+    "sh -c 'wshub push origin x'",
+    "{ wshub push origin x; }",
+    "! wshub push origin x",
+    # другие подкоманды wshub
+    "wshub",
+    "wshub code jobs",
+    "wshub code start p t.md",
+    "/home/u/.local/bin/wshub code jobs",
+    # --out помощника — по правилам записи
+    "wshub forge GET x --out /tmp/p.json",
+    "wshub forge GET x --out ../p.json",
+    "wshub forge GET x --out .git/hooks/pre-commit",
+    "wshub forge GET x --out ~/p.json",
+    "wshub forge GET x --out",
+]
+
+
+@pytest.mark.parametrize("cmd", HELPER_ALLOW)
+def test_helper_allow_task(cmd):
+    assert hook.check(cmd, CWD, DATA, "task") is None, (cmd, hook.check(cmd, CWD, DATA, "task"))
+
+
+@pytest.mark.parametrize("cmd", HELPER_DENY)
+def test_helper_deny(cmd):
+    for profile in ("task", "review", None):
+        assert hook.check(cmd, CWD, DATA, profile) is not None, (cmd, profile)
+
+
+@pytest.mark.parametrize("profile", ["review", "recon", "plan", None])
+def test_helper_push_only_task(profile):
+    assert hook.check("wshub push origin feat-x", CWD, DATA, profile) is not None
+    assert hook.check("wshub forge GET projects/1", CWD, DATA, profile) is None
+
+
+def test_helper_out_by_profile():
+    assert hook.check("wshub forge GET x --out .agents/p.json", CWD, DATA, "review") is None
+    assert hook.check("wshub forge GET x --out p.json", CWD, DATA, "review") is not None
+    assert hook.check("wshub forge GET x --out .agents/p.json", CWD, DATA, "recon") is not None
+
+
+OUTPUT_TASK_ALLOW = [
+    "git diff --output=out.diff",
+    "git diff --output out.diff origin/main..HEAD",
+    "git diff --output=.agents/WSH-1.diff origin/main..HEAD",
+    "git log -p --output=sub/dir/x.patch -3",
+    "git show --output=x.patch HEAD",
+    f"git diff --output={CWD}/x.diff",
+    "git -C . diff --output=x.diff",
+]
+
+OUTPUT_TASK_DENY = [
+    "git diff --output=/tmp/x",
+    "git diff --output=../x",
+    "git diff --output=.git/hooks/pre-commit",
+    "git diff --output=sub/../.git/config",
+    "git diff --output=.GIT/config",
+    "git diff --output=~/x",
+    "git diff --output=$OUT",
+    "git diff --output",
+    "git diff --output=*.diff",
+    "/usr/lib/git-core/git-diff --output=/tmp/x",
+]
+
+
+@pytest.mark.parametrize("cmd", OUTPUT_TASK_ALLOW)
+def test_output_task_allow(cmd):
+    assert hook.check(cmd, CWD, DATA, "task") is None, (cmd, hook.check(cmd, CWD, DATA, "task"))
+
+
+@pytest.mark.parametrize("cmd", OUTPUT_TASK_DENY)
+def test_output_task_deny(cmd):
+    assert hook.check(cmd, CWD, DATA, "task") is not None, cmd
+
+
+def test_output_review_only_agents():
+    assert hook.check("git diff --output=.agents/r.diff", CWD, DATA, "review") is None
+    assert hook.check("git diff --output=r.diff", CWD, DATA, "review") is not None
+    assert hook.check("git diff --output=.agents/../r.diff", CWD, DATA, "review") is not None
+
+
+@pytest.mark.parametrize("profile", ["recon", "plan", None, "unknown"])
+def test_output_readonly_profiles(profile):
+    assert hook.check("git diff --output=.agents/x.diff", CWD, DATA, profile) is not None
+
+
+def test_output_symlink_outside(tmp_path):
+    work, outside = tmp_path / "proj", tmp_path / "outside"
+    work.mkdir()
+    outside.mkdir()
+    (work / "out").symlink_to(outside)
+    assert hook.check("git diff --output=out/x.diff", str(work), [], "task") is not None
+    assert hook.check("git diff --output=x.diff", str(work), [], "task") is None
+
+
+def test_helper_and_remote_reasons():
+    assert "помощник" in hook.check("wshub code jobs", CWD, DATA, "task")
+    assert "wshub push" in hook.check("git push origin x", CWD, DATA, "task")
+    assert "только чтение" in hook.check("git remote add x y", CWD, DATA, "task")
+
+
+def test_main_profile_from_argv():
+    event = {"tool_name": "Bash", "tool_input": {"command": "git diff --output=x.diff"}, "cwd": CWD}
+    assert _run(event, argv=["--profile", "task", *map(str, DATA)])[0] == 0
+    assert _run(event, argv=["--profile", "recon", *map(str, DATA)])[0] == 2
+    assert _run(event)[0] == 2  # без --profile — как у читающего профиля
+    ok = {"tool_name": "Bash", "tool_input": {"command": "git status"}, "cwd": CWD}
+    assert _run(ok, argv=["--profile"])[0] == 2  # --profile без значения — fail closed
+    assert _run(ok, argv=["--profile", "task"])[0] == 0

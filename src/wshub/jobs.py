@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import fnmatch
 import hashlib
+import json
 import math
 import os
 import secrets
@@ -41,9 +42,21 @@ CANCEL_SIGTERM_AFTER = 20
 CANCEL_SIGKILL_AFTER = 10
 GIT_START = "git_start.json"  # снимок git на старте звена, в каталоге звена (ТЗ WSH-3.3, п. 1.2)
 COMMITS_MAX = 20
+EXTERNAL_MAX = 10  # строк вызовов помощника каждого вида в блоке «Внешние действия»
 DOCKER_MAX = 30
 META_MAX = 30  # строк git_meta_changed и errors в блоке
 HASH_MAX = 64 * 1024 * 1024  # файл в .git крупнее — по размеру и mtime, без чтения
+# точки монтирования песочницы в рабочем каталоге: bwrap монтирует /dev/null на месте несуществующих защищённых путей,
+# git status видит их неотслеживаемыми, git add -A падает. Хаб прячет их помеченным блоком в .git/info/exclude (ТЗ
+# WSH-3.4, А4.4). Список — журнал WSH-3.1 плюс пути под .claude/, найденные на стенде WSH-3.4 (git status --ignored
+# изнутри песочницы claude 2.1.291)
+SANDBOX_MOUNTS = (".bash_profile", ".bashrc", ".gitconfig", ".gitmodules", ".idea", ".mcp.json", ".profile",
+                  ".ripgreprc", ".vscode", ".zprofile", ".zshrc",
+                  ".claude/agents", ".claude/commands", ".claude/hooks", ".claude/launch.json", ".claude/loop.md",
+                  ".claude/output-styles", ".claude/routines", ".claude/scheduled_tasks.json", ".claude/settings.json",
+                  ".claude/settings.local.json", ".claude/skills", ".claude/workflows")
+EXCLUDE_BEGIN = "# >>> wshub-code: точки монтирования песочницы (блок пишет хаб, не править)"
+EXCLUDE_END = "# <<< wshub-code"
 META_WARNING = ("ВНИМАНИЕ: задача изменила .git/hooks или .git/config. Эти правки не видны в диффе и выполнятся "
                 "твоим git — проверь их перед git-командами в этом репозитории")
 
@@ -89,6 +102,7 @@ class Plan:
     plan_mode: str = "no"
     budget_total: float = 0.0  # бюджет всей задачи (цепочки); budget_usd — этого звена
     max_turns_total: int = 0
+    grants: dict | None = None  # разрешения задачи {push, forge, reason} (ТЗ WSH-3.4, А2)
 
     @property
     def permission_mode(self) -> str:
@@ -190,10 +204,11 @@ class Jobs:
 
     def plan(self, project: str, task: str, *, model=None, effort=None, plan=None, chosen_by=None, reason=None,
              max_turns=None, budget_usd=None, note=None, prompt_override: str | None = None,
-             inherit: dict | None = None, channel: str = "mcp") -> Plan:
+             inherit: dict | None = None, channel: str = "mcp", push: bool = False, forge: bool = False) -> Plan:
         """Проверить задачу и выбрать модель/effort/план. chosen_by="operator" — аргументы model/effort/plan
         выбрал оператор (2.2.1); иначе это отступление чата. inherit — job.json родителя при resume.
-        channel — откуда пришли аргументы: «cli» (флаги wshub code) или «mcp» (решение 12)."""
+        channel — откуда пришли аргументы: «cli» (флаги wshub code) или «mcp» (решение 12).
+        push/forge — разрешения задачи по регламенту проекта (ТЗ WSH-3.4, А2)."""
         ws, proj, glob = self._project(project)
         root = ws.path.resolve()
         dirs = self._dirs(root, proj)
@@ -228,6 +243,8 @@ class Jobs:
         if channel not in ("cli", "mcp"):
             raise JobError(f"канал выбора {channel!r} не поддерживается")
 
+        grants, gwarn = task_grants(project, proj, profile, push, forge, reason,
+                                    (inherit or {}).get("grants"))
         max_turns = int(max_turns or header.get("max_turns") or proj.max_turns)
         budget_usd = float(budget_usd if budget_usd is not None else header.get("budget_usd", proj.max_budget_usd))
         self._check_limits(proj, max_turns, budget_usd)
@@ -245,9 +262,9 @@ class Jobs:
         prompt_name = prompt_override or header.get("prompt") or profile
         prompt, warnings = self._render(root, proj, prompt_name, header["ticket"], task_rel, note)
         out = Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, choice.model, choice.effort,
-                   max_turns, budget_usd, prompt, warnings, proj, ticket=header["ticket"],
+                   max_turns, budget_usd, prompt, warnings + gwarn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
-                   budget_total=budget_usd, max_turns_total=max_turns)
+                   budget_total=budget_usd, max_turns_total=max_turns, grants=grants)
         if choice.plan != "no":
             # шаблон исполнения проверяем на старте, а не после оплаченной фазы плана (2.6.3)
             self._render(root, proj, proj.execute_prompt, header["ticket"], task_rel,
@@ -353,7 +370,6 @@ class Jobs:
         return d
 
     def write(self, jid: str, data: dict) -> None:
-        import json
         atomic_write_text(self.job_dir(jid) / "job.json", json.dumps(data, ensure_ascii=False, indent=1))
 
     @contextlib.contextmanager
@@ -399,7 +415,6 @@ class Jobs:
               chain_root: str | None = None, link: tuple[str, str] | None = None, now: float | None = None) -> dict:
         """Записать и запустить звено. link = (id фазы плана, причина) — переход из plan_ready: под тем же flock
         проверяем, что план всё ещё plan_ready и не утверждён, и отмечаем его (code_approve/replan/auto)."""
-        import json
         glob = self.hub.registry.get().code.glob
         read_extra = self._read_extra(plan.root, plan.proj)  # до каталога задачи: отказ не оставляет файлов
         # claude и его флаги (вызовы подпроцесса) — до flock: не трогают общее состояние, не держат лок
@@ -409,6 +424,13 @@ class Jobs:
         if problem:
             raise JobError(problem)
         flags = claude_cli.detect_flags(claude, self.hub.state_dir, env)
+        grants = plan.grants or {}
+        if grants.get("forge"):  # файл токена — при старте задачи с доступом к API (А1.2)
+            from .helper import HelperError, read_token
+            try:
+                read_token(plan.proj.forge_token or "")
+            except HelperError as e:
+                raise JobError(f"API хостинга: {e}") from None
         git_start = start_snapshot(plan.dir, dict(os.environ))  # тоже подпроцесс — до flock
         with self._flock():
             if link is not None:
@@ -442,7 +464,7 @@ class Jobs:
                 "ticket": plan.ticket, "size": plan.size, "risk": plan.risk, "choice": choice,
                 "phase": plan.phase, "plan_mode": plan.plan_mode, "budget_total": plan.budget_total,
                 "max_turns_total": plan.max_turns_total, "chain_root": chain_root or jid,
-                "session_name": plan.session_name(),
+                "session_name": plan.session_name(), "grants": grants,
             }
             sid = resume or str(_uuid4())
             data["session_id"] = sid if not resume else resume
@@ -452,8 +474,14 @@ class Jobs:
             hook_cmd = [sys.executable, "-m", "wshub.hook"]  # лёгкий запуск хука (замечание 9)
             settings = claude_cli.settings(plan.profile, plan.task_rel, glob, plan.proj, protected,
                                            self.hub.protected_data, hook_cmd, Path.home(), plan.dir,
-                                           phase="plan" if plan.phase == "plan" else None, read_extra=read_extra)
+                                           phase="plan" if plan.phase == "plan" else None, read_extra=read_extra,
+                                           grants=grants)
             claude_cli.write_job_files(jdir, settings, plan.prompt)
+            # помощнику — задача и хаб (не секреты); агент ssh — только в каталог задачи, Code туда не видит (А3)
+            env = {**env, "WSHUB_JOB": jid, "WSHUB_CONFIG": str(self.hub.registry.path),
+                   "WSHUB_STATE": str(self.hub.state_dir)}
+            if grants.get("push") and os.environ.get("SSH_AUTH_SOCK"):
+                atomic_write_text(jdir / "ssh_auth_sock", os.environ["SSH_AUTH_SOCK"])
             argv = claude_cli.argv(claude, plan.prompt, job_dir=jdir, model=plan.model, effort=plan.effort,
                                    max_turns=plan.max_turns, budget_usd=plan.budget_usd, flags=flags,
                                    session_id=None if resume else sid, resume=resume,
@@ -461,6 +489,10 @@ class Jobs:
             atomic_write_text(jdir / "argv.json", json.dumps(argv, ensure_ascii=False))
             atomic_write_text(jdir / "env.json", json.dumps(env, ensure_ascii=False))
             atomic_write_text(jdir / GIT_START, json.dumps(git_start, ensure_ascii=False, indent=1))
+            try:
+                write_exclude(plan.dir)
+            except OSError as e:
+                data["warnings"] = [*data["warnings"], f".git/info/exclude не записан: {e}"]
             self.write(jid, data)
 
             sup = self._spawn_supervisor(jid)
@@ -478,7 +510,8 @@ class Jobs:
             "model_source": c.source if c else None, **({"channel": c.channel} if c and c.channel else {}),
             "choice_fields": c.choice_fields or {} if c else None,
             "policy_row": c.row if c else None,
-            "reason": c.reason if c else None, "parent": parent})
+            "reason": c.reason if c else None, "parent": parent,
+            "grants": {k: v for k, v in grants.items() if v}})
         return data
 
     def _check_daily_budget(self, plan: Plan, live: list[dict], now: float | None):
@@ -634,7 +667,7 @@ class Jobs:
     # ---------- resume ----------
 
     def resume(self, jid: str, prompt: str, *, note=None, model=None, effort=None, max_turns=None,
-               budget_usd=None, chosen_by=None, reason=None) -> dict:
+               budget_usd=None, chosen_by=None, reason=None, push: bool = False, forge: bool = False) -> dict:
         d = self.read(jid)
         if d.get("phase") == "plan":
             # resume поднял бы dontAsk с правами профиля без утверждения плана
@@ -652,7 +685,7 @@ class Jobs:
         plan = self.plan(d["project"], d["task"], model=model, effort=effort, chosen_by=chosen_by, reason=reason,
                          max_turns=max_turns or d.get("max_turns"),
                          budget_usd=budget_usd if budget_usd is not None else d.get("budget_usd"),
-                         note=note, prompt_override=prompt, inherit=d)
+                         note=note, prompt_override=prompt, inherit=d, push=push, forge=forge)
         # тот же dir и профиль, что у родителя (п. 2.5.6): задача-потомок могла править свою шапку
         if str(plan.dir) != d.get("dir") or plan.profile != d.get("profile"):
             raise JobError(f"шапка ТЗ изменилась с момента родителя (dir/profile): было "
@@ -710,11 +743,13 @@ class Jobs:
         if turns < 1:
             raise JobError(f"ходы задачи исчерпаны: из {d.get('max_turns_total')} не осталось")
         prompt, warnings = self._render(root, proj, template, d.get("ticket") or "", d["task_rel"], note)
+        # разрешения — у звеньев цепочки те же (А2.2), регламент проекта перепроверяется на старте звена
+        grants, gwarn = task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants"))
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
-                    effort, turns, budget, prompt, warnings, proj, ticket=d.get("ticket") or "",
+                    effort, turns, budget, prompt, warnings + gwarn, proj, ticket=d.get("ticket") or "",
                     size=d.get("size"), risk=d.get("risk"), choice=choice, phase=phase,
                     plan_mode=d.get("plan_mode") or "no", budget_total=float(d["budget_total"]),
-                    max_turns_total=int(d["max_turns_total"]))
+                    max_turns_total=int(d["max_turns_total"]), grants=grants)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
         """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk, модель исполнения,
@@ -758,7 +793,8 @@ class Jobs:
         # «Вне кода» — один блок по всем звеньям, в итоге активного звена его не повторяем (предел ответа)
         result = {k: v for k, v in (d.get("result") or {}).items() if k != "outside_code"}
         out = {"job": job, "project": snap.get("project"), "state": snap["state"], "reason": d.get("reason"),
-               "choice": snap.get("choice"), "outside_code": outside_view(links), "result": result,
+               "choice": snap.get("choice"), "grants": d.get("grants") or {}, "outside_code": outside_view(links),
+               "external": self.external_view(links), "result": result,
                **({"reason_hint": REASON_HINT[d["reason"]]} if d.get("reason") in REASON_HINT else {}),
                "files": {"events": str(jdir / "events.jsonl"), "stderr": str(jdir / "stderr.log"),
                          "task": d.get("task")}}
@@ -772,6 +808,33 @@ class Jobs:
         if sid and d.get("dir"):
             out["open_in_terminal"] = f"cd {shlex.quote(d['dir'])} && claude --resume {sid}"
         return out
+
+    def external_view(self, links: list[dict]) -> dict:
+        """Блок «Внешние действия» (ТЗ WSH-3.4, А3.4): вызовы помощника по external.jsonl звеньев — пуши целиком
+        (их мало), вызовы API числом и последние EXTERNAL_MAX, ссылки на MR/PR."""
+        rows: list[dict] = []
+        for x in links:
+            try:
+                lines = (self.job_dir(x["id"]) / "external.jsonl").read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(r, dict):
+                    rows.append(r)
+        pushes = [r for r in rows if r.get("cmd") == "push"]
+        calls = [r for r in rows if r.get("cmd") == "forge"]
+
+        def row(r: dict) -> dict:
+            return {k: r[k] for k in ("ts", "args", "exit", "status", "link", "error") if r.get(k) is not None}
+
+        return {"push": [row(r) for r in pushes[-EXTERNAL_MAX:]], "push_count": len(pushes),
+                "forge": [row(r) for r in calls[-EXTERNAL_MAX:]], "forge_count": len(calls),
+                "forge_errors": sum(1 for r in calls if r.get("exit")),
+                "links": list(dict.fromkeys(r["link"] for r in rows if r.get("link")))}
 
     # ---------- статистика (2.4.5) ----------
 
@@ -813,6 +876,78 @@ REPLAN_PROMPT = "replan"
 # подсказки к коду причины — в снимке и итоге рядом с reason
 REASON_HINT = {"no_plan": "план ищется только в ~/.claude/plans/: настройка plansDirectory в "
                           ".claude/settings*.json проекта не поддерживается"}  # решение 13
+
+
+def task_grants(name: str, proj: ProjectCode, profile: str, push: bool, forge: bool, reason,
+                inherited: dict | None = None) -> tuple[dict, list[str]]:
+    """Разрешения задачи по регламенту проекта (ТЗ WSH-3.4, А2): no — отказ на просьбу, task — с reason
+    (≥ 15 символов: кто разрешил и когда), always — само. Пуш — только профилю task. inherited — разрешения
+    родителя: наследуются, пока регламент их не закрыл. Ответ — (разрешения, предупреждения)."""
+    inh = inherited or {}
+    why = code_policy.clean_reason(reason) if reason else ""
+    out: dict = {"push": False, "forge": False, "reason": None}
+    warnings: list[str] = []
+    for kind, asked, mode, key, label in (("push", push, proj.push, "push", "пуш"),
+                                           ("forge", forge, proj.forge_access, "forge_access", "API хостинга")):
+        # разрешение, выданное само при always, не наследуется, если регламент стал task (ревью WSH-3.4)
+        was = bool(inh.get(kind)) and (kind not in (inh.get("auto") or []) or mode == "always")
+        if kind == "push" and profile != "task":
+            if asked:
+                raise JobError(f"пуш — только задаче профиля task (у задачи {profile})")
+            continue
+        if mode == "no":
+            if asked:
+                raise JobError(f"в проекте {name} {label} закрыт реестром ({key} = no)")
+            if was:
+                warnings.append(f"{label}: разрешение родителя снято — регламент проекта теперь {key} = no")
+            continue
+        if mode == "always":
+            out[kind] = True
+            if not asked and (not inh.get(kind) or kind in (inh.get("auto") or [])):
+                out.setdefault("auto", []).append(kind)
+        elif was:
+            out[kind] = True
+        elif asked:
+            if len(why) < code_policy.REASON_MIN:
+                raise JobError(f"{label} при {key} = task — только с reason (≥ {code_policy.REASON_MIN} символов): "
+                               "кто разрешил и когда, например «оператор в чате 15.10: запушить и открыть MR»")
+            out[kind] = True
+    if out["push"] or out["forge"]:
+        out["reason"] = (why if (push or forge) and why else None) or inh.get("reason")
+    return out, warnings
+
+
+def write_exclude(repo: Path) -> None:
+    """Помеченный блок с точками монтирования песочницы в .git/info/exclude (ТЗ WSH-3.4, А4.4): заменяется, а не
+    дублируется; чужие строки не трогаются. .git/info — каталог, exclude — обычный файл или его нет (симлинк —
+    отказ: запись не уходит по ссылке, подложенной задачей)."""
+    info = repo / ".git" / "info"
+    if info.is_symlink() or (info.exists() and not info.is_dir()):
+        raise OSError(f"{info} — не каталог")
+    path = info / "exclude"
+    old = ""
+    if path.is_symlink() or (path.exists() and not path.is_file()):
+        raise OSError(f"{path} — не обычный файл")
+    if path.exists():
+        try:
+            old = path.read_bytes().decode("utf-8")
+        except UnicodeDecodeError:
+            raise OSError(f"{path} — не UTF-8, блок не пишу") from None
+    lines, skip = [], False
+    for line in old.splitlines():
+        if line == EXCLUDE_BEGIN:
+            skip = True
+        elif skip and line == EXCLUDE_END:
+            skip = False
+        elif not skip:
+            lines.append(line)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    block = [EXCLUDE_BEGIN, *(f"/{m}" for m in SANDBOX_MOUNTS), EXCLUDE_END]
+    text = "\n".join([*lines, *([""] if lines else []), *block]) + "\n"
+    if text != old:
+        info.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(path, text)
 
 
 def git_meta(repo: Path) -> dict:

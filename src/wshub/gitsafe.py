@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import fnmatch
 import os
+import re
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -27,7 +29,12 @@ OVERRIDES = (
     "submodule.recurse=false", "fetch.recurseSubmodules=false", "status.submoduleSummary=false",
     "diff.ignoreSubmodules=all",
 )
+# git push помощника (ТЗ WSH-3.4, А3.2): учётные данные — обычные у пользователя (ssh или credential helper из
+# глобальной конфигурации), поэтому без подмены sshCommand и credential.helper. Те же ключи в .git/config
+# репозитория — в UNSAFE_KEYS, с ними git не запускается
+PUSH_OVERRIDES = tuple(o for o in OVERRIDES if not o.startswith(("core.sshCommand=", "credential.helper=")))
 ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ")
+VALUE_MAX = 200  # символов значения ключа в тексте отказа
 FIXED_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false"}
 CONFIG_TIMEOUT = 15
 
@@ -65,9 +72,14 @@ def env(environ: dict, ssh_agent: bool = False) -> dict:
 
 
 def unsafe_keys(git: str, gdir: Path, environ: dict) -> list[str]:
-    """Ключи из запретного списка в .git/config (и config.worktree, если есть). Файл читается через
-    git config --file … --list --no-includes: чтение ничего не запускает."""
-    found: list[str] = []
+    """Ключи из запретного списка в .git/config (и config.worktree, если есть)."""
+    return list(dict.fromkeys(k for k, _v, _f in unsafe_entries(git, gdir, environ)))
+
+
+def unsafe_entries(git: str, gdir: Path, environ: dict) -> list[tuple[str, str, Path]]:
+    """(ключ, значение, файл) из запретного списка в .git/config (и config.worktree, если есть). Файл читается
+    через git config --file … --list --no-includes: чтение ничего не запускает."""
+    found: list[tuple[str, str, Path]] = []
     for f in (gdir / "config", gdir / "config.worktree"):
         if not f.exists():
             continue
@@ -80,27 +92,46 @@ def unsafe_keys(git: str, gdir: Path, environ: dict) -> list[str]:
         if r.returncode != 0:
             raise GitUnsafe("git_config_unsafe", f"{f} не разбирается: {r.stderr.strip()[:300]}")
         for line in r.stdout.splitlines():
-            key = line.split("=", 1)[0].lower()
-            if any(fnmatch.fnmatchcase(key, p) for p in UNSAFE_KEYS) and key not in found:
-                found.append(key)
+            key, _, value = line.partition("=")
+            key = key.lower()
+            if any(fnmatch.fnmatchcase(key, p) for p in UNSAFE_KEYS):
+                found.append((key, value, f))
     return found
 
 
-def argv(git: str, cwd: Path, *args: str) -> list[str]:
+def _show(text: str) -> str:
+    """Значение для текста отказа: без учётных данных в адресе (url.<база>.insteadOf) и не длиннее VALUE_MAX."""
+    text = re.sub(r"(://)[^/@\s]+@", r"\1***@", text)
+    return text if len(text) <= VALUE_MAX else text[:VALUE_MAX] + "…"
+
+
+def unsafe_message(repo: Path, entries: list[tuple[str, str, Path]]) -> str:
+    """Отказ git_config_unsafe (ТЗ WSH-3.4, А4.5): ключ, значение и способ починки на каждый ключ."""
+    rows = []
+    for key, value, f in entries:
+        where = "" if f.name == "config" else f" (в {f.name})"
+        opt = "" if f.name == "config" else " --worktree"
+        rows.append(f"{_show(key)} = {_show(value)}{where} — исправь: git -C {shlex.quote(str(repo))} config{opt} "
+                    f"--unset-all {shlex.quote(_show(key))} или укажи верное значение")
+    return "хаб не запускает git в репозитории с такими ключами в .git/config: " + "; ".join(rows)
+
+
+def argv(git: str, cwd: Path, *args: str, overrides: tuple[str, ...] = OVERRIDES) -> list[str]:
     out = [git, "--no-optional-locks", "-C", str(cwd)]
-    for o in OVERRIDES:
+    for o in overrides:
         out += ["-c", o]
     return [*out, *args]
 
 
 def run(git: str, cwd: Path, args: list[str], environ: dict, timeout: float, ssh_agent: bool = False,
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE) -> subprocess.CompletedProcess:
-    """Проверка конфига, затем git с переопределениями. GitUnsafe — git не запускался."""
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, push: bool = False) -> subprocess.CompletedProcess:
+    """Проверка конфига, затем git с переопределениями. GitUnsafe — git не запускался. push=True — git push
+    помощника: учётные данные пользователя (PUSH_OVERRIDES) и агент ssh из environ."""
     gdir = git_dir(cwd)
-    keys = unsafe_keys(git, gdir, environ)
-    if keys:
-        raise GitUnsafe("git_config_unsafe", f"в {gdir / 'config'} ключи, при которых хаб не запускает git: "
-                                             f"{', '.join(keys)}", keys)
-    return subprocess.run(argv(git, cwd, *args), stdout=stdout, stderr=stderr, text=True, timeout=timeout,
-                          env=env(environ, ssh_agent), stdin=subprocess.DEVNULL, check=False,
-                          cwd=os.fspath(cwd))
+    entries = unsafe_entries(git, gdir, environ)
+    if entries:
+        raise GitUnsafe("git_config_unsafe", unsafe_message(cwd, entries),
+                        list(dict.fromkeys(k for k, _v, _f in entries)))
+    return subprocess.run(argv(git, cwd, *args, overrides=PUSH_OVERRIDES if push else OVERRIDES), stdout=stdout,
+                          stderr=stderr, text=True, timeout=timeout, env=env(environ, ssh_agent or push),
+                          stdin=subprocess.DEVNULL, check=False, cwd=os.fspath(cwd))

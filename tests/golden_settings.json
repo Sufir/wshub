@@ -8,11 +8,28 @@
                 "Bash(git log *)",
                 "Bash(git show *)",
                 "Bash(git diff *)",
-                "Bash(git grep *)"
+                "Bash(git grep *)",
+                "Bash(git remote)",
+                "Bash(git remote -v)",
+                "Bash(git remote get-url *)",
+                "Bash(head *)",
+                "Bash(tail *)",
+                "Bash(wc *)",
+                "Bash(grep *)",
+                "Bash(cut *)"
             ],
             "deny": [
                 "Bash(git push *)",
-                "Bash(git remote *)",
+                "Bash(git remote add *)",
+                "Bash(git remote set-url *)",
+                "Bash(git remote remove *)",
+                "Bash(git remote rm *)",
+                "Bash(git remote rename *)",
+                "Bash(git remote prune *)",
+                "Bash(git remote update *)",
+                "Bash(git remote set-head *)",
+                "Bash(git remote set-branches *)",
+                "Bash(git remote show *)",
                 "Bash(git clean *)",
                 "Bash(ssh *)",
                 "Bash(scp *)",
@@ -100,7 +117,7 @@
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                            "command": "/py -m wshub.hook --profile recon /home/u/.config/wshub /home/u/.local/state/wshub"
                         }
                     ]
                 }
@@ -117,6 +134,14 @@
                 "Bash(git show *)",
                 "Bash(git diff *)",
                 "Bash(git grep *)",
+                "Bash(git remote)",
+                "Bash(git remote -v)",
+                "Bash(git remote get-url *)",
+                "Bash(head *)",
+                "Bash(tail *)",
+                "Bash(wc *)",
+                "Bash(grep *)",
+                "Bash(cut *)",
                 "Edit(./**)",
                 "Task",
                 "Bash(git add *)",
@@ -126,11 +151,22 @@
                 "Bash(git rev-parse *)",
                 "Bash(git rev-list *)",
                 "Bash(git merge --ff-only *)",
-                "Bash(git checkout *)"
+                "Bash(git checkout *)",
+                "Bash(sort *)",
+                "Bash(uniq *)"
             ],
             "deny": [
                 "Bash(git push *)",
-                "Bash(git remote *)",
+                "Bash(git remote add *)",
+                "Bash(git remote set-url *)",
+                "Bash(git remote remove *)",
+                "Bash(git remote rm *)",
+                "Bash(git remote rename *)",
+                "Bash(git remote prune *)",
+                "Bash(git remote update *)",
+                "Bash(git remote set-head *)",
+                "Bash(git remote set-branches *)",
+                "Bash(git remote show *)",
                 "Bash(git clean *)",
                 "Bash(ssh *)",
                 "Bash(scp *)",
@@ -218,7 +254,7 @@
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                            "command": "/py -m wshub.hook --profile task /home/u/.config/wshub /home/u/.local/state/wshub"
                         }
                     ]
                 }
@@ -235,12 +271,29 @@
                 "Bash(git show *)",
                 "Bash(git diff *)",
                 "Bash(git grep *)",
+                "Bash(git remote)",
+                "Bash(git remote -v)",
+                "Bash(git remote get-url *)",
+                "Bash(head *)",
+                "Bash(tail *)",
+                "Bash(wc *)",
+                "Bash(grep *)",
+                "Bash(cut *)",
                 "Edit(./.agents/**)",
                 "Task"
             ],
             "deny": [
                 "Bash(git push *)",
-                "Bash(git remote *)",
+                "Bash(git remote add *)",
+                "Bash(git remote set-url *)",
+                "Bash(git remote remove *)",
+                "Bash(git remote rm *)",
+                "Bash(git remote rename *)",
+                "Bash(git remote prune *)",
+                "Bash(git remote update *)",
+                "Bash(git remote set-head *)",
+                "Bash(git remote set-branches *)",
+                "Bash(git remote show *)",
                 "Bash(git clean *)",
                 "Bash(ssh *)",
                 "Bash(scp *)",
@@ -328,7 +381,7 @@
                     "hooks": [
                         {
                             "type": "command",
-                            "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                            "command": "/py -m wshub.hook --profile review /home/u/.config/wshub /home/u/.local/state/wshub"
                         }
                     ]
                 }
@@ -402,11 +455,28 @@
                     "Bash(git log *)",
                     "Bash(git show *)",
                     "Bash(git diff *)",
-                    "Bash(git grep *)"
+                    "Bash(git grep *)",
+                    "Bash(git remote)",
+                    "Bash(git remote -v)",
+                    "Bash(git remote get-url *)",
+                    "Bash(head *)",
+                    "Bash(tail *)",
+                    "Bash(wc *)",
+                    "Bash(grep *)",
+                    "Bash(cut *)"
                 ],
                 "deny": [
                     "Bash(git push *)",
-                    "Bash(git remote *)",
+                    "Bash(git remote add *)",
+                    "Bash(git remote set-url *)",
+                    "Bash(git remote remove *)",
+                    "Bash(git remote rm *)",
+                    "Bash(git remote rename *)",
+                    "Bash(git remote prune *)",
+                    "Bash(git remote update *)",
+                    "Bash(git remote set-head *)",
+                    "Bash(git remote set-branches *)",
+                    "Bash(git remote show *)",
                     "Bash(git clean *)",
                     "Bash(ssh *)",
                     "Bash(scp *)",
@@ -495,7 +565,7 @@
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                                "command": "/py -m wshub.hook --profile plan /home/u/.config/wshub /home/u/.local/state/wshub"
                             }
                         ]
                     }
@@ -511,11 +581,28 @@
                     "Bash(git log *)",
                     "Bash(git show *)",
                     "Bash(git diff *)",
-                    "Bash(git grep *)"
+                    "Bash(git grep *)",
+                    "Bash(git remote)",
+                    "Bash(git remote -v)",
+                    "Bash(git remote get-url *)",
+                    "Bash(head *)",
+                    "Bash(tail *)",
+                    "Bash(wc *)",
+                    "Bash(grep *)",
+                    "Bash(cut *)"
                 ],
                 "deny": [
                     "Bash(git push *)",
-                    "Bash(git remote *)",
+                    "Bash(git remote add *)",
+                    "Bash(git remote set-url *)",
+                    "Bash(git remote remove *)",
+                    "Bash(git remote rm *)",
+                    "Bash(git remote rename *)",
+                    "Bash(git remote prune *)",
+                    "Bash(git remote update *)",
+                    "Bash(git remote set-head *)",
+                    "Bash(git remote set-branches *)",
+                    "Bash(git remote show *)",
                     "Bash(git clean *)",
                     "Bash(ssh *)",
                     "Bash(scp *)",
@@ -604,7 +691,7 @@
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                                "command": "/py -m wshub.hook --profile plan /home/u/.config/wshub /home/u/.local/state/wshub"
                             }
                         ]
                     }
@@ -620,11 +707,28 @@
                     "Bash(git log *)",
                     "Bash(git show *)",
                     "Bash(git diff *)",
-                    "Bash(git grep *)"
+                    "Bash(git grep *)",
+                    "Bash(git remote)",
+                    "Bash(git remote -v)",
+                    "Bash(git remote get-url *)",
+                    "Bash(head *)",
+                    "Bash(tail *)",
+                    "Bash(wc *)",
+                    "Bash(grep *)",
+                    "Bash(cut *)"
                 ],
                 "deny": [
                     "Bash(git push *)",
-                    "Bash(git remote *)",
+                    "Bash(git remote add *)",
+                    "Bash(git remote set-url *)",
+                    "Bash(git remote remove *)",
+                    "Bash(git remote rm *)",
+                    "Bash(git remote rename *)",
+                    "Bash(git remote prune *)",
+                    "Bash(git remote update *)",
+                    "Bash(git remote set-head *)",
+                    "Bash(git remote set-branches *)",
+                    "Bash(git remote show *)",
                     "Bash(git clean *)",
                     "Bash(ssh *)",
                     "Bash(scp *)",
@@ -713,7 +817,7 @@
                         "hooks": [
                             {
                                 "type": "command",
-                                "command": "/py -m wshub.hook /home/u/.config/wshub /home/u/.local/state/wshub"
+                                "command": "/py -m wshub.hook --profile plan /home/u/.config/wshub /home/u/.local/state/wshub"
                             }
                         ]
                     }

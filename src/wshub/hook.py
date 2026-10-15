@@ -4,11 +4,12 @@
 sandbox_exclude, которые идут вне песочницы. Отказ, если в любом звене команды есть:
 
 1. git с подкомандой, которая ходит в сеть, меняет remote или конфигурацию, удаляет неотслеживаемые файлы
-   (push, fetch, pull, remote, clean, config на запись и т. п.), или с глобальной опцией, подменяющей
-   конфигурацию (-c, --config-env, --exec-path=…); git с опцией, которая пишет файл или запускает программу
-   из «читающей» подкоманды (--output у log/show/diff, -O/--open-files-in-pager у grep, в том числе
-   сокращения и склейки коротких опций); git с переменной окружения GIT_*, PAGER, LESSOPEN, LESSCLOSE перед ним
-   (внешний diff, пейджер, чужой каталог git);
+   (push, fetch, pull, clean, config на запись и т. п.; remote — кроме чтения: git remote, -v, get-url), или
+   с глобальной опцией, подменяющей конфигурацию (-c, --config-env, --exec-path=…); git grep -O /
+   --open-files-in-pager (запускает программу, в том числе сокращения и склейки коротких опций); --output у
+   log/show/diff — только в пишущем профиле и только в файл внутри рабочего каталога (review — внутри
+   .agents/), не в .git; git с переменной окружения GIT_*, PAGER, LESSOPEN, LESSCLOSE перед ним (внешний diff,
+   пейджер, чужой каталог git);
 2. сетевой клиент (ssh, scp, rsync, curl, wget, nc …);
 3. путь внутрь служебных каталогов wshub (реестр, состояние) — их передаёт settings.json аргументами;
 4. оболочка, читающая команды из stdin, или интерпретатор с кодом в строке, где упомянуто запрещённое;
@@ -18,7 +19,13 @@ sandbox_exclude, которые идут вне песочницы. Отказ, 
    docker (-H, --context, --config), файлы хоста в командах (cp, --env-file, --cidfile …), выгрузка наружу
    (push, login, save/export), docker build (контекст сборки читает хост), удаление томов (down -v,
    volume rm/prune, system prune), compose-файл с чужим именем (-f), переменные окружения перед docker.
-   Сама команда docker — вне песочницы (sandbox_exclude), поэтому этот пол — единственная её граница.
+   Сама команда docker — вне песочницы (sandbox_exclude), поэтому этот пол — единственная её граница;
+6. wshub — кроме помощника хаба (ТЗ WSH-3.4, А3): wshub push и wshub forge идут вне песочницы, поэтому
+   разрешены только командой целиком — одно звено, без обёрток, присваиваний, $, обратных кавычек и
+   перенаправлений; wshub push — только в профиле task; --out у помощника — по тем же правилам, что --output
+   у git. Разрешение задачи и регламент проекта проверяет сам помощник, хук держит форму команды.
+
+Профиль задачи приходит аргументом --profile (task, review, recon, plan). Без него — как у читающего профиля.
 
 Звенья команды: ; && || | & и перевод строки, $( ), обратные кавычки, <( ), {…}, sh -c / bash -c, eval,
 обёртки (env, nohup, timeout, xargs, find -exec …). Ошибка разбора — отказ (fail closed).
@@ -37,6 +44,7 @@ import re
 import shlex
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 MAX_COMMAND = 200_000  # длиннее — отказ: разбор такой команды ненадёжен
 MAX_DEPTH = 8  # вложенность sh -c / eval / $( ) / ``
@@ -111,6 +119,15 @@ DOCKER_FILE_FLAGS = {"--env-file", "--label-file", "--cidfile", "--iidfile"}
 DOCKER_SHORT_BOOL = set("itdPqT")  # короткие флаги без значения, которые бывают в склейке с -v
 NAMED_VOLUME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
+# git remote на чтение (ТЗ WSH-3.4, А4.2): имена и адреса remote; show ходит в сеть, остальное меняет remote
+GIT_REMOTE_READ_FLAGS = {"-v", "--verbose"}
+GIT_REMOTE_GETURL_FLAGS = {"--push", "--all"}
+# профили, которым можно писать файлы (Edit): task — рабочий каталог, review — только .agents/
+WRITE_PROFILES = {"task", "review"}
+# помощник хаба (ТЗ WSH-3.4, А3): вне песочницы, поэтому только командой целиком
+HELPER = "wshub"
+HELPER_SUBS = {"push", "forge"}
+
 CODE_DENY = re.compile(
     r"\bgit\b[^\n;|&]{0,200}?\b(" + "|".join(sorted(GIT_DENY | {"config"})) + r")\b"
     r"|\b(" + "|".join(sorted(NET_TOOLS - {"http", "https"})) + r")\b")
@@ -120,8 +137,16 @@ class _Deny(Exception):
     pass
 
 
-def check(command: str, cwd: str, protected: list[Path]) -> str | None:
-    """Причина отказа для Bash-команды или None — разрешено. protected — служебные каталоги wshub (данные)."""
+class _Ctx(NamedTuple):
+    cwd: Path
+    roots: list[str]
+    profile: str | None  # task, review, recon, plan; None — как у читающего профиля
+    helper: bool  # вся команда — один вызов помощника хаба (_helper_call)
+
+
+def check(command: str, cwd: str, protected: list[Path], profile: str | None = None) -> str | None:
+    """Причина отказа для Bash-команды или None — разрешено. protected — служебные каталоги wshub (данные);
+    profile — профиль задачи (--profile хука)."""
     if not isinstance(command, str):
         return "команда не строка"
     if len(command) > MAX_COMMAND:
@@ -131,7 +156,8 @@ def check(command: str, cwd: str, protected: list[Path]) -> str | None:
         hit = _paths_in_text(command, roots)
         if hit:
             raise _Deny(_path_reason(hit))
-        _check_script(command, Path(cwd or "."), roots, 0)
+        ctx = _Ctx(Path(cwd or "."), roots, profile, _helper_call(command))
+        _check_script(command, ctx, 0)
     except _Deny as e:
         return str(e)
     except ValueError as e:  # shlex: незакрытая кавычка и т. п.
@@ -141,11 +167,11 @@ def check(command: str, cwd: str, protected: list[Path]) -> str | None:
 
 # ---------- разбор ----------
 
-def _check_script(script: str, cwd: Path, roots: list[str], depth: int) -> None:
+def _check_script(script: str, ctx: _Ctx, depth: int) -> None:
     if depth > MAX_DEPTH:
         raise _Deny("слишком глубокая вложенность команд — отказ")
     for seg in _segments(script):
-        _check_segment(seg, cwd, roots, depth)
+        _check_segment(seg, ctx, depth)
 
 
 def _segments(script: str) -> list[list[str]]:
@@ -164,11 +190,12 @@ def _segments(script: str) -> list[list[str]]:
     return [s for s in segs if s]
 
 
-def _check_segment(tokens: list[str], cwd: Path, roots: list[str], depth: int) -> None:
+def _check_segment(tokens: list[str], ctx: _Ctx, depth: int) -> None:
+    cwd = ctx.cwd
     for tok in tokens:  # подстановки внутри строк в кавычках
         for inner in _nested(tok):
-            _check_script(inner, cwd, roots, depth + 1)
-        hit = _path_hit(tok, cwd, roots)
+            _check_script(inner, ctx, depth + 1)
+        hit = _path_hit(tok, cwd, ctx.roots)
         if hit:
             raise _Deny(_path_reason(hit))
 
@@ -186,26 +213,89 @@ def _check_segment(tokens: list[str], cwd: Path, roots: list[str], depth: int) -
     if name == "find":
         candidates |= {j + 1 for j in range(i, len(tokens) - 1) if tokens[j] in FIND_EXEC}
     if name == "eval":
-        _check_script(" ".join(tokens[i + 1:]), cwd, roots, depth + 1)
+        _check_script(" ".join(tokens[i + 1:]), ctx, depth + 1)
 
     for j in sorted(candidates):
         n = _base(tokens[j])
+        if n == HELPER:
+            if not (ctx.helper and depth == 0 and j == 0):
+                raise _Deny("wshub в задаче — только помощник хаба (wshub push, wshub forge) и только командой "
+                            "целиком: одно звено, без обёрток, присваиваний, $, обратных кавычек и перенаправлений")
+            _check_helper(tokens, ctx)
+            return
         if n in NET_TOOLS:
             raise _Deny(f"сетевой клиент {n} в задачах wshub-code запрещён: сети у задачи нет")
         if n in PRIV:
             raise _Deny(f"{n}: повышение прав в задачах wshub-code запрещено")
         if n in SHELLS:
-            _check_shell(tokens, j, cwd, roots, depth)
+            _check_shell(tokens, j, ctx, depth)
         if n in INTERPRETERS:
             _check_interpreter(tokens, j)
         if n in DOCKER:
             _check_docker(tokens, j, cwd)
     for j, tok in enumerate(tokens):  # git в любой позиции: обёртки, которые обёртка не распознала
         if _is_git(tok):
-            _check_git(tokens, j)
+            _check_git(tokens, j, ctx)
 
 
-def _check_shell(tokens: list[str], j: int, cwd: Path, roots: list[str], depth: int) -> None:
+def _helper_call(command: str) -> bool:
+    """Вся команда — один вызов помощника хаба: wshub push|forge … Одно звено без обёрток и присваиваний, без $,
+    обратных кавычек, переводов строки, перенаправлений и фона. Помощник идёт вне песочницы (sandbox_exclude), и
+    рядом с ним в той же команде не должно быть ничего."""
+    if any(c in command for c in "$`\n\r"):
+        return False
+    lex = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    lex.commenters = ""
+    toks = list(lex)
+    if any(t and set(t) <= PUNCT for t in toks):  # ; & | > < ( ) в любом виде, кроме как внутри кавычек
+        return False
+    return len(toks) >= 2 and _base(toks[0]) == HELPER and toks[1] in HELPER_SUBS
+
+
+def _check_helper(tokens: list[str], ctx: _Ctx) -> None:
+    """Помощник хаба, уже проверенный по форме (_helper_call): профиль для push и путь --out."""
+    sub = tokens[1]
+    if sub == "push" and ctx.profile != "task":
+        raise _Deny("wshub push — только в профиле task: пушит задача, которая пишет код")
+    for idx, t in enumerate(tokens[2:], 2):
+        if t == "--out" or t.startswith("--out="):
+            val = t.split("=", 1)[1] if "=" in t else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
+            _check_write_path(f"wshub {sub} --out", val, ctx)
+
+
+def _check_write_path(label: str, val: str, ctx: _Ctx) -> None:
+    """Файл, который пишет «читающая» команда (git --output, wshub forge --out): только в пишущем профиле, внутри
+    рабочего каталога (review — внутри .agents/), не в .git; путь явный — без переменных, шаблонов и ~."""
+    if ctx.profile not in WRITE_PROFILES:
+        raise _Deny(f"{label} пишет файл — в читающем профиле запрещено")
+    if not val or any(c in val for c in "$`*?[~"):
+        raise _Deny(f"{label}: нужен явный путь к файлу — без переменных, шаблонов и ~")
+    base = os.path.normpath(str(ctx.cwd))
+    area = base if ctx.profile == "task" else os.path.join(base, ".agents")
+    where = "рабочего каталога задачи" if ctx.profile == "task" else ".agents/ рабочего каталога"
+    p = os.path.normpath(val if os.path.isabs(val) else os.path.join(base, val))
+    real, real_area = os.path.realpath(p), os.path.realpath(area)
+    if not p.startswith(area + "/") or not real.startswith(real_area + "/"):
+        raise _Deny(f"{label} {val}: файл — только внутри {where}")
+    if any(part.lower() == ".git" for part in os.path.relpath(p, base).split("/")):
+        raise _Deny(f"{label} {val}: запись в .git запрещена")
+
+
+def _check_git_remote(args: list[str]) -> None:
+    """git remote — только чтение: без аргументов, -v, get-url <имя> [--push | --all]."""
+    rest = [a for a in args if a not in GIT_REMOTE_READ_FLAGS]
+    if not rest:
+        return
+    if rest[0] == "get-url":
+        names = [a for a in rest[1:] if a not in GIT_REMOTE_GETURL_FLAGS]
+        if len(names) == 1 and not names[0].startswith("-") and "$" not in names[0]:
+            return
+    raise _Deny("git remote: в задачах — только чтение (git remote, git remote -v, git remote get-url <имя>); "
+                "show ходит в сеть, остальное меняет remote")
+
+
+def _check_shell(tokens: list[str], j: int, ctx: _Ctx, depth: int) -> None:
     args = tokens[j + 1:]
     k = 0
     while k < len(args) and args[k].startswith("-") and args[k] != "--":
@@ -213,13 +303,13 @@ def _check_shell(tokens: list[str], j: int, cwd: Path, roots: list[str], depth: 
         if not opt.startswith("--") and "c" in opt[1:]:  # -c, -lc, -ec …
             if k + 1 >= len(args):
                 raise _Deny("оболочка с -c без команды — отказ")
-            _check_script(args[k + 1], cwd, roots, depth + 1)
+            _check_script(args[k + 1], ctx, depth + 1)
             return
         k += 1
     if "<<<" in args:
         idx = args.index("<<<")
         if idx + 1 < len(args):
-            _check_script(args[idx + 1], cwd, roots, depth + 1)
+            _check_script(args[idx + 1], ctx, depth + 1)
             return
     rest = [a for a in args[k:] if a != "--"]
     if not rest or rest[0] in ("-", "/dev/stdin") or set(rest[0]) <= set("<>"):
@@ -242,7 +332,7 @@ def _is_git(tok: str) -> bool:
     return n == "git" or n.startswith("git-")
 
 
-def _check_git(tokens: list[str], j: int) -> None:
+def _check_git(tokens: list[str], j: int, ctx: _Ctx) -> None:
     for t in tokens[:j]:
         m = GIT_ENV_DENY.match(t)
         if m:
@@ -253,7 +343,7 @@ def _check_git(tokens: list[str], j: int) -> None:
         sub = n[4:]
         if sub in GIT_DENY or sub.startswith("remote") or sub == "config":
             raise _Deny(f"{n}: {_git_reason(sub)}")
-        _check_git_args(sub, tokens[j + 1:])
+        _check_git_args(sub, tokens[j + 1:], ctx)
         return
     k = j + 1
     while k < len(tokens):
@@ -274,22 +364,28 @@ def _check_git(tokens: list[str], j: int) -> None:
     sub = tokens[k]
     if "$" in sub or any(c in sub for c in "*?["):
         raise _Deny("подкоманда git собрана из переменной или шаблона — хук не может её проверить, отказ")
+    if sub == "remote":
+        _check_git_remote(tokens[k + 1:])
+        return
     if sub in GIT_DENY:
         raise _Deny(f"git {sub}: {_git_reason(sub)}")
     if sub == "config":
         args = set(tokens[k + 1:])
         if args & GIT_CONFIG_WRITE or not args & GIT_CONFIG_READ:
             raise _Deny("git config: в задачах разрешено только чтение (--get, --list)")
-    _check_git_args(sub, tokens[k + 1:])
+    _check_git_args(sub, tokens[k + 1:], ctx)
 
 
-def _check_git_args(sub: str, args: list[str]) -> None:
-    """Опции подкоманды, которые пишут файл или запускают программу. После «--» — пути, не опции."""
-    for t in args:
+def _check_git_args(sub: str, args: list[str], ctx: _Ctx) -> None:
+    """Опции подкоманды, которые пишут файл или запускают программу. После «--» — пути, не опции.
+    --output: git принимает только точное имя — сокращения неоднозначны с --output-indicator-*."""
+    for idx, t in enumerate(args):
         if t == "--":
             return
         if t == "--output" or t.startswith("--output="):
-            raise _Deny(f"git {sub} --output пишет файл — в задачах запрещено")
+            val = t.split("=", 1)[1] if "=" in t else (args[idx + 1] if idx + 1 < len(args) else "")
+            _check_write_path(f"git {sub} --output", val, ctx)
+            continue
         if sub != "grep" or not t.startswith("-") or t == "-":
             continue
         if t.startswith("--"):
@@ -446,7 +542,8 @@ def _check_mount_source(src: str, cwd: Path, label: str) -> None:
 
 def _git_reason(sub: str) -> str:
     if sub == "push":
-        return "пушит оператор, в задачах wshub-code пуш запрещён"
+        return ("голый git push в задачах запрещён: пуш — только помощником хаба wshub push, если его разрешают "
+                "регламент проекта и задача")
     if sub in ("fetch", "pull", "ls-remote", "submodule"):
         return "сети у задачи нет; свежие ветки подтягивает хаб перед стартом (prefetch)"
     if sub == "clean":
@@ -557,18 +654,23 @@ def _path_reason(root: str) -> str:
 # ---------- точка входа ----------
 
 def main(argv: list[str], stdin=None, stderr=None) -> int:
-    """argv — служебные каталоги wshub (как их передаёт settings.json). 0 — разрешить, 2 — отказ (причина
-    в stderr). Любая ошибка — 2."""
+    """argv — [--profile <профиль>] и служебные каталоги wshub (как их передаёт settings.json). 0 — разрешить,
+    2 — отказ (причина в stderr). Любая ошибка — 2."""
     stdin = stdin or sys.stdin
     stderr = stderr or sys.stderr
     try:
+        args, profile = list(argv), None
+        if args and args[0] == "--profile":
+            if len(args) < 2 or not args[1] or args[1].startswith("-"):
+                raise ValueError("--profile без значения")
+            profile, args = args[1], args[2:]
         event = json.loads(stdin.read())
         if event.get("tool_name") != "Bash":
             return 0
         command = event["tool_input"]["command"]
         if not isinstance(command, str):
             raise TypeError("tool_input.command — не строка")
-        reason = check(command, str(event.get("cwd") or "."), [Path(p) for p in argv])
+        reason = check(command, str(event.get("cwd") or "."), [Path(p) for p in args], profile)
     except Exception as e:  # noqa: BLE001 — fail closed
         reason = f"хук не разобрал событие: {e}"
     if reason is None:
@@ -577,5 +679,5 @@ def main(argv: list[str], stdin=None, stderr=None) -> int:
     return 2
 
 
-if __name__ == "__main__":  # python -m wshub.hook <каталоги>: без тяжёлых импортов сервера
+if __name__ == "__main__":  # python -m wshub.hook [--profile P] <каталоги>: без тяжёлых импортов сервера
     sys.exit(main(sys.argv[1:]))

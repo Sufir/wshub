@@ -219,6 +219,8 @@ wshub code start <проект> <ТЗ>  — запустить задачу Clau
 wshub code status [job]   — список последних задач или снимок одной
 wshub code result <job>   — итог задачи
 wshub code stop <job>|--all     — остановить задачу
+wshub push <remote> <ветка>      — помощник задачи Claude Code: пуш по регламенту проекта (только внутри задачи)
+wshub forge <метод> <путь>       — помощник задачи Claude Code: API хостинга по регламенту (только внутри задачи)
 wshub code-run <job>      — служебная: надзиратель задачи (запускает хаб, вручную не вызывается)
 wshub code-hook <кат>…    — служебная: PreToolUse-хук Bash (ставится в settings.json как python -m wshub.hook)
 wshub --version           — версия и коммит"""
@@ -248,6 +250,9 @@ def main(argv: list[str] | None = None) -> None:
     if cmd in ("setup", "uninstall", "update"):
         from .install import cli
         sys.exit(cli(cmd, rest, config, state))
+    if cmd in ("push", "forge"):  # помощник хаба для задач Claude Code (ТЗ WSH-3.4, А3)
+        from .helper import main as helper_main
+        sys.exit(helper_main(cmd, rest, config, state))
     if cmd in ("code", "code-run", "code-hook", "code-kill"):
         from .code_cli import code_main
         sys.exit(code_main(cmd, rest, config, state))

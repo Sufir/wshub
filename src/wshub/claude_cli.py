@@ -21,11 +21,22 @@ from .registry import CodeGlobal, ProjectCode
 from .runtime import atomic_write_text
 
 SUBAGENT_TOOL = "Task"  # так инструмент называется в init.tools у 2.1.291; в документации Agent — алиас
-FILE_TOOLS = ("Read", "Edit", "Write", "Grep", "Glob", "NotebookEdit")
+FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "NotebookEdit")  # Grep нет в init.tools у 2.1.291 (WSH-3.4, А4.6)
 RECON_BASH = ("git status *", "git log *", "git show *", "git diff *", "git grep *")
 TASK_BASH = ("git add *", "git commit *", "git switch *", "git branch *", "git rev-parse *", "git rev-list *",
              "git merge --ff-only *", "git checkout *")
-DENY_BASH = ("git push *", "git remote *", "git clean *", "ssh *", "scp *", "sudo *", "curl *", "wget *")
+# git remote на чтение (ТЗ WSH-3.4, А4.2): правила — удобство, настоящая граница — хук
+GIT_REMOTE_READ = ("git remote", "git remote -v", "git remote get-url *")
+GIT_REMOTE_DENY = tuple(f"git remote {s} *" for s in ("add", "set-url", "remove", "rm", "rename", "prune", "update",
+                                                        "set-head", "set-branches", "show"))
+READ_BASH = (*RECON_BASH, *GIT_REMOTE_READ)  # git на чтение — всем профилям и фазе плана
+# фильтры в конвейере (А4.1): всем профилям и фазе плана; sort и uniq — только task
+FILTER_BASH = ("head *", "tail *", "wc *", "grep *", "cut *")
+TASK_FILTER_BASH = ("sort *", "uniq *")
+DENY_BASH = ("git push *", *GIT_REMOTE_DENY, "git clean *", "ssh *", "scp *", "sudo *", "curl *", "wget *")
+# помощник хаба (А3): вне песочницы и только с разрешением задачи; пуш — только профилю task
+HELPER_PUSH = "wshub push *"
+HELPER_FORGE = "wshub forge *"
 ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ", "DOCKER_HOST", "DOCKER_CONFIG")
 # исполняемая часть git: Code её не меняет — иначе git хаба (вне песочницы) запустит его программу
 GIT_PROTECTED = (".git/config", ".git/hooks", ".git/info", ".git/modules")
@@ -73,21 +84,25 @@ def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home:
 
 def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
              data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path, phase: str | None = None,
-             read_extra: list[str] = ()) -> dict:
+             read_extra: list[str] = (), grants: dict | None = None) -> dict:
     """settings.json задачи. cwd — dir (рабочий каталог Code), task_rel — путь к ТЗ от него; protected — все
     служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук).
     phase="plan" — фаза плана (ТЗ WSH-3, решение 5): отличие от эталона профиля — ровно plan_overrides.
-    read_extra — абсолютные пути и шаблоны, проверенные jobs (ТЗ WSH-3.1, п. 2.2): Read вне cwd."""
+    read_extra — абсолютные пути и шаблоны, проверенные jobs (ТЗ WSH-3.1, п. 2.2): Read вне cwd.
+    grants — разрешения задачи {push, forge} (ТЗ WSH-3.4, А3.5): помощник в allow и excludedCommands — только с ними."""
     if RULE_UNSAFE.search(task_rel):
         raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
-    allow = ["Read(./**)", *_read_extra_rules(read_extra), f"Edit(./{task_rel})", *(f"Bash({c})" for c in RECON_BASH)]
+    allow = ["Read(./**)", *_read_extra_rules(read_extra), f"Edit(./{task_rel})",
+             *(f"Bash({c})" for c in (*READ_BASH, *FILTER_BASH))]
     if profile == "task":
-        allow += ["Edit(./**)", SUBAGENT_TOOL, *(f"Bash({c})" for c in TASK_BASH),
+        allow += ["Edit(./**)", SUBAGENT_TOOL, *(f"Bash({c})" for c in (*TASK_BASH, *TASK_FILTER_BASH)),
                   *(f"Bash({c})" for c in proj.bash_allow)]
     elif profile == "review":
         allow += ["Edit(./.agents/**)", SUBAGENT_TOOL]
     elif profile != "recon":
         raise CliError(f"неизвестный профиль {profile}")
+    helper = helper_commands(profile, grants)
+    allow += [f"Bash({c})" for c in helper]
     deny = [*(f"Bash({c})" for c in DENY_BASH), "Read(**/.env*)", "WebFetch", "WebSearch",
             *(f"Edit({m})" for m in proj.deny_edit),
             *(f"Edit(./{g}{'' if g.endswith('config') else '/**'})" for g in GIT_PROTECTED)]
@@ -102,7 +117,8 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
             "allowUnsandboxedCommands": False,
             "autoAllowBashIfSandboxed": False,  # Bash — только по allow-правилам профиля
             # читающие профили никого не выпускают из песочницы (решение 9.2, правка 2026-10-14)
-            "excludedCommands": list(proj.sandbox_exclude) if profile == "task" else [],
+            # помощник хаба — вне песочницы при разрешении задачи (ТЗ WSH-3.4, А3.5): форму держит хук
+            "excludedCommands": [*(proj.sandbox_exclude if profile == "task" else ()), *helper],
             "network": {"allowedDomains": [*glob.network, *proj.network]},
             "filesystem": {
                 # служебные каталоги wshub — абсолютными путями тоже: при нестандартном WSHUB_STATE/CONFIG
@@ -119,7 +135,9 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
         # хук запускается на каждую Bash-команду: python -m wshub.hook (~0.03 с) без тяжёлых импортов сервера
         "hooks": {"PreToolUse": [{"matcher": "Bash",
                                   "hooks": [{"type": "command",
-                                             "command": shlex.join([*hook_cmd, *map(str, data_dirs)])}]}]},
+                                             "command": shlex.join([*hook_cmd, "--profile",
+                                                                    "plan" if phase == "plan" else profile,
+                                                                    *map(str, data_dirs)])}]}]},
     }
     if proj.claude_md_excludes:
         data["claudeMdExcludes"] = list(proj.claude_md_excludes)
@@ -138,8 +156,15 @@ def plan_overrides(data: dict, read_extra: list[str] = ()) -> None:
     data["useAutoModeDuringPlan"] = False
     data["permissions"]["disableAutoMode"] = "disable"
     data["permissions"]["allow"] = ["Read(./**)", *_read_extra_rules(read_extra),
-                                    *(f"Bash({c})" for c in RECON_BASH)]
+                                    *(f"Bash({c})" for c in (*READ_BASH, *FILTER_BASH))]
     data["sandbox"]["excludedCommands"] = []
+
+
+def helper_commands(profile: str, grants: dict | None) -> list[str]:
+    """Правила помощника хаба по разрешениям задачи: пуш — только профилю task, API хостинга — любому."""
+    g = grants or {}
+    return [*([HELPER_PUSH] if g.get("push") and profile == "task" else []),
+            *([HELPER_FORGE] if g.get("forge") else [])]
 
 
 def _read_extra_rules(read_extra: list[str]) -> list[str]:

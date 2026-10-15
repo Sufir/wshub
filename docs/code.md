@@ -29,7 +29,7 @@ deny_read = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.config/wshub", "~/.local/state/
              "~/.claude/.credentials.json", "~/.claude.json"]
 pass_env = []            # имена переменных окружения сверх белого списка (секреты запрещены)
 
-[workspace.payload.code]
+[workspace.team-service.code]
 enabled = true
 dirs = ["org", "journal"]         # где можно запускать; каждый dir — КОРЕНЬ git-репозитория (есть .git)
 prompts = ".agents/templates/code-prompts"  # каталог шаблонов промптов, от корня проекта
@@ -47,7 +47,7 @@ status_regex = '\*\*Статус:\*\*\s*(\S+)'   # как найти стату�
 bash_allow = ["docker compose run --rm migrations"]   # добавка к allow профиля task
 sandbox_exclude = ["docker compose run --rm migrations"]   # команды вне песочницы
 network = []                      # добавка к [code].network
-deny_read = ["~/.config/payload"] # добавка к [code].deny_read
+deny_read = ["~/.config/team-service"] # добавка к [code].deny_read
 allow_read = []                   # sandbox.filesystem.allowRead сверх рабочего каталога и настроек git
 deny_edit = ["docker-compose*.yml", "Dockerfile*", ".gitlab-ci.yml"]
 claude_md_excludes = []           # claudeMdExcludes
@@ -55,6 +55,9 @@ read_extra = ["CLAUDE.md", ".agents/*.md"]   # Read вне dir: пути и glob
 plan_budget_share = 0.3           # доля бюджета задачи на фазу плана
 plan_max_turns = 40               # ходы фазы плана
 execute_prompt = "execute"        # шаблон фазы исполнения в каталоге prompts
+push = "no"                       # пуш: no | task | always (раздел «Пуш и API хостинга»)
+push_protect = ["main", "master"] # куда пуш запрещён всегда
+forge_access = "no"               # API хостинга: no | task | always; при доступе нужны forge и forge_token
 
 [[code.policy]]                   # строка политики для всех проектов (сильнее встроенной)
 profile = "task"
@@ -66,7 +69,7 @@ plan = "auto"
 plan_model = "opus"
 plan_effort = "high"
 
-[[workspace.payload.code.policy]] # строка политики проекта (сильнее глобальной)
+[[workspace.team-service.code.policy]] # строка политики проекта (сильнее глобальной)
 profile = "task"
 size = "M"
 risk = "high"
@@ -80,7 +83,8 @@ plan_effort = "high"
 Умолчания: `enabled = false`; при `enabled = true` обязательны `dirs` и `prompts`; `profiles` — все три;
 `model_min = "haiku"`, `model_max = "opus"`, `effort_max = "high"`, `max_turns = 100`, `max_budget_usd = 10`,
 `daily_budget_usd = 30`, `max_parallel = 1`, `max_hours = 4`, `prefetch = false`, `plan_budget_share = 0.3`,
-`plan_max_turns = 40`, `execute_prompt = "execute"`; списки пустые. Каждый
+`plan_max_turns = 40`, `execute_prompt = "execute"`, `push = "no"`, `push_protect = ["main", "master"]`,
+`forge_access = "no"`, `forge_write = false`; списки пустые. Каждый
 элемент `dirs` после `resolve()` лежит внутри корня проекта, существует и строго не пересекается со
 служебными каталогами wshub (код, реестр, состояние) — иначе ошибка реестра для `wshub-code`.
 
@@ -225,22 +229,37 @@ header. У источника `policy` канала нет. **`choice_fields`** 
 | профиль | что разрешено дополнительно к чтению и git-чтению |
 |---|---|
 | recon | правит только файл ТЗ (`Edit(./<ТЗ>)`) |
-| task | `Edit(./**)`, субагенты, git add/commit/switch/branch/checkout/merge --ff-only, `bash_allow` проекта |
+| task | `Edit(./**)`, субагенты, git add/commit/switch/branch/checkout/merge --ff-only, `sort`, `uniq`, `bash_allow` проекта |
 | review | `Edit(./.agents/**)`, субагенты |
+
+Всем профилям и фазе плана: git на чтение (`status`, `log`, `show`, `diff`, `grep`; `git remote`, `git remote -v`,
+`git remote get-url …`) и фильтры конвейера `head`, `tail`, `wc`, `grep`, `cut` — `git log --oneline | tail -50`
+проходит. Встроенных Grep и Glob у claude 2.1.291 нет (в `init.tools` их нет): поиск — `git grep` или `grep`.
 
 Ограничения держат четыре слоя, ни один не зависит от текста промпта:
 
 1. **Правила permissions.** Файловые инструменты — только с путём от рабочего каталога (`Read(./**)` и
    нужный `Edit(...)`); голых правил без пути нет. Для каждого пути из `deny_read` и каждого служебного
-   каталога wshub — deny `Read` и `Edit`. deny всех профилей: `git push/remote/clean`, `ssh`, `scp`, `sudo`,
-   `curl`, `wget`, `Read(**/.env*)`, `WebFetch`, `WebSearch`, маски `deny_edit`.
+   каталога wshub — deny `Read` и `Edit`. deny всех профилей: `git push`, `git clean`, `git remote` с
+   `add`, `set-url`, `remove`, `rm`, `rename`, `prune`, `update`, `set-head`, `set-branches`, `show`, `ssh`, `scp`,
+   `sudo`, `curl`, `wget`, `Read(**/.env*)`, `WebFetch`, `WebSearch`, маски `deny_edit`.
 2. **Песочница** (`sandbox`, нужны bwrap и socat). Включена, `failIfUnavailable: true`,
    `allowUnsandboxedCommands: false`, `autoAllowBashIfSandboxed: false` — Bash идёт только по allow-правилам.
    Сеть — только `network`. Чтение сужено: `denyRead` включает `~/` и `/mnt/`, `allowRead` открывает рабочий
    каталог, `~/.gitconfig`, `~/.config/git/` и `allow_read` проекта. Запись: у всех профилей и в фазе плана
    закрыты `./.git/config`, `./.git/hooks`, `./.git/info`, `./.git/modules` (`denyWrite` и deny `Edit`), запись
-   вне рабочего каталога закрыта песочницей. `excludedCommands` у `recon` и `review` пуст: `sandbox_exclude`
-   проекта действует только в `task`.
+   вне рабочего каталога закрыта песочницей. `sandbox_exclude` проекта действует только в `task`; у `recon` и
+   `review` в `excludedCommands` — только помощник хаба при разрешении задачи (раздел «Пуш и API хостинга»).
+
+   **Точки монтирования песочницы** (`.bash_profile`, `.bashrc`, `.gitconfig`, `.gitmodules`, `.idea`,
+   `.mcp.json`, `.profile`, `.ripgreprc`, `.vscode`, `.zprofile`, `.zshrc` и под `.claude/`: `agents`,
+   `commands`, `hooks`, `launch.json`, `loop.md`, `output-styles`, `routines`, `scheduled_tasks.json`,
+   `settings.json`, `settings.local.json`, `skills`, `workflows` — список claude 2.1.291; bwrap монтирует
+   `/dev/null` на месте несуществующих) хаб при старте задачи прячет помеченным блоком в `.git/info/exclude`
+   (`/путь` — от корня репозитория): `git status` во время прогона чистый, `git add -A` проходит. Отслеживаемых
+   файлов блок не касается. Блок заменяется при каждом старте, чужие строки файла не
+   трогаются. Побочный эффект: неотслеживаемый файл с таким именем в корне репозитория git тоже не видит —
+   добавить его в репозиторий можно `git add -f`.
 
    **Запись у читающих профилей** (`recon`, `review`, фаза плана) закрывают права и хук, а не песочница:
    Bash — только git на чтение из allow (остальное — отказ в `dontAsk` и в фазе плана без auto mode);
@@ -252,7 +271,7 @@ header. У источника `policy` канала нет. **`choice_fields`** 
    песочницы.
 
    **`read_extra`** — что ещё, кроме рабочего каталога, можно читать встроенными файловыми инструментами
-   (Read, Grep, Glob): пути и glob от корня проекта, например правила проекта в Payload —
+   (Read): пути и glob от корня проекта, например правила проекта —
    `read_extra = ["CLAUDE.md", ".agents/*.md"]`. Каждый элемент даёт allow `Read(//<абсолютный путь>)` во всех
    профилях и в фазе плана; база (часть пути до первого компонента с `*`) берётся после `resolve()`.
    Содержимое каталога — `dir/*`, глубже — `dir/*/*`; элемент `dir` даёт правило только на сам путь. В `allowRead` песочницы элементы не попадают: Bash
@@ -265,10 +284,15 @@ header. У источника `policy` канала нет. **`choice_fields`** 
    `resolve()` проверяется так же, как база: симлинк наружу или в служебный каталог — отказ. Файлы и
    симлинки, появившиеся после старта задачи, эта проверка не видит — остаточный риск. По умолчанию список
    пуст — лишних правил нет.
-3. **Хук** на Bash (`python -m wshub.hook`) закрывает формы, которые правила по тексту не ловят (git push в
-   подстановке, сетевые утилиты, пути к служебным каталогам; `--output` у любой подкоманды git; `-O` /
-   `--open-files-in-pager` у `git grep`, включая сокращения и склейки; `GIT_*`, `PAGER`, `LESSOPEN`,
-   `LESSCLOSE` перед git). Ошибка разбора — отказ.
+3. **Хук** на Bash (`python -m wshub.hook --profile <профиль> <служебные каталоги…>`; фаза плана —
+   `--profile plan`) закрывает формы, которые правила по тексту не ловят (git push в подстановке, сетевые
+   утилиты, пути к служебным каталогам; `git remote` кроме чтения; `-O` / `--open-files-in-pager` у `git grep`,
+   включая сокращения и склейки; `GIT_*`, `PAGER`, `LESSOPEN`, `LESSCLOSE` перед git). `--output` у
+   `log`/`show`/`diff` — в `task` только в файл внутри рабочего каталога и не в `.git`, в `review` — только
+   внутри `.agents/`, у остальных — отказ; путь явный, проверка по `normpath` и `realpath`. Помощник хаба
+   `wshub push` / `wshub forge` — только командой целиком (одно звено, без обёрток, присваиваний, `$`,
+   обратных кавычек и перенаправлений), `wshub push` — только в `task`, другие подкоманды `wshub` — отказ.
+   Без `--profile` хук ведёт себя как у читающего профиля. Ошибка разбора — отказ.
 
    **Пол docker** — пятый пункт хука. Для `docker` и `docker compose` отказ, если команда монтирует не
    именованный том и не абсолютный путь внутри рабочего каталога задачи (`-v`, `--volume`, `--mount`, склейки
@@ -283,9 +307,11 @@ header. У источника `policy` канала нет. **`choice_fields`** 
    этот пол — их единственная граница.
 4. **Окружение** — белый список: `HOME`, `USER`, `LOGNAME`, `PATH`, `LANG`, `LC_*`, `TZ`, `DOCKER_HOST`,
    `DOCKER_CONFIG`, плюс `pass_env`; `TERM=dumb`. Секретов (`SSH_AUTH_SOCK`, имена с `TOKEN`/`SECRET`/
-   `PASSWORD`/`KEY`) нет даже из `pass_env`. SSH-агента у Code нет — запушить нечем.
+   `PASSWORD`/`KEY`) нет даже из `pass_env`. SSH-агента и токенов у Code нет. Хаб добавляет `WSHUB_JOB`,
+   `WSHUB_CONFIG` и `WSHUB_STATE` — по ним помощник находит задачу; это не секреты.
 
-Пуш невозможен: запрет держат правила, хук, песочница без сети к git-хосту и окружение без ключей.
+Голый `git push` и `curl` невозможны: запрет держат правила, хук, песочница без сети к git-хосту и окружение
+без ключей. Пуш и API хостинга — только помощником хаба по регламенту проекта (раздел ниже).
 
 ### git силами хаба
 
@@ -307,7 +333,9 @@ header. У источника `policy` канала нет. **`choice_fields`** 
   `remote.*.uploadpack`, `remote.*.receivepack`, `protocol.*.allow`, `protocol.allow`, `url.*.insteadOf`,
   `url.*.pushInsteadOf`, `hook.*`, `gc.recentObjectsHook`, `core.alternateRefsCommand`, `remote.*.vcs`,
   `gpg.program`, `gpg.*.program`, `gpg.ssh.defaultKeyCommand`), git не запускается: задача `failed`, причина
-  `git_config_unsafe`. Если `.git` — файл (worktree) или рядом есть `.git/commondir`, prefetch и снимок в v0
+  `git_config_unsafe`. Текст отказа называет ключ, значение (учётные данные в адресе — `***`, не длиннее 200
+  символов) и способ починки: `core.hookspath = /path/… — исправь: git -C <репозиторий> config --unset-all
+  core.hookspath или укажи верное значение`. Если `.git` — файл (worktree) или рядом есть `.git/commondir`, prefetch и снимок в v0
   отклоняются.
 
 Команды docker выполняются вне песочницы только через `sandbox_exclude` проекта (только профиль `task`),
@@ -326,6 +354,135 @@ header. У источника `policy` канала нет. **`choice_fields`** 
 (том с `type=none,o=bind` на любой каталог хоста), запись в репозиторий и в `.git` через смонтированный рабочий
 каталог — контейнер пишет туда мимо песочницы и `denyWrite`. Последнее делает видимым блок «Вне кода» (ниже).
 Вернуться к этим путям, если Code начнёт работать с чужим кодом с правом на запись.
+
+## Пуш и API хостинга
+
+Голый `git push` и `curl` у задачи закрыты всегда. Пушит и ходит в API хостинга репозитория (GitLab, GitHub)
+помощник хаба — `wshub push` и `wshub forge`: Code вызывает его из Bash, помощник идёт вне песочницы и для git и
+API — единственный путь в сеть. Что можно, задаёт регламент проекта в реестре; разрешение даётся задаче.
+
+**Регламент** — ключи `[workspace.<имя>.code]`:
+
+| ключ | значения | по умолчанию | смысл |
+|---|---|---|---|
+| `push` | `no` / `task` / `always` | `no` | `no` — пуш закрыт; `task` — только задаче с разрешением; `always` — любой задаче профиля `task` |
+| `push_protect` | список шаблонов веток | `["main", "master"]` | куда пуш запрещён всегда (`fnmatch`: `release/*`) |
+| `forge` | `gitlab` / `github` | — | тип хостинга: заголовок токена, адрес API по умолчанию, встроенные запреты |
+| `forge_access` | `no` / `task` / `always` | `no` | доступ к API хостинга через хаб, как у `push` |
+| `forge_write` | `true` / `false` | `false` | POST, PUT, PATCH: заметки, создание и правка MR/PR. DELETE — никогда |
+| `forge_url` | `https://…` | `github` — `https://api.github.com`; `gitlab` — нет | адрес API; для `gitlab` обязателен (`http://` — только `localhost`) |
+| `forge_token` | путь к файлу, `~` раскрывается | — | обязателен, если `forge_access` не `no` |
+
+Неверное значение, `forge_access` не `no` без `forge` или без `forge_token`, `gitlab` без `forge_url` —
+ошибка секции проекта. Файл токена проверяется при старте задачи с доступом к API: обычный файл, владелец —
+пользователь, права не шире `0600`; иначе отказ с текстом, как исправить. `code_projects` показывает
+регламент и путь к токену; значение токена — никогда.
+
+```toml
+# проект на GitLab: пуш по разрешению на задачу, токен только на чтение
+[workspace.team-service.code]
+push = "task"
+push_protect = ["master", "dev"]
+forge = "gitlab"
+forge_access = "task"
+forge_url = "https://gitlab.example.com"
+forge_token = "~/.config/team-service/gitlab.token"
+
+# личный проект на GitHub: пуш в любые ветки, кроме main; PR через API
+[workspace.pet-project.code]
+push = "always"
+forge = "github"
+forge_access = "always"
+forge_write = true
+forge_token = "~/.config/pet-project/github.token"
+```
+
+**Разрешение задачи** — параметры `push` и `forge` у `code_start` и `code_resume`:
+
+- регламент `task` — разрешение только с `reason` ≥ 15 символов: кто разрешил и когда («оператор в чате 15.10:
+  запушить и открыть MR»); `always` — разрешение действует само (в `grants` помечено `auto` и после смены
+  регламента на `task` не наследуется); `no` — отказ «в проекте <имя> пуш закрыт
+  реестром (push = no)»;
+- пуш — только задаче профиля `task` и только в фазе исполнения; API хостинга — любому профилю (разведке
+  бывает нужно прочитать MR); в фазе плана помощника нет;
+- разрешения пишутся в `job.json` (`grants: {push, forge, reason}`), их наследуют звенья цепочки (план →
+  исполнение, переделка плана) и `code_resume`; `code_resume` может добавить новое — так работает «задача
+  принята, оператор говорит „запушь“» → `code_resume(push=true, reason=…)`. Если регламент с тех пор стал
+  `no`, унаследованное разрешение снимается с предупреждением;
+- строки `code_start` в журнале — с разрешениями и `reason`.
+
+Слова в тексте ТЗ разрешением не являются. Хаб не может проверить, что оператор действительно разрешил,
+поэтому `reason` пишется в журнал, а итог и карточка задачи показывают разрешение.
+
+**Settings задачи.** С разрешением — `Bash(wshub push *)` / `Bash(wshub forge *)` в allow и та же строка в
+`sandbox.excludedCommands`; без разрешения — ни того, ни другого.
+
+**Команды помощника.** Хаб передаёт claude `WSHUB_JOB=<id>`. Помощник читает `job.json` и проверяет: задача
+идёт (`running`), его рабочий каталог — внутри рабочего каталога задачи, разрешение есть, регламент проекта в
+реестре его не закрыл. Любая проверка не прошла — отказ с причиной в stderr, код выхода 1.
+
+```sh
+wshub push <remote> <ветка> [-o ключ=значение]…
+wshub forge <GET|POST|PUT|PATCH> <путь> [--data <json-файл>] [--out <файл>]
+```
+
+`wshub push` от хостинга не зависит:
+
+- `remote` — имя из `git remote` репозитория; адрес вместо имени — отказ;
+- ветка — локальная, уходит на remote под тем же именем (`refs/heads/<ветка>:refs/heads/<ветка>`); форма
+  `src:dst`, `+`, `refs/…` — отказ; ветка из `push_protect` — отказ;
+- всегда `-u`, `--no-follow-tags`, `--recurse-submodules=no`; никогда force, delete, теги, `--all`,
+  `--mirror` — других опций, кроме `-o`, нет;
+- `-o` (push-опции) — как есть, например `-o merge_request.create` у GitLab; опции, в имени которых есть
+  `auto_merge` или `merge_when_pipeline_succeeds`, — отказ при любом регламенте: мерж — действие оператора;
+- `git push` идёт как git хаба: проверка `.git/config` по запретному списку, те же переопределения, кроме
+  `core.sshCommand` и `credential.helper` (учётные данные — обычные у пользователя: ssh или credential helper
+  из глобальной конфигурации git), таймаут 120 с. Вывод git — в stdout как есть: хостинг печатает в нём
+  ссылку на MR/PR;
+- если в окружении хаба при старте задачи есть `SSH_AUTH_SOCK`, хаб кладёт его в каталог задачи (Code туда не
+  видит), и помощник отдаёт его только этому `git push`. В окружение claude `SSH_AUTH_SOCK` не попадает.
+
+`wshub forge`:
+
+- методы: GET — всегда; POST, PUT, PATCH — только при `forge_write = true`; DELETE — никогда;
+- путь — от адреса API, начинается с `/`; без схемы, `//`, `..` (в том числе закодированных), `\`, `#` и
+  пробелов;
+- **пол** — при любом регламенте: API не мержит, не одобряет и не пишет в репозиторий (это делает `wshub push`
+  по `push_protect`). Запись (POST, PUT, PATCH) по этим путям — отказ; путь сверяется раскодированным и без
+  учёта регистра:
+  - `gitlab`: `…/merge_requests/<n>/merge`, `…/approve`, `…/unapprove`, `…/rebase`; всё под `…/repository/`
+    (commits, files, branches, tags, submodules и прочее); `…/protected_branches`, `…/protected_tags`;
+    `…/merge_trains`, `…/approvals`, `…/approval_rules`, `…/releases` (тег); выпуск учётных данных —
+    `…/access_tokens`, `…/personal_access_tokens`, `…/deploy_tokens`, `…/deploy_keys`, `/user/keys`;
+  - `github`: `…/pulls/<n>/merge`, `…/merges`, `…/pulls/<n>/reviews` (одобрение), `…/pulls/<n>/update-branch`,
+    `…/merge-upstream`, `…/contents/…`, `…/git/…`, `…/branches/<ветка>/…` (защита, переименование),
+    `…/rulesets`, `…/releases` (тег), `…/keys`, `…/gpg_keys`, `/graphql`. Комментарии к строкам — через
+    `…/pulls/<n>/comments` и `…/issues/<n>/comments`;
+  - конец сегмента — `/`, конец пути или `.`: суффикс формата GitLab (`…/merge.json`) пол не обходит;
+- токен читается из `forge_token` и не попадает ни в argv, ни в окружение, ни в вывод, ни в файлы: если ответ
+  его содержит, он заменяется на `***`; перенаправления помощник не выполняет (иначе заголовок с токеном ушёл
+  бы по `Location`);
+- ответ до 20 КБ — в stdout; больше — только с `--out <файл>` внутри рабочего каталога, не в `.git/`, не в
+  `.claude/`, не в точку монтирования песочницы и не по маске `deny_edit` проекта: помощник пишет вне
+  песочницы и повторяет её запреты сам; `--data` — JSON-файл до 1 МБ, тоже внутри рабочего каталога, не `.env*`; ответ 4xx/5xx — код и тело в stderr, код выхода 1;
+- `urllib` из стандартной библиотеки, без прокси из окружения, таймаут 30 с.
+
+Для GitHub PR создаётся через `wshub forge POST /repos/<владелец>/<репозиторий>/pulls --data pr.json`:
+push-опций для PR у GitHub нет. У GitLab MR создаёт сам пуш: `wshub push origin feat-x -o
+merge_request.create`.
+
+**Пресеты хостинга** — пакет `wshub.forges`, модуль на тип: заголовки токена (`gitlab` — `PRIVATE-TOKEN`;
+`github` — `Authorization: Bearer`, `Accept: application/vnd.github+json`), префикс пути (`gitlab` —
+`/api/v4`, добавляется, если его нет; `github` — от `forge_url`), адрес по умолчанию и пол. Новый хостинг —
+новый модуль с `PRESET` и строка в `PRESETS`; реестр, помощник и документация берут список типов оттуда. Пол
+— минимальный список, а не полное описание API: новый опасный путь, найденный на практике, добавляется в
+модуль пресета строкой и тестом.
+
+**Где видны внешние действия.** Каждый вызов помощника — строка в `<каталог задачи>/external.jsonl` и в
+журнале хаба (`wshub_push`, `wshub_forge`): время, команда, аргументы без секретов (значения push-опций вида
+`ci.variable=ИМЯ=значение` — `***`), код выхода, HTTP-статус, ссылка на MR/PR, если она есть в выводе.
+`code_result` показывает блок «Внешние действия» (`external`) по всем звеньям: пуши, вызовы API числом и
+последние 10, ссылки на MR/PR; там же — разрешения задачи (`grants`).
 
 ## Прозрачность
 
@@ -397,4 +554,5 @@ wshub code stats [project] [--days N]
 ```
 
 `wshub code` без аргументов — сам MCP-сервer (его запускает Desktop). `wshub code-run` и `wshub code-hook` —
-служебные (надзиратель задачи и хук Bash), вручную не вызываются.
+служебные (надзиратель задачи и хук Bash), вручную не вызываются. `wshub push` и `wshub forge` — помощник для
+задач (раздел «Пуш и API хостинга»), вне задачи отвечает отказом.

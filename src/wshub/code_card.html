@@ -76,7 +76,7 @@
 </div>
 <div class="end" id="end" hidden></div>
 <div class="bar">
-  <button id="cancel" class="danger" hidden>Отменить</button>
+  <button id="cancel" class="danger" disabled>Отменить</button>
   <button id="log">Журнал</button>
   <span id="note" class="muted"></span>
 </div>
@@ -244,7 +244,7 @@ function render(d) {
     : (d.billing === "подписка" ? "подписка" : "—");
   $("rate").textContent = d.rate ? Object.entries(d.rate).map(([k, v]) => (k === "five_hour" ? "5 ч" : k === "seven_day" ? "7 дн" : k) + " " + Math.round(v * 100) + "%").join(", ") : "—";
 
-  $("cancel").hidden = FINAL.includes(d.state);
+  $("cancel").disabled = FINAL.includes(d.state);  // конечное состояние — кнопка неактивна, а не скрыта
   renderEnd(d.end);
 }
 
@@ -347,7 +347,7 @@ $("cancel").addEventListener("click", async () => {
   } catch (e) {
     setNote(e.message, true);
   } finally {
-    $("cancel").disabled = false;
+    $("cancel").disabled = !!(data && FINAL.includes(data.state));
     $("cancel").textContent = "Отменить";
   }
 });

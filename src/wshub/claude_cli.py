@@ -21,7 +21,7 @@ from .registry import CodeGlobal, ProjectCode
 from .runtime import atomic_write_text
 
 SUBAGENT_TOOL = "Task"  # так инструмент называется в init.tools у 2.1.291; в документации Agent — алиас
-FILE_TOOLS = ("Read", "Edit", "Write", "Glob", "NotebookEdit")  # Grep нет в init.tools у 2.1.291 (WSH-3.4, А4.6)
+FILE_TOOLS = ("Read", "Edit", "Write", "NotebookEdit")  # Grep и Glob нет в init.tools у 2.1.291 (WSH-3.4)
 RECON_BASH = ("git status *", "git log *", "git show *", "git diff *", "git grep *")
 TASK_BASH = ("git add *", "git commit *", "git switch *", "git branch *", "git rev-parse *", "git rev-list *",
              "git merge --ff-only *", "git checkout *")
@@ -29,7 +29,8 @@ TASK_BASH = ("git add *", "git commit *", "git switch *", "git branch *", "git r
 GIT_REMOTE_READ = ("git remote", "git remote -v", "git remote get-url *")
 GIT_REMOTE_DENY = tuple(f"git remote {s} *" for s in ("add", "set-url", "remove", "rm", "rename", "prune", "update",
                                                         "set-head", "set-branches", "show"))
-READ_BASH = (*RECON_BASH, *GIT_REMOTE_READ)  # git на чтение — всем профилям и фазе плана
+# git на чтение и список файлов — всем профилям и фазе плана; ls и git ls-files вместо Glob (ревью WSH-3.4)
+READ_BASH = (*RECON_BASH, *GIT_REMOTE_READ, "git ls-files *", "ls *")
 # фильтры в конвейере (А4.1): всем профилям и фазе плана; sort и uniq — только task
 FILTER_BASH = ("head *", "tail *", "wc *", "grep *", "cut *")
 TASK_FILTER_BASH = ("sort *", "uniq *")
@@ -59,6 +60,12 @@ def wshub_cmd() -> list[str]:
     if exe and Path(sys.executable).parent == Path(exe).parent:  # тот же venv
         return [exe]
     return [sys.executable, "-m", "wshub"]
+
+
+def wshub_exe() -> str | None:
+    """Исполняемый файл wshub хаба — для помощника в задаче; None, если хаб запущен как python -m wshub."""
+    cmd = wshub_cmd()
+    return cmd[0] if len(cmd) == 1 and os.path.isabs(cmd[0]) else None
 
 
 def _abs_rule(p: str) -> str:

@@ -235,7 +235,8 @@ header. У источника `policy` канала нет. **`choice_fields`** 
 
 Всем профилям и фазе плана: git на чтение (`status`, `log`, `show`, `diff`, `grep`; `git remote`, `git remote -v`,
 `git remote get-url …`) и фильтры конвейера `head`, `tail`, `wc`, `grep`, `cut` — `git log --oneline | tail -50`
-проходит. Встроенных Grep и Glob у claude 2.1.291 нет (в `init.tools` их нет): поиск — `git grep` или `grep`.
+проходит; список файлов — `git ls-files` и `ls`. Встроенных Grep и Glob у claude 2.1.291 нет (в `init.tools` их
+нет): поиск — `git grep`/`grep`, список файлов — `git ls-files`/`ls`.
 
 Ограничения держат четыре слоя, ни один не зависит от текста промпта:
 
@@ -416,7 +417,11 @@ forge_token = "~/.config/pet-project/github.token"
 поэтому `reason` пишется в журнал, а итог и карточка задачи показывают разрешение.
 
 **Settings задачи.** С разрешением — `Bash(wshub push *)` / `Bash(wshub forge *)` в allow и та же строка в
-`sandbox.excludedCommands`; без разрешения — ни того, ни другого.
+`sandbox.excludedCommands`; без разрешения — ни того, ни другого. Правило называет `wshub` по имени, и вне
+песочницы запустится первый `wshub` из `PATH`, поэтому при разрешении `PATH` задачи начинается с каталога
+настоящего `wshub` хаба, а относительные элементы и каталоги внутри рабочего каталога задачи из него убраны.
+Если хаб запущен как `python -m wshub`, а не исполняемым файлом, разрешения `push` и `forge` не выдаются —
+отказ старта.
 
 **Команды помощника.** Хаб передаёт claude `WSHUB_JOB=<id>`. Помощник читает `job.json` и проверяет: задача
 идёт (`running`), его рабочий каталог — внутри рабочего каталога задачи, разрешение есть, регламент проекта в
@@ -445,12 +450,26 @@ wshub forge <GET|POST|PUT|PATCH> <путь> [--data <json-файл>] [--out <ф�
 
 `wshub forge`:
 
-- методы: GET — всегда; POST, PUT, PATCH — только при `forge_write = true`; DELETE — никогда;
+- методы: GET — всегда, кроме путей с секретами (ниже); POST, PUT, PATCH — только при `forge_write = true` и
+  только по списку пресета; DELETE — никогда;
+- **запись — по списку разрешений**: только MR/PR, issues и комментарии, всё прочее — отказ «запись через API —
+  только MR/PR, issues и комментарии». Путь сверяется сырым, целиком: проект/владелец/репозиторий — один
+  сегмент (у GitLab — числом или закодированным путём `group%2Frepo`), номера и id заметок — цифры, id
+  обсуждения — hex, суффикс `.json` допускается:
+  - `gitlab`, от `/api/v4/projects/<проект>/`: POST `merge_requests`; PUT `merge_requests/<iid>`; POST
+    `merge_requests/<iid>/notes`, `merge_requests/<iid>/discussions`, `merge_requests/<iid>/discussions/<id>/notes`;
+    POST `issues`; PUT `issues/<iid>`; POST `issues/<iid>/notes`;
+  - `github`, от `/repos/<владелец>/<репозиторий>/`: POST `pulls`; PATCH `pulls/<n>`; POST `pulls/<n>/comments`,
+    `pulls/<n>/comments/<id>/replies`; POST `issues`; PATCH `issues/<n>`; POST `issues/<n>/comments`,
+    `issues/<n>/labels`;
+- **чтение секретов — отказ**: ответ GET уходит в транскрипт. `gitlab`: `…/variables`, `…/hooks`,
+  `…/access_tokens`, `…/deploy_tokens`; `github`: `…/actions/variables`, `…/environments/<x>/variables`,
+  `…/hooks`;
 - путь — от адреса API, начинается с `/`; без схемы, `//`, `..` (в том числе закодированных), `\`, `#` и
   пробелов;
-- **пол** — при любом регламенте: API не мержит, не одобряет и не пишет в репозиторий (это делает `wshub push`
-  по `push_protect`). Запись (POST, PUT, PATCH) по этим путям — отказ; путь сверяется раскодированным и без
-  учёта регистра:
+- **пол** — второй слой при любом регламенте: API не мержит, не одобряет и не пишет в репозиторий (это делает
+  `wshub push` по `push_protect`). Запись (POST, PUT, PATCH) по этим путям — отказ, даже если путь когда-нибудь
+  попадёт в список разрешений; путь сверяется раскодированным и без учёта регистра:
   - `gitlab`: `…/merge_requests/<n>/merge`, `…/approve`, `…/unapprove`, `…/rebase`; всё под `…/repository/`
     (commits, files, branches, tags, submodules и прочее); `…/protected_branches`, `…/protected_tags`;
     `…/merge_trains`, `…/approvals`, `…/approval_rules`, `…/releases` (тег); выпуск учётных данных —
@@ -465,8 +484,15 @@ wshub forge <GET|POST|PUT|PATCH> <путь> [--data <json-файл>] [--out <ф�
   бы по `Location`);
 - ответ до 20 КБ — в stdout; больше — только с `--out <файл>` внутри рабочего каталога, не в `.git/`, не в
   `.claude/`, не в точку монтирования песочницы и не по маске `deny_edit` проекта: помощник пишет вне
-  песочницы и повторяет её запреты сам; `--data` — JSON-файл до 1 МБ, тоже внутри рабочего каталога, не `.env*`; ответ 4xx/5xx — код и тело в stderr, код выхода 1;
+  песочницы и повторяет её запреты сам. Файл открывается по цепочке каталогов от рабочего каталога задачи
+  (`O_DIRECTORY | O_NOFOLLOW` на каждом, файл — `O_NOFOLLOW`): каталог, подменённый на симлинк после
+  проверки, — отказ. `--data` — JSON-файл до 1 МБ, тоже внутри рабочего каталога, по правилам чтения
+  песочницы: не `.env*` и не по маскам `deny_read` проекта и `[code]` (относительные — от рабочего каталога).
+  Ответ 4xx/5xx — код и тело в stderr, код выхода 1;
 - `urllib` из стандартной библиотеки, без прокси из окружения, таймаут 30 с.
+
+Граница `push_protect` — пуш помощника. CI на запушенной ветке (pipeline, Actions) работает со своими
+правами и может сам писать в защищённые ветки — это настройка CI проекта, а не wshub.
 
 Для GitHub PR создаётся через `wshub forge POST /repos/<владелец>/<репозиторий>/pulls --data pr.json`:
 push-опций для PR у GitHub нет. У GitLab MR создаёт сам пуш: `wshub push origin feat-x -o

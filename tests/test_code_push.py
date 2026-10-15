@@ -30,6 +30,17 @@ def code(tmp_path, monkeypatch):
     return make_code(tmp_path, monkeypatch)
 
 
+@pytest.fixture(autouse=True)
+def hub_wshub(tmp_path, monkeypatch):
+    """wshub хаба — исполняемый файл (иначе разрешения push/forge не выдаются, ревью WSH-3.4, круг 1)."""
+    exe = tmp_path / "hubbin" / "wshub"
+    exe.parent.mkdir()
+    exe.write_text("#!/bin/sh\nexit 0\n")
+    exe.chmod(0o755)
+    monkeypatch.setattr(claude_cli, "wshub_exe", lambda: str(exe))
+    return exe
+
+
 def _call(code, name, args) -> str:
     out = asyncio.run(code_server.build_code_server(code.hub).call_tool(name, args))
     content = out[0] if isinstance(out, tuple) else out
@@ -377,6 +388,7 @@ def test_start_saves_ssh_agent_and_env(code, monkeypatch, tmp_path):
     assert (code.jobs.job_dir(jid) / helper.SSH_SOCK).read_text() == "/run/agent.sock"
     env = json.loads((tmp_path / "rec.json").read_text())["env"]
     assert "SSH_AUTH_SOCK" not in env and env["WSHUB_JOB"] == jid
+    assert env["PATH"].split(":")[0] == str(Path(claude_cli.wshub_exe()).parent)  # настоящий wshub — первым
     assert env["WSHUB_STATE"] == str(code.state) and env["WSHUB_CONFIG"] == str(code.cfg)
 
 
@@ -687,7 +699,8 @@ def test_settings_helper_only_with_grant(profile):
 def test_settings_filters_and_remote(profile, phase):
     s = _settings(profile, phase=phase)
     allow, deny = s["permissions"]["allow"], s["permissions"]["deny"]
-    for c in ("head *", "tail *", "wc *", "grep *", "cut *", "git remote", "git remote -v", "git remote get-url *"):
+    for c in ("head *", "tail *", "wc *", "grep *", "cut *", "git remote", "git remote -v", "git remote get-url *",
+              "git ls-files *", "ls *"):
         assert f"Bash({c})" in allow
     task = profile == "task" and phase is None
     assert ("Bash(sort *)" in allow) == task and ("Bash(uniq *)" in allow) == task
@@ -762,3 +775,168 @@ def test_git_config_unsafe_names_key_and_value(code):
     assert "core.hookspath = /path/hooks — исправь: git -C" in msg and "--unset-all core.hookspath" in msg
     assert "url.https://***@host/.insteadof" in msg and "pw" not in msg
     assert e.value.keys == ["core.hookspath", "url.https://user:pw@host/.insteadof"]
+
+
+# ---------- круг 1 ревью: запись по списку разрешений, секреты, PATH, --out, --data, cwd ----------
+
+ALLOWED = [
+    ("gitlab", "POST", "/projects/1/merge_requests"),
+    ("gitlab", "PUT", "/projects/1/merge_requests/2"),
+    ("gitlab", "POST", "/projects/1/merge_requests/2/notes"),
+    ("gitlab", "POST", "/projects/1/merge_requests/2/discussions"),
+    ("gitlab", "POST", "/projects/1/merge_requests/2/discussions/0a1b2c3d/notes"),
+    ("gitlab", "POST", "/projects/1/issues"),
+    ("gitlab", "PUT", "/projects/1/issues/3"),
+    ("gitlab", "POST", "/projects/1/issues/3/notes"),
+    ("gitlab", "POST", "/projects/group%2Frepo/merge_requests"),  # закодированный проект
+    ("gitlab", "PUT", "/api/v4/projects/1/merge_requests/2.json"),  # префикс и суффикс формата
+    ("github", "POST", "/repos/o/r/pulls"),
+    ("github", "PATCH", "/repos/o/r/pulls/2"),
+    ("github", "POST", "/repos/o/r/pulls/2/comments"),
+    ("github", "POST", "/repos/o/r/pulls/2/comments/9/replies"),
+    ("github", "POST", "/repos/o/r/issues"),
+    ("github", "PATCH", "/repos/o/r/issues/3"),
+    ("github", "POST", "/repos/o/r/issues/3/comments"),
+    ("github", "POST", "/repos/o/r/issues/3/labels"),
+]
+
+
+@pytest.mark.parametrize("kind,method,path", ALLOWED)
+def test_forge_write_allowlist_passes(code, tmp_path, api, capsys, kind, method, path):
+    jid = _forge_code(code, tmp_path, api, kind)
+    rc, out = _helper(code, "forge", [method, path], jid, capsys=capsys)
+    assert rc == 0, out.err
+    assert api.requests[-1]["method"] == method
+
+
+@pytest.mark.parametrize("kind,method,path", ALLOWED)
+def test_allowlist_never_hits_floor(kind, method, path):
+    from wshub.helper import api_path
+    _url, check, raw = api_path(PRESETS[kind], path)
+    assert PRESETS[kind].write_allowed(method, raw) and PRESETS[kind].floor_hit(check) is None
+
+
+@pytest.mark.parametrize("kind,method,path", [
+    ("gitlab", "POST", "/projects/1/members"),
+    ("gitlab", "POST", "/projects/1/hooks"),
+    ("gitlab", "POST", "/projects/1/variables"),
+    ("gitlab", "POST", "/projects/1/pipeline"),
+    ("gitlab", "POST", "/projects/1/jobs/7/play"),
+    ("gitlab", "PUT", "/projects/1"),
+    ("gitlab", "POST", "/projects/1/merge_requests/2%2F..%2F3/notes"),  # закодированный «/» в номере
+    ("gitlab", "PUT", "/projects/1/merge_requests"),  # метод не тот
+    ("gitlab", "POST", "/projects/1/merge_requests/2/discussions/xyz/notes"),  # id обсуждения — hex
+    ("github", "PUT", "/repos/o/r/collaborators/u"),
+    ("github", "POST", "/repos/o/r/hooks"),
+    ("github", "POST", "/repos/o/r/actions/workflows/x/dispatches"),
+    ("github", "POST", "/repos/o/r/pulls/2%2F3/comments"),
+    ("github", "PATCH", "/repos/o/r"),
+    ("github", "POST", "/user/repos"),
+])
+def test_forge_write_outside_allowlist_refused(code, tmp_path, api, capsys, kind, method, path):
+    jid = _forge_code(code, tmp_path, api, kind)
+    rc, out = _helper(code, "forge", [method, path], jid, capsys=capsys)
+    assert rc == 1 and api.requests == []
+    assert "запись через API — только MR/PR, issues и комментарии" in out.err or "без . и .." in out.err, out.err
+
+
+@pytest.mark.parametrize("kind,path", [
+    ("gitlab", "/projects/1/variables"),
+    ("gitlab", "/projects/1/variables/KEY"),
+    ("gitlab", "/projects/1/hooks"),
+    ("gitlab", "/projects/1/access_tokens"),
+    ("gitlab", "/projects/1/deploy_tokens"),
+    ("gitlab", "/groups/2/variables"),
+    ("github", "/repos/o/r/actions/variables"),
+    ("github", "/repos/o/r/environments/prod/variables"),
+    ("github", "/repos/o/r/hooks"),
+    ("github", "/repos/o/r/hooks/1"),
+])
+def test_forge_secret_reads_refused(code, tmp_path, api, capsys, kind, path):
+    jid = _forge_code(code, tmp_path, api, kind, write=False)
+    rc, out = _helper(code, "forge", ["GET", path], jid, capsys=capsys)
+    assert rc == 1 and "чтение через API запрещено" in out.err and api.requests == []
+
+
+def test_forge_out_parent_symlink_race(code, tmp_path, api, capsys, monkeypatch):
+    """Каталог, подменённый на симлинк после проверки пути, — отказ записи, файл снаружи не появляется."""
+    jid = _forge_code(code, tmp_path, api, "github")
+    (code.root / "sub").mkdir()
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    real_check = helper._work_file
+
+    def check_then_swap(ctx, cwd, val, what):
+        p = real_check(ctx, cwd, val, what)
+        if what == "--out":
+            (code.root / "sub").rmdir()
+            (code.root / "sub").symlink_to(outside)
+        return p
+    monkeypatch.setattr(helper, "_work_file", check_then_swap)
+    rc, out = _helper(code, "forge", ["GET", "/x", "--out", "sub/x.json"], jid, capsys=capsys)
+    assert rc == 1 and "не записан" in out.err and not (outside / "x.json").exists()
+
+
+def test_open_out_chain(tmp_path):
+    top = tmp_path / "w"
+    (top / "a" / "b").mkdir(parents=True)
+    os.close(helper.open_out(top, "a/b/x.json"))
+    assert (top / "a" / "b" / "x.json").is_file()
+    (top / "l").symlink_to(top / "a")
+    with pytest.raises(OSError):
+        helper.open_out(top, "l/y.json")
+    (top / "a" / "lf").symlink_to(tmp_path / "target")
+    with pytest.raises(OSError):
+        helper.open_out(top, "a/lf")
+
+
+def test_forge_data_deny_read(code, tmp_path, api, capsys, monkeypatch):
+    jid = _forge_code(code, tmp_path, api, "github")
+    tok = tmp_path / "secrets" / "forge.token"
+    code.write(forge='"github"', forge_access='"task"', forge_write="true", forge_url=f'"{api.url}"',
+               forge_token=f'"{tok}"', deny_read='["conf/secret*", "~/.config/team-service"]')
+    (code.root / "conf").mkdir()
+    (code.root / "conf" / "secret.json").write_text("{}")
+    rc, out = _helper(code, "forge", ["POST", "/repos/o/r/issues", "--data", "conf/secret.json"], jid, capsys=capsys)
+    assert rc == 1 and "deny_read" in out.err
+    home = Path(os.environ["HOME"])
+    (home / ".config" / "team-service").mkdir(parents=True)
+    (code.root / "lnk.json").symlink_to(home / ".config" / "team-service" / "x.json")
+    (home / ".config" / "team-service" / "x.json").write_text("{}")
+    rc, out = _helper(code, "forge", ["POST", "/repos/o/r/issues", "--data", "lnk.json"], jid, capsys=capsys)
+    assert rc == 1 and api.requests == []
+    (code.root / "ok.json").write_text("{}")
+    rc, out = _helper(code, "forge", ["POST", "/repos/o/r/issues", "--data", "ok.json"], jid, capsys=capsys)
+    assert rc == 0, out.err
+
+
+def test_helper_cwd_via_symlinked_path(code, tmp_path, api, capsys):
+    """Каталог задачи записан через симлинк — помощник из настоящего каталога не получает ложного отказа."""
+    jid = _forge_code(code, tmp_path, api, "github", write=False)
+    alias = tmp_path / "alias"
+    alias.symlink_to(code.root)
+    d = code.jobs.read(jid)
+    d["dir"] = str(alias)
+    code.jobs.write(jid, d)
+    rc, out = _helper(code, "forge", ["GET", "/user"], jid, cwd=code.root, capsys=capsys)
+    assert rc == 0, out.err
+
+
+def test_helper_env_path(code, hub_wshub, tmp_path):
+    env = {"PATH": f"bin:{code.root}/node_modules/.bin:{code.root}:/usr/bin::/bin:/usr/bin"}
+    out = jobs_mod.helper_env(env, code.root)
+    assert out["PATH"] == f"{hub_wshub.parent}:/usr/bin:/bin"
+
+
+def test_helper_env_refused_for_python_m(code, monkeypatch):
+    monkeypatch.setattr(claude_cli, "wshub_exe", lambda: None)
+    code.write(push='"task"')
+    with pytest.raises(JobError, match="python -m wshub"):
+        code.jobs.start(code.jobs.plan("proj", code.taskfile(), push=True, reason=REASON))
+    # без разрешений — старт как обычно
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    wait_terminal(code.jobs, jid)
+
+
+def test_no_glob_tool():
+    assert "Glob" not in claude_cli.FILE_TOOLS and "Grep" not in claude_cli.FILE_TOOLS

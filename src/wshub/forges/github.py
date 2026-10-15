@@ -1,7 +1,7 @@
 """GitHub: Bearer-токен, путь от адреса API (по умолчанию https://api.github.com)."""
 from __future__ import annotations
 
-from . import Preset, floor
+from . import Preset, floor, writes
 
 PRESET = Preset(
     name="github",
@@ -25,5 +25,21 @@ PRESET = Preset(
         (r"/releases(/|$)", "релиз создаёт тег"),
         (r"/keys(/|$)", "выпуск учётных данных"),
         (r"/gpg_keys(/|$)", "выпуск учётных данных"),
+    ),
+    writes=writes(
+        r"/repos/[^/]+/[^/]+/",
+        ("POST", "pulls"),
+        ("PATCH", "pulls/<n>"),
+        ("POST", "pulls/<n>/comments"),
+        ("POST", "pulls/<n>/comments/<n>/replies"),
+        ("POST", "issues"),
+        ("PATCH", "issues/<n>"),
+        ("POST", "issues/<n>/comments"),
+        ("POST", "issues/<n>/labels"),
+    ),
+    secret_reads=floor(
+        (r"/actions/variables(/|$)", "секреты: переменные Actions"),
+        (r"/environments/[^/]+/variables(/|$)", "секреты: переменные окружения"),
+        (r"/hooks(/|$)", "секреты: webhooks"),
     ),
 )

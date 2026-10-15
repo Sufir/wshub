@@ -1,7 +1,7 @@
 """GitLab: PRIVATE-TOKEN, /api/v4, адрес API задаётся в реестре (self-hosted)."""
 from __future__ import annotations
 
-from . import Preset, floor
+from . import Preset, floor, writes
 
 PRESET = Preset(
     name="gitlab",
@@ -23,5 +23,20 @@ PRESET = Preset(
         (r"/releases(/|$)", "релиз создаёт тег"),
         (r"/(personal_access_tokens|access_tokens|deploy_tokens|deploy_keys)(/|$)", "выпуск учётных данных"),
         (r"^/api/v4/user/(keys|gpg_keys)(/|$)", "выпуск учётных данных"),
+    ),
+    # проект — сырым сегментом: числом или закодированным путём group%2Frepo
+    writes=writes(
+        r"/api/v4/projects/[^/]+/",
+        ("POST", "merge_requests"),
+        ("PUT", "merge_requests/<n>"),
+        ("POST", "merge_requests/<n>/notes"),
+        ("POST", "merge_requests/<n>/discussions"),
+        ("POST", "merge_requests/<n>/discussions/[0-9a-f]+/notes"),
+        ("POST", "issues"),
+        ("PUT", "issues/<n>"),
+        ("POST", "issues/<n>/notes"),
+    ),
+    secret_reads=floor(
+        (r"/(variables|hooks|access_tokens|deploy_tokens)(/|$)", "секреты: CI-переменные, webhooks, токены"),
     ),
 )

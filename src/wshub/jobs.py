@@ -425,6 +425,8 @@ class Jobs:
             raise JobError(problem)
         flags = claude_cli.detect_flags(claude, self.hub.state_dir, env)
         grants = plan.grants or {}
+        if grants.get("push") or grants.get("forge"):
+            env = helper_env(env, plan.dir)
         if grants.get("forge"):  # файл токена — при старте задачи с доступом к API (А1.2)
             from .helper import HelperError, read_token
             try:
@@ -959,6 +961,28 @@ def task_grants(name: str, proj: ProjectCode, profile: str, push: bool, forge: b
     if out["push"] or out["forge"]:
         out["reason"] = (why if (push or forge) and why else None) or inh.get("reason")
     return out, warnings
+
+
+def helper_env(env: dict, workdir: Path) -> dict:
+    """PATH задачи с помощником (ревью WSH-3.4, круг 1): правила Bash(wshub push|forge *) и excludedCommands
+    называют wshub по имени, и вне песочницы запустится первый wshub из PATH. Поэтому PATH начинается с каталога
+    настоящего wshub хаба, а относительные элементы и каталоги внутри рабочего каталога задачи выкидываются.
+    wshub хаба — не один исполняемый файл (python -m wshub) — разрешения не выдаются: JobError."""
+    exe = claude_cli.wshub_exe()
+    if not exe:
+        raise JobError("помощник хаба: wshub запущен как «python -m wshub», а не исполняемым файлом — разрешения "
+                       "push и forge не выдаются; поставь wshub как программу (uv tool install) и перезапусти")
+    home = os.path.dirname(exe)
+    work = os.path.realpath(workdir)
+    keep = []
+    for d in (env.get("PATH") or "").split(os.pathsep):
+        if not d or not os.path.isabs(d):
+            continue
+        real = os.path.realpath(d)
+        if real == work or real.startswith(work + os.sep) or d in keep or d == home:
+            continue
+        keep.append(d)
+    return {**env, "PATH": os.pathsep.join([home, *keep])}
 
 
 def write_exclude(repo: Path) -> None:

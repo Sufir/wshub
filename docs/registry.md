@@ -70,7 +70,7 @@ wshub outbox clean                               # удалить все кат�
 claude = "claude"                 # имя в PATH или абсолютный путь
 deny_read = ["~/.ssh", "~/.config/wshub", "~/.claude/.credentials.json", "~/.claude.json"]
 
-[workspace.payload.code]
+[workspace.team-service.code]
 enabled = true
 dirs = ["org"]                    # где можно запускать; строго вне служебных каталогов wshub
 prompts = ".agents/templates/code-prompts"

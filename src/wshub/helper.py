@@ -85,6 +85,7 @@ class Ctx:
         self.hub, self.jobs, self.jid, self.d = hub, jobs, jid, d
         self.dir = Path(d["dir"])
         self.proj = None
+        self.glob = None
 
     def record(self, cmd: str, args: list[str], code: int, link: str | None = None, error: str | None = None,
                extra: dict | None = None) -> None:
@@ -126,12 +127,13 @@ def check(ctx: Ctx, cwd: str, kind: str) -> None:
         raise HelperError(f"задача {ctx.jid} не идёт (состояние {state})")
     try:
         here = Path(cwd).resolve()
+        top = ctx.dir.resolve()  # симлинк в пути к каталогу задачи — не повод для отказа
     except OSError as e:
         raise HelperError(f"рабочий каталог не определяется: {e}") from None
-    if not (here == ctx.dir or here.is_relative_to(ctx.dir)):
+    if not (here == top or here.is_relative_to(top)):
         raise HelperError(f"рабочий каталог {here} вне каталога задачи {ctx.dir}")
     try:
-        _ws, ctx.proj, _glob = ctx.jobs._project(ctx.d["project"])
+        _ws, ctx.proj, ctx.glob = ctx.jobs._project(ctx.d["project"])
     except JobError as e:
         raise HelperError(str(e)) from None
     grants = ctx.d.get("grants") or {}
@@ -155,7 +157,8 @@ def check(ctx: Ctx, cwd: str, kind: str) -> None:
 def _work_file(ctx: Ctx, cwd: str, val: str, what: str) -> Path:
     """Файл --data/--out: явный путь внутри каталога задачи и не в .git — по normpath и по realpath. Помощник
     идёт вне песочницы, поэтому её запреты повторяются здесь (ревью WSH-3.4): --out — не в .claude/, не в точку
-    монтирования песочницы и не по маске deny_edit проекта; --data — не .env*."""
+    монтирования песочницы и не по маске deny_edit проекта; --data — не .env* и не по маскам deny_read проекта
+    и [code] (относительные — от рабочего каталога)."""
     if not val or any(c in val for c in "$`*?[~\x00"):
         raise HelperError(f"{what}: нужен явный путь к файлу — без переменных, шаблонов и ~")
     base = os.path.normpath(str(ctx.dir))
@@ -170,6 +173,8 @@ def _work_file(ctx: Ctx, cwd: str, val: str, what: str) -> Path:
             raise HelperError(f"{what} {val}: файлы в .git — нельзя")
         if what == "--data" and parts[-1].startswith(".env"):
             raise HelperError(f"{what} {val}: .env* — нельзя")
+        if what == "--data" and _deny_read_hit(ctx, rel, real):
+            raise HelperError(f"{what} {val}: путь закрыт deny_read")
         if what == "--out" and (parts[0] == ".claude" or any(rel == m or rel.startswith(m + "/")
                                                              for m in SANDBOX_MOUNTS)):
             raise HelperError(f"{what} {val}: защищённый путь песочницы — помощник туда не пишет")
@@ -177,6 +182,37 @@ def _work_file(ctx: Ctx, cwd: str, val: str, what: str) -> Path:
                                    for m in ctx.proj.deny_edit):
             raise HelperError(f"{what} {val}: путь закрыт deny_edit проекта")
     return Path(p)
+
+
+def _deny_read_hit(ctx: Ctx, rel: str, real: str) -> bool:
+    """Маски deny_read проекта и [code]: абсолютные и ~ — по реальному пути, относительные — от рабочего каталога."""
+    masks = [*(ctx.glob.deny_read if ctx.glob else ()), *(ctx.proj.deny_read if ctx.proj else ())]
+    for m in masks:
+        if m == "~" or m.startswith("~/") or os.path.isabs(m):
+            base = os.path.normpath(os.path.expanduser(m))
+            if real == base or real.startswith(base.rstrip("/") + "/") or fnmatch.fnmatchcase(real, base):
+                return True
+        else:
+            m = os.path.normpath(m)
+            if rel == m or rel.startswith(m + "/") or fnmatch.fnmatchcase(rel, m):
+                return True
+    return False
+
+
+def open_out(top: Path, rel: str) -> int:
+    """--out без гонки с симлинком в родителе (ревью WSH-3.4, круг 1): каталоги от рабочего каталога задачи —
+    по одному, O_DIRECTORY | O_NOFOLLOW относительно предыдущего; файл — O_NOFOLLOW относительно последнего.
+    Подменённый на симлинк каталог — OSError."""
+    parts = rel.split("/")
+    fd = os.open(os.path.realpath(top), os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts[:-1]:
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = nfd
+        return os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+    finally:
+        os.close(fd)
 
 
 # ---------- wshub push ----------
@@ -316,8 +352,9 @@ def _parse_forge(args: list[str]) -> tuple[str, str, str | None, str | None]:
     return pos[0], pos[1], opts.get("--data"), opts.get("--out")
 
 
-def api_path(preset, raw: str) -> tuple[str, str]:
-    """(путь с префиксом пресета и query — для URL, раскодированный путь в нижнем регистре — для пола).
+def api_path(preset, raw: str) -> tuple[str, str, str]:
+    """(путь с префиксом пресета и query — для URL, раскодированный путь в нижнем регистре — для пола и чтения
+    секретов, сырой путь с префиксом без query — для списка разрешённой записи).
     Путь — от адреса API: начинается с /, без схемы, //, .., \\, пробелов и фрагмента."""
     if not raw.startswith("/") or raw.startswith("//") or any(c in raw for c in "\\#") \
             or any(c.isspace() or ord(c) < 32 for c in raw):
@@ -334,7 +371,7 @@ def api_path(preset, raw: str) -> tuple[str, str]:
     if any(part in (".", "..") for part in decoded.split("/")) or "//" in decoded or "\\" in decoded:
         raise HelperError(f"путь {raw[:200]!r}: без . и .. в пути")
     full = preset.path(path)
-    return full + (q + query if q else ""), preset.path(decoded).lower()
+    return full + (q + query if q else ""), preset.path(decoded).lower(), full
 
 
 def forge(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
@@ -355,12 +392,18 @@ def forge(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
         if method in WRITE_METHODS and not proj.forge_write:
             raise HelperError(f"{method}: запись через API закрыта регламентом проекта (forge_write = false)")
         preset = PRESETS[proj.forge]
-        url_path, check_path = api_path(preset, raw)
+        url_path, check_path, raw_full = api_path(preset, raw)
         if method in WRITE_METHODS:
             what = preset.floor_hit(check_path)
             if what:
                 raise HelperError(f"{method} {raw[:200]}: {what} — через API запрещено при любом регламенте "
                                   "(мерж и одобрение — оператор, запись в репозиторий — wshub push)")
+            if not preset.write_allowed(method, raw_full):
+                raise HelperError(f"{method} {raw[:200]}: запись через API — только MR/PR, issues и комментарии")
+        else:
+            what = preset.secret_hit(check_path)
+            if what:
+                raise HelperError(f"GET {raw[:200]}: {what} — чтение через API запрещено: ответ уходит в транскрипт")
         body = None
         if data_arg is not None:
             if method not in WRITE_METHODS:
@@ -396,7 +439,7 @@ def forge(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
         return 1
     if out_path is not None:
         try:
-            fd = os.open(out_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644)
+            fd = open_out(ctx.dir, os.path.relpath(out_path, os.path.normpath(str(ctx.dir))))
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
         except OSError as e:

@@ -51,7 +51,7 @@ curl -LsSf https://raw.githubusercontent.com/Sufir/wshub/main/install.sh | sh
 | открыть проект | «Открой проект myproject через wshub» | `workspace_open` |
 | управлять проектами, сессиями, копиями | «Открой панель wshub» | `panel` |
 | показать файл | «Покажи report.pdf» | `publish` |
-| запустить Claude Code по ТЗ | «Запусти Code по org/task.md в проекте payload» | `code_start` (сервер `wshub-code`) |
+| запустить Claude Code по ТЗ | «Запусти Code по org/task.md в проекте team-service» | `code_start` (сервер `wshub-code`) |
 | утвердить план Claude Code | «Покажи план задачи и запусти исполнение» | `code_plan`, `code_approve` (сервер `wshub-code`) |
 
 При первом вызове Desktop запрашивает разрешение на инструменты wshub — **Always allow**.

@@ -302,3 +302,61 @@ def test_push_upstream_keys_not_a_warning(code, tmp_path, monkeypatch):
              ".git/config — добавлен ключ branch.bad.remote", ".git/config — добавлен ключ core.hookspath (опасный)"]
     assert _drop_push_upstream(lines, jd) == lines[2:]
     assert _drop_push_upstream(lines, tmp_path) == lines  # нет учёта — всё как есть
+
+
+# ---------- ревью круга 1, пп. 10–11: текст отказа хаба виден чату; удалённый cwd процесса хаба ----------
+
+def test_hub_refusal_text_reaches_chat(code, capsys):
+    """Отказ prefetch по git_config_unsafe: текст с ключом — в code_status, code_wait, code_result, CLI и карточке."""
+    code.write(prefetch="true")
+    git(code.root, "config", "core.fsmonitor", "true")
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    assert wait_terminal(code.jobs, jid)["state"] == "failed"
+    assert code.jobs.read(jid)["reason"] == "git_config_unsafe"
+    for name, args in (("code_status", {"job": jid}), ("code_wait", {"job": jid, "seconds": 1}),
+                       ("code_result", {"job": jid})):
+        out = json.loads(_call(code, name, args))
+        assert "core.fsmonitor = true" in out["error"] and "--unset-all core.fsmonitor" in out["error"], name
+    assert code_cli.code_main("code", ["result", jid], code.cfg, code.state) == 0
+    assert "core.fsmonitor = true" in json.loads(capsys.readouterr().out.split("\nоткрыть сессию:")[0])["error"]
+    srv = code_server.build_code_server(code.hub)
+    out = asyncio.run(srv.call_tool("code_card_data", {"job": jid}))
+    card = json.loads((out[0] if isinstance(out, tuple) else out)[0].text)
+    assert "core.fsmonitor" in card["end"]["error"]
+
+
+def test_no_error_field_when_clean(code):
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    wait_terminal(code.jobs, jid)
+    assert "error" not in json.loads(_call(code, "code_result", {"job": jid}))
+
+
+def test_deleted_cwd_unsafe_keys_and_prefetch(code, tmp_path, monkeypatch):
+    """Процесс хаба с удалённым рабочим каталогом: unsafe_keys и prefetch задачи проходят (ревью, п. 11)."""
+    from wshub import gitsafe
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+    assert gitsafe.unsafe_keys("git", code.root / ".git", dict(os.environ)) == []
+    code.write(prefetch="true")
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]  # надзиратель — с cwd каталога задачи
+    snap = wait_terminal(code.jobs, jid)
+    assert snap["state"] == "completed", code.jobs.read(jid).get("error")
+
+
+def test_git_launch_failure_is_not_unsafe_config(code, tmp_path):
+    """Сбой запуска git («Unable to read current working directory») — prefetch с понятной причиной, а не
+    git_config_unsafe; нечитаемый конфиг — «конфиг не прочитан»; плохой ключ — «плохой ключ»."""
+    from wshub import gitsafe
+    fake = tmp_path / "fakegit"
+    fake.write_text("#!/bin/sh\necho 'fatal: Unable to read current working directory: No such file or directory' >&2\n"
+                    "exit 128\n")
+    fake.chmod(0o755)
+    with pytest.raises(gitsafe.GitUnsafe) as e:
+        gitsafe.unsafe_keys(str(fake), code.root / ".git", dict(os.environ))
+    assert e.value.reason == "prefetch" and "рабочий каталог процесса хаба удалён" in str(e.value)
+    (code.root / ".git" / "config").write_text("[broken\n")
+    with pytest.raises(gitsafe.GitUnsafe) as e:
+        gitsafe.unsafe_keys("git", code.root / ".git", dict(os.environ))
+    assert e.value.reason == "git_config_unsafe" and str(e.value).startswith("конфиг не прочитан")

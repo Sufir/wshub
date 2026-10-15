@@ -335,7 +335,10 @@ header. У источника `policy` канала нет. **`choice_fields`** 
   `remote.*.uploadpack`, `remote.*.receivepack`, `protocol.*.allow`, `protocol.allow`, `url.*.insteadOf`,
   `url.*.pushInsteadOf`, `hook.*`, `gc.recentObjectsHook`, `core.alternateRefsCommand`, `remote.*.vcs`,
   `gpg.program`, `gpg.*.program`, `gpg.ssh.defaultKeyCommand`), git не запускается: задача `failed`, причина
-  `git_config_unsafe`. Текст отказа называет ключ, значение (учётные данные в адресе — `***`, не длиннее 200
+  `git_config_unsafe`. Текст отказа — «плохой ключ: …» или «конфиг не прочитан: …»; сбой запуска самого git
+  (например, удалён рабочий каталог процесса хаба: «Unable to read current working directory») — причина
+  `prefetch`, а не `git_config_unsafe`. Текст отказа хаба (поле `error`) видят `code_status`, `code_wait`,
+  `code_result`, `wshub code result` и карточка задачи. Текст отказа по ключу называет ключ, значение (учётные данные в адресе — `***`, не длиннее 200
   символов) и способ починки: `core.hookspath = /path/… — исправь: git -C <репозиторий> config --unset-all
   core.hookspath или укажи верное значение`. Если `.git` — файл (worktree) или рядом есть `.git/commondir`, prefetch и снимок в v0
   отклоняются.
@@ -660,6 +663,8 @@ wshub code stop <job> | wshub code stop --all
 wshub code stats [project] [--days N]
 ```
 
-`wshub code` без аргументов — сам MCP-сервer (его запускает Desktop). `wshub code-run` и `wshub code-hook` —
+`wshub code` без аргументов — сам MCP-сервer (его запускает Desktop). Серверы и надзиратель задачи при старте
+переходят в домашний каталог, надзиратель запускается с рабочим каталогом в каталоге задачи, а чтение
+`.git/config` идёт с `cwd=/`: удалённый каталог, из которого запустили хаб, git не ломает. `wshub code-run` и `wshub code-hook` —
 служебные (надзиратель задачи и хук Bash), вручную не вызываются. `wshub push` и `wshub forge` — помощник для
 задач (раздел «Пуш и API хостинга»), вне задачи отвечает отказом.

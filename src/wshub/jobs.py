@@ -547,9 +547,10 @@ class Jobs:
                            f"{plan.proj.daily_budget_usd:g} (daily_budget_usd)")
 
     def _spawn_supervisor(self, jid: str) -> int:
+        # cwd — каталог задачи: рабочий каталог сервера мог быть удалён (ревью WSH-3.4, п. 11)
         proc = subprocess.Popen([*claude_cli.wshub_cmd(), "code-run", jid], stdin=subprocess.DEVNULL,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                                env={**os.environ})
+                                env={**os.environ}, cwd=self.job_dir(jid))
         return proc.pid
 
     # ---------- снимки, список ----------
@@ -563,6 +564,8 @@ class Jobs:
                 "task": d.get("task"), "profile": d.get("profile"), "model": d.get("model"),
                 "elapsed_s": max(elapsed, 0), "session_id": d.get("session_id"), "parent": d.get("parent"),
                 "result": d.get("result"), "warnings": d.get("warnings") or []}
+        if d.get("error"):  # текст отказа хаба (prefetch, git_config_unsafe…) — чату, а не только код (ревью, п. 10)
+            snap["error"] = d["error"]
         if d.get("reason") in REASON_HINT:
             snap["reason_hint"] = REASON_HINT[d["reason"]]
         if d.get("choice"):
@@ -580,6 +583,15 @@ class Jobs:
                             active=active["id"], chain=[self._link_row(x) for x in links],
                             cost_usd=_sum(phase_cost(x) for x in links),
                             elapsed_s=max(int(end - (d.get("started") or d.get("created_ts") or end)), 0))
+                if active.get("error"):
+                    snap["error"] = active["error"]
+                else:
+                    snap.pop("error", None)
+                if active["id"] == jid:  # корень перечитан в chain() — причина из того же прочтения, что и состояние
+                    snap["reason"] = active.get("reason")
+                    snap.pop("reason_hint", None)
+                    if active.get("reason") in REASON_HINT:
+                        snap["reason_hint"] = REASON_HINT[active["reason"]]
         return snap
 
     def _link_row(self, d: dict) -> dict:
@@ -666,7 +678,7 @@ class Jobs:
         async) fork копирует удерживаемый flock-fd и заклинил бы лок. close_fds (по умолчанию) этого не даёт."""
         subprocess.Popen([*claude_cli.wshub_cmd(), "code-kill", jid], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                         env={**os.environ})
+                         env={**os.environ}, cwd=self.job_dir(jid))
 
     def kill_orphaned(self, jid: str) -> dict:
         """Погасить группу Code осиротевшей задачи и записать cancelled (вызывается процессом `code-kill`)."""
@@ -829,6 +841,7 @@ class Jobs:
         result = {k: v for k, v in (d.get("result") or {}).items() if k != "outside_code"}
         out = {"job": job, "project": snap.get("project"), "state": snap["state"], "reason": d.get("reason"),
                "choice": snap.get("choice"), "elapsed_s": snap.get("elapsed_s"), **self.counts(links),
+               **({"error": d["error"]} if d.get("error") else {}),
                "grants": d.get("grants") or {}, "outside_code": outside_view(links, docker_max),
                "external": self.external_view(links), "result": result,
                **({"reason_hint": REASON_HINT[d["reason"]]} if d.get("reason") in REASON_HINT else {}),
@@ -1101,7 +1114,7 @@ def config_keys(git: str, repo: Path, environ: dict, salt: str) -> dict | None:
             return None
         r = subprocess.run([git, "config", "--file", str(path), "--list", "--no-includes"], capture_output=True,
                            text=True, errors="replace", timeout=gitsafe.CONFIG_TIMEOUT, env=gitsafe.env(environ),
-                           stdin=subprocess.DEVNULL, check=False)
+                           stdin=subprocess.DEVNULL, check=False, cwd="/")
     except (OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:

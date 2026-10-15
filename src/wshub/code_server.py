@@ -448,7 +448,7 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
     if state in FINAL:  # как в code_result, но по уже прочитанным звеньям — без обхода всех задач
         oc, ex = outside_view(links, RESULT_DOCKER_MAX), jobs.external_view(links)
         text = (active.get("result") or {}).get("result") or ""
-        out["end"] = {"warning": meta_warning({"outside_code": oc}),
+        out["end"] = {"warning": meta_warning({"outside_code": oc}), "error": active.get("error"),
                       "outside": {"commits_count": oc.get("commits_count", 0),
                                   "docker_count": oc.get("docker_count", 0), "head_moved": oc.get("head_moved") or []},
                       "external": {"push_count": ex.get("push_count", 0), "forge_count": ex.get("forge_count", 0),

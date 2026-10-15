@@ -37,10 +37,12 @@ ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ")
 VALUE_MAX = 200  # символов значения ключа в тексте отказа
 FIXED_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_ASKPASS": "/bin/false", "SSH_ASKPASS": "/bin/false"}
 CONFIG_TIMEOUT = 15
+LAUNCH_FAIL = "Unable to read current working directory"  # сбой запуска git, а не плохой конфиг
 
 
 class GitUnsafe(Exception):
-    """Git в этом каталоге не запускается. reason — для job.json: git_config_unsafe | worktree | no_repo."""
+    """Git в этом каталоге не запускается. reason — для job.json: git_config_unsafe (плохой ключ или конфиг не
+    прочитан) | prefetch (сам git не запустился) | worktree | no_repo."""
 
     def __init__(self, reason: str, message: str, keys: list[str] | None = None):
         super().__init__(message)
@@ -84,13 +86,18 @@ def unsafe_entries(git: str, gdir: Path, environ: dict) -> list[tuple[str, str, 
         if not f.exists():
             continue
         try:
+            # cwd="/": рабочий каталог процесса хаба мог быть удалён — тогда git падает ещё до чтения файла
             r = subprocess.run([git, "config", "--file", str(f), "--list", "--no-includes"], capture_output=True,
                                text=True, timeout=CONFIG_TIMEOUT, env=env(environ), stdin=subprocess.DEVNULL,
-                               check=False)
+                               check=False, cwd="/")
         except (OSError, subprocess.TimeoutExpired) as e:
-            raise GitUnsafe("git_config_unsafe", f"{f} не прочитан: {e}") from None
+            raise GitUnsafe("prefetch", f"git не запустился для чтения {f}: {e}") from None
         if r.returncode != 0:
-            raise GitUnsafe("git_config_unsafe", f"{f} не разбирается: {r.stderr.strip()[:300]}")
+            err = r.stderr.strip()
+            if not r.stdout and LAUNCH_FAIL in err:
+                raise GitUnsafe("prefetch", f"git не запустился для чтения {f}: рабочий каталог процесса хаба удалён "
+                                            f"({err[:300]}) — перезапусти сервер wshub-code")
+            raise GitUnsafe("git_config_unsafe", f"конфиг не прочитан: {f} не разбирается git ({err[:300]})")
         for line in r.stdout.splitlines():
             key, _, value = line.partition("=")
             key = key.lower()
@@ -113,7 +120,7 @@ def unsafe_message(repo: Path, entries: list[tuple[str, str, Path]]) -> str:
         opt = "" if f.name == "config" else " --worktree"
         rows.append(f"{_show(key)} = {_show(value)}{where} — исправь: git -C {shlex.quote(str(repo))} config{opt} "
                     f"--unset-all {shlex.quote(_show(key))} или укажи верное значение")
-    return "хаб не запускает git в репозитории с такими ключами в .git/config: " + "; ".join(rows)
+    return "плохой ключ: хаб не запускает git в репозитории с такими ключами в .git/config: " + "; ".join(rows)
 
 
 def unsafe_key(key: str) -> bool:

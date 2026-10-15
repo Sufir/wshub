@@ -14,7 +14,19 @@ TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancel
 USER_ERR = (WsError, TaskError, RegistryError, OSError)
 
 
+def home_cwd() -> None:
+    """Сервер и надзиратель работают из домашнего каталога: каталог, из которого их запустили, может быть удалён,
+    и тогда любой git без -C падает «Unable to read current working directory» (ревью WSH-3.4, п. 11)."""
+    import os
+    try:
+        os.chdir(os.path.expanduser("~"))
+    except OSError:
+        os.chdir("/")
+
+
 def code_main(cmd: str, rest: list[str], config: Path, state: Path) -> int:
+    if cmd in ("code-run", "code-kill") or (cmd == "code" and not rest):
+        home_cwd()
     if cmd == "code-hook":
         from .hook import main as hook_main
         return hook_main(rest)

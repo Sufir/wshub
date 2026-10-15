@@ -254,6 +254,7 @@ function renderEnd(end) {
   if (!end) return;
   const rows = [];
   if (end.warning) rows.push(el("div", "danger", end.warning));
+  if (end.error) rows.push(el("div", "danger", "отказ хаба: " + end.error));
   const oc = end.outside || {};
   const parts = ["коммиты " + (oc.commits_count || 0), "docker " + (oc.docker_count || 0)];
   rows.push(el("div", null, "вне кода: " + parts.join(", ")));

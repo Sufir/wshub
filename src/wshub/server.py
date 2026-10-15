@@ -261,6 +261,8 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def serve(config: Path, state: Path) -> None:
+    from .code_cli import home_cwd
+    home_cwd()  # каталог запуска мог быть удалён (ревью WSH-3.4, п. 11)
     hub = Hub(config, state)
     hub.runtime.start()
     hub.publish()

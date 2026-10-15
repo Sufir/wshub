@@ -20,7 +20,7 @@ from wshub.registry import RegistryError, parse
 FAKE = Path(__file__).parent / "fake_claude.py"
 FAKE_ENV = ["FAKE_REC", "FAKE_SLEEP", "FAKE_SIGINT", "FAKE_TOUCH", "FAKE_COST", "FAKE_SUBTYPE",
             "FAKE_DENIALS", "FAKE_SIGMARK", "FAKE_RECLOG", "FAKE_NO_PLAN", "FAKE_PLAN", "FAKE_COST_PLAN",
-            "FAKE_SLEEP_PLAN", "FAKE_SELF_CANCEL"]
+            "FAKE_SLEEP_PLAN", "FAKE_SELF_CANCEL", "FAKE_DOCKER", "FAKE_GIT_META", "FAKE_COMMIT"]
 TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost", "plan_ready")
 
 

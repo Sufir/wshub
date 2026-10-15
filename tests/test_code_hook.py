@@ -279,6 +279,9 @@ ALLOW = [
     "docker container ls",
     "docker rm -f x",
     "docker-compose ps",
+    "docker compose run --rm app pytest -v tests/test_x.py::test_y",
+    "docker compose exec -T app pytest -v tests/test_x.py::TestA::test_b",
+    "docker run --rm img pytest -v a.py::t",
 ]
 
 

@@ -405,14 +405,16 @@ def _check_container_flags(rest: list[str], cwd: Path, label: str, mounts: bool)
 
 
 def _check_mount_spec(spec: str, cwd: Path, label: str) -> None:
-    """-v ИСТОЧНИК:ЦЕЛЬ[:опции]. Без «:» — анонимный том или чужой -v внутренней команды: не монтирование хоста.
+    """-v ИСТОЧНИК:ЦЕЛЬ[:опции]. Без «:» или с неабсолютной целью — анонимный том или чужой -v внутренней команды
+    (pytest -v file::test): не монтирование хоста.
     Подстановка ($, `) — отказ: источник не проверить ($(pwd) разбор режет на звенья, остаётся «$»)."""
     if any(c in spec for c in "$`"):
         raise _Deny(f"{label}: источник монтирования из подстановки — хук не может его проверить, укажи "
                     "абсолютный путь внутри рабочего каталога")
-    if ":" not in spec:
-        return
-    _check_mount_source(spec.split(":", 1)[0], cwd, label)
+    src, sep, dst = spec.partition(":")
+    if not sep or not dst.startswith("/"):
+        return  # цель в контейнере у монтирования всегда абсолютная: «pytest -v file::test» — не монтирование
+    _check_mount_source(src, cwd, label)
 
 
 def _check_mount_opt(spec: str, cwd: Path, label: str) -> None:

@@ -3,12 +3,14 @@
 Запускается в своём сеансе (start_new_session). prefetch силами хаба, запуск Code в собственной группе
 процессов, слежение за отменой и пределом времени, разбор итога, снимок git, запись result.json и job.json.
 Фаза плана (ТЗ WSH-3, 2.3): копия плана в plan.md, состояние plan_ready, при plan = auto — запуск исполнения.
+Блок «Вне кода» (ТЗ WSH-3.3): коммиты звена, изменения .git/hooks и .git/config, вызовы docker.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import time
@@ -16,14 +18,17 @@ from datetime import datetime
 from pathlib import Path
 
 from . import gitsafe
-from .jobs import JobError, Jobs, cancel_timers
-from .runtime import atomic_write_text, proc_start
+from .jobs import COMMITS_MAX, DOCKER_MAX, GIT_START, JobError, Jobs, cancel_timers, clip_list, git_meta, meta_changes
+from .runtime import atomic_write_text, proc_start, read_json
 
 PREFETCH_TIMEOUT = 120
 POLL = 1.0
 RESULT_MAX = 8 * 1024
 STATUS_LINES = 200
 PLAN_MAX = 200 * 1024  # байт: копия плана в каталоге задачи
+DOCKER_CMD_MAX = 200  # символов команды в блоке «Вне кода»
+# docker как команда: в начале (строки) или после ;, &&, ||, | (ТЗ WSH-3.3, п. 1.3)
+DOCKER_RE = re.compile(r"(?:^|;|&&|\|\|?)\s*(?:docker|docker-compose)(?=\s|$)", re.MULTILINE)
 
 
 def _clip_bytes(text: str, limit: int) -> str:
@@ -111,6 +116,79 @@ def _git_snapshot(git: str, cwd: Path, environ: dict) -> dict:
         out["error"] = f"{e.reason}: {e}"
     except (OSError, subprocess.TimeoutExpired) as e:
         out["error"] = str(e)
+    return out
+
+
+def _docker_calls(events_path: Path) -> tuple[list[str], int]:
+    """Bash-вызовы docker из потока событий: первые DOCKER_MAX, команда ≤ DOCKER_CMD_MAX символов, «— отказ»,
+    если парный tool_result — ошибка; плюс общее число."""
+    uses: list[tuple[str | None, str]] = []
+    failed: set[str] = set()
+    try:
+        lines = events_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return [], 0
+    for line in lines:
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        msg = e.get("message") if isinstance(e, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        for c in content if isinstance(content, list) else []:
+            if not isinstance(c, dict):
+                continue
+            if c.get("type") == "tool_result" and c.get("is_error") and isinstance(c.get("tool_use_id"), str):
+                failed.add(c["tool_use_id"])
+            if e.get("type") == "assistant" and c.get("type") == "tool_use" and c.get("name") == "Bash":
+                cmd = (c.get("input") or {}).get("command") if isinstance(c.get("input"), dict) else None
+                if isinstance(cmd, str) and DOCKER_RE.search(cmd):
+                    uses.append((c.get("id") if isinstance(c.get("id"), str) else None, cmd))
+    out = [cmd[:DOCKER_CMD_MAX] + (" — отказ" if uid in failed else "") for uid, cmd in uses[:DOCKER_MAX]]
+    return out, len(uses)
+
+
+def _outside_code(git: str, cwd: Path, environ: dict, jdir: Path) -> dict:
+    """Что звено сделало вне диффа: коммиты от HEAD на старте, .git/hooks и .git/config против снимка на
+    старте (git_start.json), вызовы docker. Каждая часть — отдельно: сбой одной пишется в errors и не стирает
+    остальные (прежде всего git_meta_changed — повод для предупреждения)."""
+    out: dict = {"commits": [], "commits_count": 0, "git_meta_changed": [], "docker": [], "docker_count": 0}
+    errors: list[str] = []
+    start = read_json(jdir / GIT_START)
+    if not start:
+        errors.append("снимка git на старте звена нет")
+    if start.get("error"):
+        errors.append(f"снимок на старте: {start['error']}")
+    if start:
+        try:
+            now = git_meta(cwd)
+            out["git_meta_changed"] = clip_list(meta_changes(start, now))
+            errors += [f"на старте: {m}" for m in start.get("meta_errors") or []]
+            errors += [f"в конце: {m}" for m in now.get("meta_errors") or []]
+        except Exception as e:  # noqa: BLE001
+            out["git_meta_changed"] = [".git/hooks и .git/config — не проверены"]
+            errors.append(f".git не проверен: {e}")
+    head = start.get("head")
+    if head:
+        try:
+            r = gitsafe.run(git, cwd, ["log", "--oneline", f"{head}..HEAD"], environ, 30)
+            if r.returncode == 0:
+                commits = r.stdout.splitlines()
+                out["commits"], out["commits_count"] = commits[:COMMITS_MAX], len(commits)
+            else:
+                errors.append(f"git log вернул {r.returncode}: {r.stderr.strip()[:300]}")
+        except gitsafe.GitUnsafe as e:
+            errors.append(f"коммиты: {e.reason}: {e}")
+        except Exception as e:  # noqa: BLE001 — OSError, TimeoutExpired, декодирование вывода
+            errors.append(f"коммиты: {e}")
+    elif start:
+        errors.append("коммиты: HEAD на старте неизвестен")
+    try:
+        out["docker"], out["docker_count"] = _docker_calls(jdir / "events.jsonl")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"docker: {e}")
+    if errors:
+        out["errors"] = clip_list([x[:500] for x in errors])
     return out
 
 
@@ -238,6 +316,11 @@ class Supervisor:
             "result": _clip_bytes(res_event.get("result") or "", RESULT_MAX),
             "git": _git_snapshot(git, cwd, environ),
         }
+        try:
+            result["outside_code"] = _outside_code(git, cwd, environ, self.jdir)
+        except Exception as e:  # noqa: BLE001 — блок прозрачности не должен ронять итог звена
+            result["outside_code"] = {"commits": [], "commits_count": 0, "git_meta_changed": [], "docker": [],
+                                      "docker_count": 0, "errors": [f"блок не собран: {e}"[:500]]}
         if self.d.get("state") == "cancelling":
             state, reason = ("timeout", "max_hours") if self.d.get("reason") == "timeout" else ("cancelled", "cancel")
         elif not res_event:
@@ -339,6 +422,7 @@ class Supervisor:
 
     def _journal(self):
         res = self.d.get("result") or {}
+        oc = res.get("outside_code") or {}
         sha = hashlib.sha256((self.d.get("prompt") or "").encode()).hexdigest()
         try:
             prompt = (self.jdir / "prompt.txt").read_text(encoding="utf-8")
@@ -351,7 +435,9 @@ class Supervisor:
                                  "state": self.d.get("state"), "reason": self.d.get("reason"),
                                  "cost_usd": res.get("phase_cost_usd", res.get("total_cost_usd")),
                                  "session_cost_usd": res.get("total_cost_usd"), "num_turns": res.get("num_turns"),
-                                 "session_id": res.get("session_id"), "phase": self.d.get("phase")})
+                                 "session_id": res.get("session_id"), "phase": self.d.get("phase"),
+                                 "docker_count": oc.get("docker_count"), "commits_count": oc.get("commits_count"),
+                                 "git_meta_changed": oc.get("git_meta_changed")})
 
 
 def run_job(hub, jid: str) -> int:

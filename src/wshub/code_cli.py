@@ -159,12 +159,15 @@ def _status(hub: Hub, args: list[str]) -> int:
 
 
 def _result(hub: Hub, args: list[str]) -> int:
-    from .jobs import Jobs
+    from .jobs import Jobs, meta_warning
     jobs = Jobs(hub)
     pos, _ = _parse(args)
     if len(pos) != 1:
         raise WsError("нужно: wshub code result <job>")
     out = jobs.result_view(pos[0])
+    warn = meta_warning(out)
+    if warn:
+        print(warn)
     print(json.dumps(out, ensure_ascii=False, indent=1))
     if out.get("open_in_terminal"):
         print(f"открыть сессию: {out['open_in_terminal']}")

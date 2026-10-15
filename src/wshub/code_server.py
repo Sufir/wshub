@@ -12,7 +12,7 @@ from mcp.server.fastmcp import FastMCP
 
 from . import code_policy
 from .core import WsError
-from .jobs import TERMINAL, Jobs
+from .jobs import TERMINAL, Jobs, meta_warning
 from .registry import RegistryError
 from .taskfile import TaskError
 
@@ -144,14 +144,17 @@ def build_code_server(hub) -> FastMCP:
     @mcp.tool()
     def code_result(job: str) -> str:
         """Итог задачи: состояние, выбор модели и его источник, звенья цепочки и их стоимость, итоговый текст
-        Code, снимок git, команда, чтобы открыть сессию в терминале, и пути к файлам."""
+        Code, снимок git, блок «Вне кода» (коммиты, docker-команды, правки .git/hooks и .git/config — по всем
+        звеньям), команда, чтобы открыть сессию в терминале, и пути к файлам. Правка .git/hooks или .git/config —
+        предупреждение первой строкой."""
         try:
             out = jobs.result_view(job)
         except USER_ERR as e:
             _audit("code_result", job=job, status="error", error=str(e))
             return f"отказ: {e}"
         _audit("code_result", project=out.get("project"), job=job)
-        return _dump(out)
+        warn = meta_warning(out)  # первой строкой, до JSON: обрезка по пределу ответа его не съест
+        return _trim(f"{warn}\n" + json.dumps(out, ensure_ascii=False, indent=1)) if warn else _dump(out)
 
     @mcp.tool()
     def code_cancel(job: str) -> str:

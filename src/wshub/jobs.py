@@ -1,5 +1,6 @@
 """Задачи Claude Code: хранилище, старт, снимки, отмена, resume (ТЗ WSH-2, п. 2.5); политика выбора модели,
-фазы плана и исполнения одной сессии, цепочка звеньев, статистика (ТЗ WSH-3).
+фазы плана и исполнения одной сессии, цепочка звеньев, статистика (ТЗ WSH-3); снимок git на старте звена
+и блок «Вне кода» в итоге (ТЗ WSH-3.3).
 
 Логика не зависит от MCP и проверяется тестами напрямую. Общее с файловым сервером берётся из Hub:
 журнал (`_audit`), служебные каталоги (`protected_kind`), `runtime.pid_alive`/`proc_start`.
@@ -8,11 +9,14 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import hashlib
 import math
 import os
 import secrets
 import shlex
+import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -20,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import claude_cli, code_policy, taskfile
+from . import claude_cli, code_policy, gitsafe, taskfile
 from .core import WsError
 from .registry import ProjectCode, RegistryError
 from .runtime import atomic_write_text, pid_alive, proc_start, read_json
@@ -35,6 +39,13 @@ TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancel
 # сигнал отмены → пауза → эскалация (п. 2.5.4). Паузы можно укоротить env-переменными — только для тестов
 CANCEL_SIGTERM_AFTER = 20
 CANCEL_SIGKILL_AFTER = 10
+GIT_START = "git_start.json"  # снимок git на старте звена, в каталоге звена (ТЗ WSH-3.3, п. 1.2)
+COMMITS_MAX = 20
+DOCKER_MAX = 30
+META_MAX = 30  # строк git_meta_changed и errors в блоке
+HASH_MAX = 64 * 1024 * 1024  # файл в .git крупнее — по размеру и mtime, без чтения
+META_WARNING = ("ВНИМАНИЕ: задача изменила .git/hooks или .git/config. Эти правки не видны в диффе и выполнятся "
+                "твоим git — проверь их перед git-командами в этом репозитории")
 
 
 def cancel_timers() -> tuple[float, float]:
@@ -398,6 +409,7 @@ class Jobs:
         if problem:
             raise JobError(problem)
         flags = claude_cli.detect_flags(claude, self.hub.state_dir, env)
+        git_start = start_snapshot(plan.dir, dict(os.environ))  # тоже подпроцесс — до flock
         with self._flock():
             if link is not None:
                 ld = self.read(link[0])
@@ -448,6 +460,7 @@ class Jobs:
                                    permission_mode=plan.permission_mode, name=plan.session_name())
             atomic_write_text(jdir / "argv.json", json.dumps(argv, ensure_ascii=False))
             atomic_write_text(jdir / "env.json", json.dumps(env, ensure_ascii=False))
+            atomic_write_text(jdir / GIT_START, json.dumps(git_start, ensure_ascii=False, indent=1))
             self.write(jid, data)
 
             sup = self._spawn_supervisor(jid)
@@ -741,8 +754,11 @@ class Jobs:
         d = self.read(snap.get("active") or job)
         jdir = self.job_dir(d["id"])
         sid = d.get("session_id")
+        links = [self.read(x["id"]) for x in snap["chain"]] if snap.get("chain") else [d]
+        # «Вне кода» — один блок по всем звеньям, в итоге активного звена его не повторяем (предел ответа)
+        result = {k: v for k, v in (d.get("result") or {}).items() if k != "outside_code"}
         out = {"job": job, "project": snap.get("project"), "state": snap["state"], "reason": d.get("reason"),
-               "choice": snap.get("choice"), "result": d.get("result") or {},
+               "choice": snap.get("choice"), "outside_code": outside_view(links), "result": result,
                **({"reason_hint": REASON_HINT[d["reason"]]} if d.get("reason") in REASON_HINT else {}),
                "files": {"events": str(jdir / "events.jsonl"), "stderr": str(jdir / "stderr.log"),
                          "task": d.get("task")}}
@@ -797,6 +813,150 @@ REPLAN_PROMPT = "replan"
 # подсказки к коду причины — в снимке и итоге рядом с reason
 REASON_HINT = {"no_plan": "план ищется только в ~/.claude/plans/: настройка plansDirectory в "
                           ".claude/settings*.json проекта не поддерживается"}  # решение 13
+
+
+def git_meta(repo: Path) -> dict:
+    """Исполняемая часть .git, которой нет в диффе (ТЗ WSH-3.3, п. 1.2): .git/hooks — обычный файл по sha256,
+    симлинк по цели; .git/config — так же (обычно sha256). Файлы читает хаб сам, без git.
+    hooks_dir — что такое сам .git/hooks (каталог, симлинк, нет); hooks = None — каталог не прочитан;
+    config = None — файла нет. Имена и цели — без суррогатов (не-UTF-8 имя иначе роняет запись JSON)."""
+    g = repo / ".git"
+    out: dict = {"hooks_dir": None, "hooks": {}, "config": None}
+    errors = []
+    try:
+        st = os.lstat(g / "hooks")
+        out["hooks_dir"] = {"symlink": _text(os.readlink(g / "hooks"))} if stat.S_ISLNK(st.st_mode) else \
+            {"type": "dir" if stat.S_ISDIR(st.st_mode) else "not_dir"}
+        entries = sorted(os.scandir(g / "hooks"), key=lambda e: e.name)
+    except FileNotFoundError:
+        entries = []
+    except OSError as e:
+        entries, out["hooks"] = [], None
+        errors.append(f".git/hooks не прочитан: {e}")
+    for e in entries:
+        try:
+            if e.is_symlink() or e.is_file(follow_symlinks=False):  # каталоги и прочее хуком не запускаются
+                out["hooks"][_text(e.name)] = _file_id(Path(e.path))
+        except FileNotFoundError:
+            pass
+        except OSError as err:  # lstat не прошёл — запись есть, но что это, не узнать: считаем её отдельным видом
+            out["hooks"][_text(e.name)] = {"type": "unreadable"}
+            errors.append(f".git/hooks/{_text(e.name)} не прочитан: {err}")
+    try:
+        out["config"] = _file_id(g / "config")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        out["config"] = {"type": "unreadable"}
+        errors.append(f".git/config не прочитан: {e}")
+    if errors:
+        out["meta_errors"] = [_text(x) for x in errors]
+    return out
+
+
+def start_snapshot(cwd: Path, environ: dict) -> dict:
+    """Снимок на старте звена: полный HEAD через gitsafe и git_meta. Отказ gitsafe (небезопасный ключ, worktree)
+    задачу не останавливает — пишется в error."""
+    out: dict = {"head": None, **git_meta(cwd)}
+    try:
+        r = gitsafe.run(shutil.which("git") or "git", cwd, ["rev-parse", "HEAD"], environ, 30)
+        if r.returncode == 0:
+            out["head"] = r.stdout.strip()
+        else:
+            out["error"] = f"git rev-parse HEAD вернул {r.returncode}: {r.stderr.strip()[:300]}"
+    except gitsafe.GitUnsafe as e:
+        out["error"] = f"{e.reason}: {e}"
+    except (OSError, subprocess.TimeoutExpired) as e:
+        out["error"] = str(e)
+    return out
+
+
+def meta_changes(start: dict, now: dict) -> list[str]:
+    """Что задача сделала с .git/hooks и .git/config по сравнению со снимком на старте."""
+    out = []
+    a, b = start.get("hooks"), now.get("hooks")
+    if "hooks_dir" in start and start.get("hooks_dir") != now.get("hooks_dir"):
+        out.append(".git/hooks — изменён")  # стал симлинком, исчез, появился
+    if a is None or b is None:
+        out.append(".git/hooks — не прочитан")  # сравнить нельзя: хук git пользователя всё равно исполнит
+    else:
+        for name in sorted(set(a) | set(b)):
+            if name not in a:
+                out.append(f".git/hooks/{name} — новый")
+            elif name not in b:
+                out.append(f".git/hooks/{name} — удалён")
+            elif a[name] != b[name]:
+                out.append(f".git/hooks/{name} — изменён")
+    if "config" in start and start.get("config") != now.get("config"):
+        out.append(".git/config — изменён")
+    return out
+
+
+def outside_view(links: list[dict]) -> dict:
+    """Блок «Вне кода» по звеньям (у корня цепочки — по всем): коммиты (новые сверху), docker-вызовы по порядку,
+    изменения .git/hooks и .git/config. Звено без блока (идёт, не дошло до итога, старое) — в no_data."""
+    out: dict = {"commits": [], "commits_count": 0, "docker": [], "docker_count": 0, "git_meta_changed": []}
+    errors, no_data = [], []
+    for x in links:
+        oc = (x.get("result") or {}).get("outside_code")
+        if not isinstance(oc, dict):
+            no_data.append(x.get("id"))
+            continue
+        out["commits"] = list(oc.get("commits") or []) + out["commits"]
+        out["commits_count"] += int(oc.get("commits_count") or 0)
+        out["docker"] += list(oc.get("docker") or [])
+        out["docker_count"] += int(oc.get("docker_count") or 0)
+        out["git_meta_changed"] += [m for m in oc.get("git_meta_changed") or [] if m not in out["git_meta_changed"]]
+        errors += [f"{x.get('id')}: {e}" for e in oc.get("errors") or []]
+    out["commits"] = out["commits"][:COMMITS_MAX]
+    out["docker"] = out["docker"][:DOCKER_MAX]
+    out["git_meta_changed"] = clip_list(out["git_meta_changed"])
+    if errors:
+        out["errors"] = clip_list(errors)
+    if no_data:
+        out["no_data"] = no_data
+    return out
+
+
+def clip_list(items: list[str], limit: int = META_MAX) -> list[str]:
+    """Не больше limit строк (предел ответа 20 КБ и строки журнала) плюс «…ещё N»."""
+    return items if len(items) <= limit else [*items[:limit], f"…ещё {len(items) - limit}"]
+
+
+def meta_warning(view: dict) -> str | None:
+    """Первая строка ответа code_result / wshub code result, если задача тронула .git/hooks или .git/config."""
+    return META_WARNING if (view.get("outside_code") or {}).get("git_meta_changed") else None
+
+
+def _file_id(path: Path) -> dict:
+    """{"symlink": цель} | {"sha256": …} обычного файла | {"type": …} прочего. Сначала lstat: спецфайл не
+    открывается, симлинк не проходится; открытие — без следования по симлинку и без блокировки (подмена между
+    lstat и open). Файл в .git могла подложить задача (через docker). Нечитаемый или крупный файл — по размеру
+    и mtime: так его появление и смена тоже видны."""
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode):
+        return {"symlink": _text(os.readlink(path))}
+    if not stat.S_ISREG(st.st_mode):
+        return {"type": "not_regular"}
+    meta = {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    if st.st_size > HASH_MAX:
+        return {"type": "large", **meta}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except PermissionError:
+        return {"type": "unreadable", **meta}
+    with os.fdopen(fd, "rb") as fh:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return {"type": "not_regular"}
+        h = hashlib.sha256()
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+        return {"sha256": h.hexdigest()}
+
+
+def _text(name: str) -> str:
+    """Имя с не-UTF-8 байтами (суррогаты из os.fsdecode) — с экранированием: JSON в UTF-8 его иначе не запишет."""
+    return os.fsencode(name).decode("utf-8", "backslashreplace")
 
 
 def _channel(chans) -> str | None:

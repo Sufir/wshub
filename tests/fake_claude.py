@@ -14,12 +14,16 @@
   FAKE_NO_PLAN — в режиме plan не писать план (кейс no_plan)
   FAKE_PLAN    — текст плана (по умолчанию короткий план)
   FAKE_SELF_CANCEL — перед итогом создать файл cancel в каталоге задачи (отмена «между выходом и итогом»)
+  FAKE_DOCKER  — Bash-вызовы docker compose: успешный и с ошибкой в tool_result, плюс не-docker команды
+  FAKE_GIT_META — создать .git/hooks/pre-commit и дописать секцию в .git/config (обход через смонтированный каталог)
+  FAKE_COMMIT  — сделать коммит в cwd
 В режиме plan фейк, как настоящий claude 2.1.291 (PoC WSH-3, 0.3.1), пишет план инструментом Write
 в $HOME/.claude/plans/<slug>.md и завершается success.
 """
 import json
 import os
 import signal
+import subprocess
 import sys
 import time
 
@@ -89,6 +93,28 @@ def main() -> int:
         open(os.path.join(os.getcwd(), os.environ["FAKE_TOUCH"]), "w").close()
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read",
           "input": {"file_path": "x"}}]}})
+
+    if os.environ.get("FAKE_DOCKER"):
+        calls = (("dk_ok", "docker compose up -d db", False),
+                 ("dk_err", "cd app && docker compose run --rm app pytest -v tests/x.py::t", True),
+                 ("sh_ls", "ls docker && echo docker-compose", False))
+        for uid, cmd, err in calls:
+            uid = f"{uid}_{os.getpid()}"
+            emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": uid, "name": "Bash",
+                  "input": {"command": cmd}}]}})
+            emit({"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": uid,
+                  "is_error": err, "content": "denied" if err else "ok"}]}})
+    if os.environ.get("FAKE_GIT_META"):
+        hook = os.path.join(os.getcwd(), ".git", "hooks", "pre-commit")
+        with open(hook, "w") as f:
+            f.write("#!/bin/sh\necho fake\n")
+        os.chmod(hook, 0o755)
+        with open(os.path.join(os.getcwd(), ".git", "config"), "a") as f:
+            f.write("[wshubfake]\n\tmark = 1\n")
+    if os.environ.get("FAKE_COMMIT"):
+        subprocess.run(["git", "-c", "user.name=fake", "-c", "user.email=fake@e", "-c", "core.hooksPath=/dev/null",
+                        "commit", "-q", "--allow-empty", "-m", f"fake commit {perm_mode}"], check=True,
+                       stdin=subprocess.DEVNULL, capture_output=True)
 
     slept = 0.0
     step = 0.05

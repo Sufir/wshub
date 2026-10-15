@@ -17,8 +17,20 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import gitsafe
-from .jobs import COMMITS_MAX, DOCKER_MAX, GIT_START, JobError, Jobs, cancel_timers, clip_list, git_meta, meta_changes
+from . import code_events, gitsafe
+from .jobs import (
+    COMMITS_MAX,
+    DOCKER_MAX,
+    GIT_START,
+    JobError,
+    Jobs,
+    cancel_timers,
+    clip_list,
+    config_keys,
+    git_meta,
+    head_state,
+    meta_changes,
+)
 from .runtime import atomic_write_text, proc_start, read_json
 
 PREFETCH_TIMEOUT = 120
@@ -120,10 +132,11 @@ def _git_snapshot(git: str, cwd: Path, environ: dict) -> dict:
 
 
 def _docker_calls(events_path: Path) -> tuple[list[str], int]:
-    """Bash-вызовы docker из потока событий: первые DOCKER_MAX, команда ≤ DOCKER_CMD_MAX символов, «— отказ»,
-    если парный tool_result — ошибка; плюс общее число."""
+    """Bash-вызовы docker из потока событий: первые DOCKER_MAX, команда ≤ DOCKER_CMD_MAX символов, «— отказ»
+    (права или хук) или «— ошибка» (прочий is_error) по парному tool_result (ТЗ WSH-3.4, Б5); плюс общее число."""
     uses: list[tuple[str | None, str]] = []
-    failed: set[str] = set()
+    results: dict[str, dict] = {}
+    denied: set[str] = set()
     try:
         lines = events_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
@@ -133,18 +146,27 @@ def _docker_calls(events_path: Path) -> tuple[list[str], int]:
             e = json.loads(line)
         except ValueError:
             continue
-        msg = e.get("message") if isinstance(e, dict) else None
+        if not isinstance(e, dict):
+            continue
+        if e.get("type") == "system" and e.get("subtype") == "permission_denied":
+            denied.add(e.get("tool_use_id"))
+        if e.get("type") == "result":
+            denied |= {d.get("tool_use_id") for d in e.get("permission_denials") or [] if isinstance(d, dict)}
+        msg = e.get("message")
         content = msg.get("content") if isinstance(msg, dict) else None
         for c in content if isinstance(content, list) else []:
             if not isinstance(c, dict):
                 continue
-            if c.get("type") == "tool_result" and c.get("is_error") and isinstance(c.get("tool_use_id"), str):
-                failed.add(c["tool_use_id"])
+            if c.get("type") == "tool_result" and isinstance(c.get("tool_use_id"), str):
+                results[c["tool_use_id"]] = c
             if e.get("type") == "assistant" and c.get("type") == "tool_use" and c.get("name") == "Bash":
                 cmd = (c.get("input") or {}).get("command") if isinstance(c.get("input"), dict) else None
                 if isinstance(cmd, str) and DOCKER_RE.search(cmd):
                     uses.append((c.get("id") if isinstance(c.get("id"), str) else None, cmd))
-    out = [cmd[:DOCKER_CMD_MAX] + (" — отказ" if uid in failed else "") for uid, cmd in uses[:DOCKER_MAX]]
+    out = []
+    for uid, cmd in uses[:DOCKER_MAX]:
+        m = code_events.mark(results[uid], denied) if uid in results else None
+        out.append(cmd[:DOCKER_CMD_MAX] + (f" — {m}" if m else ""))
     return out, len(uses)
 
 
@@ -162,21 +184,17 @@ def _outside_code(git: str, cwd: Path, environ: dict, jdir: Path) -> dict:
     if start:
         try:
             now = git_meta(cwd)
-            out["git_meta_changed"] = clip_list(meta_changes(start, now))
+            if start.get("config_salt"):
+                now["config_keys"] = config_keys(git, cwd, environ, start["config_salt"])
+            out["git_meta_changed"] = clip_list(_drop_push_upstream(meta_changes(start, now), jdir))
             errors += [f"на старте: {m}" for m in start.get("meta_errors") or []]
             errors += [f"в конце: {m}" for m in now.get("meta_errors") or []]
         except Exception as e:  # noqa: BLE001
             out["git_meta_changed"] = [".git/hooks и .git/config — не проверены"]
             errors.append(f".git не проверен: {e}")
-    head = start.get("head")
-    if head:
+    if start and (start.get("head") or start.get("empty")):
         try:
-            r = gitsafe.run(git, cwd, ["log", "--oneline", f"{head}..HEAD"], environ, 30)
-            if r.returncode == 0:
-                commits = r.stdout.splitlines()
-                out["commits"], out["commits_count"] = commits[:COMMITS_MAX], len(commits)
-            else:
-                errors.append(f"git log вернул {r.returncode}: {r.stderr.strip()[:300]}")
+            _commits(git, cwd, environ, start, out, errors)
         except gitsafe.GitUnsafe as e:
             errors.append(f"коммиты: {e.reason}: {e}")
         except Exception as e:  # noqa: BLE001 — OSError, TimeoutExpired, декодирование вывода
@@ -190,6 +208,60 @@ def _outside_code(git: str, cwd: Path, environ: dict, jdir: Path) -> dict:
     if errors:
         out["errors"] = clip_list([x[:500] for x in errors])
     return out
+
+
+def _drop_push_upstream(lines: list[str], jdir: Path) -> list[str]:
+    """Ключи branch.<ветка>.remote и .merge, которые поставил сам wshub push -u этого звена (успешный пуш ветки в
+    external.jsonl), — не правка задачи: без них предупреждение про .git было бы после каждого пуша (стенд WSH-3.4)."""
+    pushed = set()
+    try:
+        for line in (jdir / "external.jsonl").read_text(encoding="utf-8").splitlines():
+            r = json.loads(line)
+            if isinstance(r, dict) and r.get("cmd") == "push" and r.get("exit") == 0 and len(r.get("args") or []) > 1:
+                pushed.add(r["args"][1])
+    except (OSError, ValueError):
+        return lines
+    own = {f".git/config — {what} ключ branch.{b}.{k}" for b in pushed for k in ("remote", "merge")
+           for what in ("добавлен", "изменён")}
+    return [x for x in lines if x not in own]
+
+
+def _commits(git: str, cwd: Path, environ: dict, start: dict, out: dict, errors: list[str]) -> None:
+    """Коммиты звена (ТЗ WSH-3.4, Б6): HEAD и ветка на старте и в конце. Старт — предок конца: коммиты
+    старт..конец; пустой репозиторий на старте — все коммиты от корня. Старт не предок конца (reset назад,
+    другая ветка) — строка «HEAD ушёл» без коммитов. Ветка сменилась, но старт — предок: коммиты старт..конец,
+    сделанные после старта звена; более старые — чужие (ветка уже была), тогда тоже «HEAD ушёл»."""
+    end = head_state(git, cwd, environ)
+    out.update(head_start=start.get("head"), head_end=end.get("head"), branch_start=start.get("branch"),
+               branch_end=end.get("branch"))
+    if end.get("error"):
+        errors.append(f"коммиты: {end['error']}")
+        return
+    head, last = start.get("head"), end.get("head")
+    if not last:
+        return  # в конце коммитов нет (пустой репозиторий так и остался пустым)
+    moved = (f"HEAD ушёл: {start.get('branch') or '(отсоединён)'} {(head or '—')[:9]} → "
+             f"{end.get('branch') or '(отсоединён)'} {last[:9]}")
+    if head:
+        r = gitsafe.run(git, cwd, ["merge-base", "--is-ancestor", head, last], environ, 30)
+        if r.returncode != 0:
+            if r.returncode != 1:
+                errors.append(f"git merge-base вернул {r.returncode}: {r.stderr.strip()[:300]}")
+            out["head_moved"] = moved
+            return
+    r = gitsafe.run(git, cwd, ["log", "--format=%ct %h %s", f"{head}..{last}" if head else last], environ, 30)
+    if r.returncode != 0:
+        errors.append(f"git log вернул {r.returncode}: {r.stderr.strip()[:300]}")
+        return
+    rows = [line.split(" ", 1) for line in r.stdout.splitlines() if " " in line]
+    commits = [c for _t, c in rows]
+    if start.get("branch") != end.get("branch") and isinstance(start.get("ts"), (int, float)):
+        since = int(start["ts"]) - 1  # время коммита — в секундах
+        own = [c for t, c in rows if t.isdigit() and int(t) >= since]
+        if len(own) != len(commits):
+            out["head_moved"] = moved
+        commits = own
+    out["commits"], out["commits_count"] = commits[:COMMITS_MAX], len(commits)
 
 
 def _find_status(text: str, regex: str | None) -> str | None:
@@ -255,7 +327,7 @@ class Supervisor:
         return True
 
     def _fail(self, reason: str, message: str) -> None:
-        self.d.update(state="failed", reason=reason, error=message,
+        self.d.update(state="failed", reason=reason, error=message, finished_ts=time.time(),
                       finished=datetime.now().astimezone().isoformat(timespec="seconds"))
         self._journal()  # журнал до записи терминального состояния (замечание 10)
         self.jobs.write(self.jid, self.d)
@@ -338,7 +410,7 @@ class Supervisor:
         atomic_write_text(self.jdir / "result.json", json.dumps(result, ensure_ascii=False, indent=1))
         # журнал пишем до терминального состояния в job.json: читатель, увидевший терминал, уже видит строку
         self.d.update(state=state, reason=reason, session_id=result["session_id"], result=result,
-                      finished=datetime.now().astimezone().isoformat(timespec="seconds"))
+                      finished_ts=time.time(), finished=datetime.now().astimezone().isoformat(timespec="seconds"))
         self._journal()
         self.jobs.write(self.jid, self.d)
         if state == "plan_ready" and self.d.get("plan_mode") == "auto":

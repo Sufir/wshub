@@ -116,6 +116,11 @@ def unsafe_message(repo: Path, entries: list[tuple[str, str, Path]]) -> str:
     return "хаб не запускает git в репозитории с такими ключами в .git/config: " + "; ".join(rows)
 
 
+def unsafe_key(key: str) -> bool:
+    """Ключ из запретного списка (без учёта регистра) — «опасный» в блоке «Вне кода»."""
+    return any(fnmatch.fnmatchcase(key.lower(), p) for p in UNSAFE_KEYS)
+
+
 def argv(git: str, cwd: Path, *args: str, overrides: tuple[str, ...] = OVERRIDES) -> list[str]:
     out = [git, "--no-optional-locks", "-C", str(cwd)]
     for o in overrides:

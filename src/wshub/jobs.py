@@ -546,7 +546,7 @@ class Jobs:
         d = self.read(jid)
         state = self.effective_state(d)
         now = now or time.time()
-        elapsed = int(now - (d.get("started") or d.get("created_ts") or now))
+        elapsed = int(_end_ts(d, state, now) - (d.get("started") or d.get("created_ts") or now))
         snap = {"id": jid, "project": d.get("project"), "state": state, "reason": d.get("reason"),
                 "task": d.get("task"), "profile": d.get("profile"), "model": d.get("model"),
                 "elapsed_s": max(elapsed, 0), "session_id": d.get("session_id"), "parent": d.get("parent"),
@@ -562,9 +562,12 @@ class Jobs:
                 # корень цепочки (2.3.6): состояние и фаза — активного звена, плюс все звенья
                 links = self.chain(jid)
                 active = links[-1]
-                snap.update(own_state=state, state=self._chain_state(active), phase=active.get("phase"),
+                chain_state = self._chain_state(active)
+                end = _end_ts(active, chain_state, now)  # время цепочки: от старта корня до конца активного звена
+                snap.update(own_state=state, state=chain_state, phase=active.get("phase"),
                             active=active["id"], chain=[self._link_row(x) for x in links],
-                            cost_usd=_sum(phase_cost(x) for x in links))
+                            cost_usd=_sum(phase_cost(x) for x in links),
+                            elapsed_s=max(int(end - (d.get("started") or d.get("created_ts") or end)), 0))
         return snap
 
     def _link_row(self, d: dict) -> dict:
@@ -782,9 +785,11 @@ class Jobs:
             raise JobError(f"плана у {d['id']} нет (состояние {self.effective_state(d)})")
         return path.read_text(encoding="utf-8", errors="replace"), path
 
-    def result_view(self, job: str) -> dict:
+    def result_view(self, job: str, docker_max: int = DOCKER_MAX) -> dict:
         """Итог задачи для code_result и wshub code result: у корня цепочки — все звенья, стоимость обеих фаз
-        и итог активного звена; строка, чтобы открыть сессию в терминале (2.5.2)."""
+        и итог активного звена; строка, чтобы открыть сессию в терминале (2.5.2). docker_max — сколько
+        docker-команд блока «Вне кода» показать (MCP — 10, CLI — все 30; ТЗ WSH-3.4, Б8). Ходы и действия —
+        по событиям всех звеньев, как в code_status (Б1). Файлы — только существующие (Б3)."""
         snap = self.snapshot(job)
         d = self.read(snap.get("active") or job)
         jdir = self.job_dir(d["id"])
@@ -793,11 +798,12 @@ class Jobs:
         # «Вне кода» — один блок по всем звеньям, в итоге активного звена его не повторяем (предел ответа)
         result = {k: v for k, v in (d.get("result") or {}).items() if k != "outside_code"}
         out = {"job": job, "project": snap.get("project"), "state": snap["state"], "reason": d.get("reason"),
-               "choice": snap.get("choice"), "grants": d.get("grants") or {}, "outside_code": outside_view(links),
+               "choice": snap.get("choice"), "elapsed_s": snap.get("elapsed_s"), **self.counts(links),
+               "grants": d.get("grants") or {}, "outside_code": outside_view(links, docker_max),
                "external": self.external_view(links), "result": result,
                **({"reason_hint": REASON_HINT[d["reason"]]} if d.get("reason") in REASON_HINT else {}),
-               "files": {"events": str(jdir / "events.jsonl"), "stderr": str(jdir / "stderr.log"),
-                         "task": d.get("task")}}
+               "files": {"events": _existing(jdir / "events.jsonl"), "stderr": _existing(jdir / "stderr.log"),
+                         "task": _existing(Path(d["task"]), "нет (файл ТЗ удалён)") if d.get("task") else None}}
         if snap.get("chain"):
             out.update(phase=snap.get("phase"), active=snap.get("active"), chain=snap["chain"],
                        cost_usd=snap.get("cost_usd"))
@@ -807,6 +813,16 @@ class Jobs:
             out["files"]["plan"] = str(plan_md)
         if sid and d.get("dir"):
             out["open_in_terminal"] = f"cd {shlex.quote(d['dir'])} && claude --resume {sid}"
+        return out
+
+    def counts(self, links: list[dict]) -> dict:
+        """Ходы и действия по events.jsonl звеньев (ТЗ WSH-3.4, Б1) — одни и те же цифры во всех ответах."""
+        from . import code_events
+        out = {"turns": 0, "actions": 0}
+        for x in links:
+            c = code_events.scan(self.job_dir(x["id"]) / "events.jsonl", x.get("dir")).counts()
+            out["turns"] += c["turns"]
+            out["actions"] += c["actions"]
         return out
 
     def external_view(self, links: list[dict]) -> dict:
@@ -990,20 +1006,59 @@ def git_meta(repo: Path) -> dict:
 
 
 def start_snapshot(cwd: Path, environ: dict) -> dict:
-    """Снимок на старте звена: полный HEAD через gitsafe и git_meta. Отказ gitsafe (небезопасный ключ, worktree)
-    задачу не останавливает — пишется в error."""
-    out: dict = {"head": None, **git_meta(cwd)}
+    """Снимок на старте звена: полный HEAD и ветка через gitsafe, git_meta и ключи .git/config. Отказ gitsafe
+    (небезопасный ключ, worktree) задачу не останавливает — пишется в error. Пустой репозиторий (ветка без
+    коммитов) — empty: коммиты в конце считаются от корня (ТЗ WSH-3.4, Б6)."""
+    git = shutil.which("git") or "git"
+    out: dict = {"head": None, "branch": None, "ts": time.time(), **git_meta(cwd)}
+    salt = secrets.token_hex(8)
+    keys = config_keys(git, cwd, environ, salt)
+    if keys is not None:
+        out.update(config_salt=salt, config_keys=keys)
     try:
-        r = gitsafe.run(shutil.which("git") or "git", cwd, ["rev-parse", "HEAD"], environ, 30)
-        if r.returncode == 0:
-            out["head"] = r.stdout.strip()
-        else:
-            out["error"] = f"git rev-parse HEAD вернул {r.returncode}: {r.stderr.strip()[:300]}"
+        out.update(head_state(git, cwd, environ))
     except gitsafe.GitUnsafe as e:
         out["error"] = f"{e.reason}: {e}"
     except (OSError, subprocess.TimeoutExpired) as e:
         out["error"] = str(e)
     return out
+
+
+def head_state(git: str, cwd: Path, environ: dict) -> dict:
+    """HEAD и ветка: {head, branch} (branch = None — HEAD отсоединён), {head: None, empty: True} — ветка без
+    коммитов, {head: None, error} — HEAD не читается."""
+    r = gitsafe.run(git, cwd, ["rev-parse", "--verify", "-q", "HEAD"], environ, 30)
+    b = gitsafe.run(git, cwd, ["symbolic-ref", "-q", "--short", "HEAD"], environ, 30)
+    branch = b.stdout.strip() if b.returncode == 0 and b.stdout.strip() else None
+    if r.returncode == 0:
+        return {"head": r.stdout.strip(), "branch": branch}
+    if branch is not None:
+        return {"head": None, "branch": branch, "empty": True}
+    return {"head": None, "branch": None,
+            "error": f"git rev-parse HEAD вернул {r.returncode}: {r.stderr.strip()[:300]}"}
+
+
+def config_keys(git: str, repo: Path, environ: dict, salt: str) -> dict | None:
+    """Ключи .git/config без значений (ТЗ WSH-3.4, Б7): ключ → хэш значений с солью снимка — так видно, что ключ
+    изменился, а значения (в конфигурации бывают учётные данные) не хранятся. Читает git config --file …
+    --list --no-includes в чистом окружении (gitsafe.env): чтение ничего не запускает. Файл не обычный (симлинк,
+    спецфайл) или не читается — None, сравнение идёт по sha256 файла."""
+    path = repo / ".git" / "config"
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        r = subprocess.run([git, "config", "--file", str(path), "--list", "--no-includes"], capture_output=True,
+                           text=True, errors="replace", timeout=gitsafe.CONFIG_TIMEOUT, env=gitsafe.env(environ),
+                           stdin=subprocess.DEVNULL, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    values: dict[str, list[str]] = {}
+    for line in r.stdout.splitlines():
+        key, _, value = line.partition("=")
+        values.setdefault(_text(key), []).append(value)
+    return {k: hashlib.sha256((salt + "\x00" + "\x00".join(v)).encode()).hexdigest()[:16] for k, v in values.items()}
 
 
 def meta_changes(start: dict, now: dict) -> list[str]:
@@ -1023,20 +1078,38 @@ def meta_changes(start: dict, now: dict) -> list[str]:
             elif a[name] != b[name]:
                 out.append(f".git/hooks/{name} — изменён")
     if "config" in start and start.get("config") != now.get("config"):
-        out.append(".git/config — изменён")
+        a, b = start.get("config_keys"), now.get("config_keys")
+        if isinstance(a, dict) and isinstance(b, dict):
+            rows = [(k, "добавлен") for k in b if k not in a] + [(k, "удалён") for k in a if k not in b] + \
+                [(k, "изменён") for k in a if k in b and a[k] != b[k]]
+            out += [f".git/config — {what} ключ {k}" + (" (опасный)" if gitsafe.unsafe_key(k) else "")
+                    for k, what in sorted(rows)]
+            if not rows:
+                out.append(".git/config — изменён, ключи те же")
+        else:
+            out.append(".git/config — изменён")
     return out
 
 
-def outside_view(links: list[dict]) -> dict:
-    """Блок «Вне кода» по звеньям (у корня цепочки — по всем): коммиты (новые сверху), docker-вызовы по порядку,
+def outside_view(links: list[dict], docker_max: int = DOCKER_MAX) -> dict:
+    """Блок «Вне кода» по звеньям (у корня цепочки — по всем): HEAD и ветка на старте первого звена и в конце
+    последнего, строки «HEAD ушёл», коммиты (новые сверху), docker-вызовы по порядку (не больше docker_max),
     изменения .git/hooks и .git/config. Звено без блока (идёт, не дошло до итога, старое) — в no_data."""
     out: dict = {"commits": [], "commits_count": 0, "docker": [], "docker_count": 0, "git_meta_changed": []}
-    errors, no_data = [], []
+    errors, no_data, moved = [], [], []
     for x in links:
         oc = (x.get("result") or {}).get("outside_code")
         if not isinstance(oc, dict):
             no_data.append(x.get("id"))
             continue
+        for k in ("head_start", "branch_start"):
+            if k in oc and k not in out:
+                out[k] = oc[k]
+        for k in ("head_end", "branch_end"):
+            if k in oc:
+                out[k] = oc[k]
+        if oc.get("head_moved"):
+            moved.append(oc["head_moved"])
         out["commits"] = list(oc.get("commits") or []) + out["commits"]
         out["commits_count"] += int(oc.get("commits_count") or 0)
         out["docker"] += list(oc.get("docker") or [])
@@ -1044,7 +1117,9 @@ def outside_view(links: list[dict]) -> dict:
         out["git_meta_changed"] += [m for m in oc.get("git_meta_changed") or [] if m not in out["git_meta_changed"]]
         errors += [f"{x.get('id')}: {e}" for e in oc.get("errors") or []]
     out["commits"] = out["commits"][:COMMITS_MAX]
-    out["docker"] = out["docker"][:DOCKER_MAX]
+    out["docker"] = out["docker"][:min(docker_max, DOCKER_MAX)]
+    if moved:
+        out["head_moved"] = moved
     out["git_meta_changed"] = clip_list(out["git_meta_changed"])
     if errors:
         out["errors"] = clip_list(errors)
@@ -1092,6 +1167,24 @@ def _file_id(path: Path) -> dict:
 def _text(name: str) -> str:
     """Имя с не-UTF-8 байтами (суррогаты из os.fsdecode) — с экранированием: JSON в UTF-8 его иначе не запишет."""
     return os.fsencode(name).decode("utf-8", "backslashreplace")
+
+
+def _end_ts(d: dict, state: str, now: float) -> float:
+    """Конец отсчёта времени звена (ТЗ WSH-3.4, Б2): у завершённого — момент завершения (finished_ts, у старых
+    задач — finished), а не текущее время."""
+    if state not in TERMINAL:
+        return now
+    if isinstance(d.get("finished_ts"), (int, float)):
+        return float(d["finished_ts"])
+    try:
+        return datetime.fromisoformat(d["finished"]).timestamp()
+    except (KeyError, TypeError, ValueError):
+        return now
+
+
+def _existing(path: Path, missing: str = "нет (задача не дошла до запуска claude)") -> str:
+    """Путь для code_result: только существующий файл (ТЗ WSH-3.4, Б3)."""
+    return str(path) if path.exists() else missing
 
 
 def _channel(chans) -> str | None:

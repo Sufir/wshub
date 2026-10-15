@@ -49,8 +49,11 @@ def test_empty_block_no_warning(code, capsys, monkeypatch):
     text = _call(code, "code_result", {"job": jid})
     assert not text.startswith("ВНИМАНИЕ")
     out = json.loads(text)
+    branch = subprocess.run(["git", "-C", str(code.root), "symbolic-ref", "--short", "HEAD"], capture_output=True,
+                            text=True, check=True).stdout.strip()
     assert out["outside_code"] == {"commits": [], "commits_count": 0, "docker": [], "docker_count": 0,
-                                   "git_meta_changed": []}
+                                   "git_meta_changed": [], "head_start": head, "head_end": head,
+                                   "branch_start": branch, "branch_end": branch}
     assert "outside_code" not in out["result"]  # блок один — на верхнем уровне
     assert _cli_result(code, jid, capsys)[0] == "{"
     p = _finish_rec(code, jid)
@@ -61,9 +64,10 @@ def test_docker_calls_listed_with_denial(code, monkeypatch):
     jid = _run(code, monkeypatch, FAKE_DOCKER="1")
     out = json.loads(_call(code, "code_result", {"job": jid}))["outside_code"]
     assert out["docker"] == ["docker compose up -d db",
-                             "cd app && docker compose run --rm app pytest -v tests/x.py::t — отказ"]
-    assert out["docker_count"] == 2 and out["git_meta_changed"] == []
-    assert _finish_rec(code, jid)["docker_count"] == 2
+                             "cd app && docker compose run --rm app pytest -v tests/x.py::t — отказ",
+                             "docker compose run --rm app false — ошибка"]
+    assert out["docker_count"] == 3 and out["git_meta_changed"] == []
+    assert _finish_rec(code, jid)["docker_count"] == 3
 
 
 def test_commits_listed(code, monkeypatch):
@@ -78,10 +82,10 @@ def test_git_meta_change_warns_first_line(code, capsys, monkeypatch):
     text = _call(code, "code_result", {"job": jid})
     first, body = text.split("\n", 1)
     assert first == META_WARNING
-    assert json.loads(body)["outside_code"]["git_meta_changed"] == [".git/hooks/pre-commit — новый",
-                                                                     ".git/config — изменён"]
+    changed = [".git/hooks/pre-commit — новый", ".git/config — добавлен ключ wshubfake.mark"]
+    assert json.loads(body)["outside_code"]["git_meta_changed"] == changed
     assert _cli_result(code, jid, capsys)[0] == META_WARNING
-    assert _finish_rec(code, jid)["git_meta_changed"] == [".git/hooks/pre-commit — новый", ".git/config — изменён"]
+    assert _finish_rec(code, jid)["git_meta_changed"] == changed
 
 
 def test_chain_root_covers_both_links(code, monkeypatch):
@@ -93,7 +97,7 @@ def test_chain_root_covers_both_links(code, monkeypatch):
     for x in snap["chain"]:  # у каждого звена — свой снимок на старте
         assert (code.jobs.job_dir(x["id"]) / GIT_START).is_file()
     out = json.loads(_call(code, "code_result", {"job": root}))["outside_code"]
-    assert out["docker_count"] == 4 and len(out["docker"]) == 4
+    assert out["docker_count"] == 6 and len(out["docker"]) == 6
     assert out["commits_count"] == 2
     assert out["commits"][0].endswith("fake commit dontAsk") and out["commits"][1].endswith("fake commit plan")
     assert "no_data" not in out

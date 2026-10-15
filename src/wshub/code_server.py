@@ -35,6 +35,7 @@ code_start(project, task) по файлу ТЗ с шапкой запуска в
 """ + code_policy.GUIDE
 
 ANSWER_MAX = 20 * 1024  # байт
+RESULT_DOCKER_MAX = 10  # docker-команд блока «Вне кода» в code_result; wshub code result показывает все 30
 
 
 def _trim(text: str) -> str:
@@ -121,20 +122,21 @@ def build_code_server(hub) -> FastMCP:
 
     @mcp.tool()
     def code_status(job: str) -> str:
-        """Снимок задачи: состояние, прошедшее время, число ходов и последние 5 событий кратко."""
+        """Снимок задачи: состояние, прошедшее время (у завершённой — до завершения), ходы (как num_turns и
+        --max-turns), действия (вызовы инструментов) и последние 5 событий кратко."""
         try:
-            snap = jobs.snapshot(job)
+            snap = _snapshot(jobs, job)
         except USER_ERR as e:
             _audit("code_status", job=job, status="error", error=str(e))
             return f"отказ: {e}"
-        snap["turns"] = _turns(jobs, job)
         snap["events"] = _recent_events(jobs, job)
         _audit("code_status", project=snap.get("project"), job=job)
         return _dump(snap)
 
     @mcp.tool()
     def code_wait(job: str, seconds: int = 30) -> str:
-        """Ждать смены состояния задачи, не дольше [code].max_wait_s. Ответ — снимок."""
+        """Ждать смены состояния задачи не дольше min(seconds, max_wait_s) — max_wait_s из [code] реестра.
+        Ответ — снимок с ходами и действиями, как у code_status, плюс waited_s (сколько ждал) и cap_s (потолок)."""
         try:
             reg = hub.registry.get()
             cap = reg.code.glob.max_wait_s
@@ -142,24 +144,28 @@ def build_code_server(hub) -> FastMCP:
         except USER_ERR as e:
             _audit("code_wait", job=job, status="error", error=str(e))
             return f"отказ: {e}"
-        deadline = time.time() + max(0, min(seconds, cap))
+        t0 = time.time()
+        deadline = t0 + max(0, min(seconds, cap))
         start_state = snap["state"]
         while time.time() < deadline:
             snap = jobs.snapshot(job)
             if snap["state"] != start_state or snap["state"] in TERMINAL:  # в т. ч. plan_ready (2.3.6)
                 break
             time.sleep(0.5)
+        snap = _snapshot(jobs, job)
+        snap.update(waited_s=int(round(time.time() - t0)), cap_s=cap)
         _audit("code_wait", project=snap.get("project"), job=job)
         return _dump(snap)
 
     @mcp.tool()
     def code_result(job: str) -> str:
-        """Итог задачи: состояние, выбор модели и его источник, звенья цепочки и их стоимость, итоговый текст
-        Code, снимок git, блок «Вне кода» (коммиты, docker-команды, правки .git/hooks и .git/config — по всем
-        звеньям), команда, чтобы открыть сессию в терминале, и пути к файлам. Правка .git/hooks или .git/config —
+        """Итог задачи: состояние, выбор модели и его источник, ходы и действия, звенья цепочки и их стоимость,
+        итоговый текст Code, снимок git, блок «Вне кода» (HEAD и ветка, коммиты, до 10 docker-команд и их число,
+        правки .git/hooks и .git/config — по всем звеньям), «Внешние действия» (пуш, API хостинга), команда,
+        чтобы открыть сессию в терминале, и пути к существующим файлам. Правка .git/hooks или .git/config —
         предупреждение первой строкой."""
         try:
-            out = jobs.result_view(job)
+            out = jobs.result_view(job, docker_max=RESULT_DOCKER_MAX)
         except USER_ERR as e:
             _audit("code_result", job=job, status="error", error=str(e))
             return f"отказ: {e}"
@@ -183,6 +189,7 @@ def build_code_server(hub) -> FastMCP:
                     max_turns: int = 0, budget_usd: float = 0.0, chosen_by: str = "", reason: str = "",
                     push: bool = False, forge: bool = False) -> str:
         """Продолжить задачу. prompt — ИМЯ шаблона промпта (не текст): рендер как при старте, с {note}.
+        note — одна строка ≤ 300 символов; длинную инструкцию — разделом в ТЗ, в note — ссылку на раздел.
         Новый job с --resume session_id родителя; родитель не завершён или это фаза плана — отказ.
         model/effort — как у родителя; сменить — с reason (чат) или chosen_by="operator".
         push/forge — добавить разрешение (как у code_start); разрешения родителя наследуются.
@@ -218,6 +225,7 @@ def build_code_server(hub) -> FastMCP:
     def code_approve(job: str, note: str = "") -> str:
         """Утвердить план в plan_ready и запустить фазу исполнения: та же сессия (--resume), dontAsk, модель
         исполнения по выбору задачи, остаток бюджета. Утверждай план, который прочитал (code_plan).
+        note — одна строка ≤ 300 символов; длинную инструкцию — разделом в ТЗ, в note — ссылку на раздел.
         План обязателен по политике для task M/L и S/high (size: S — один слой ≤ 3 файлов, M — несколько, L —
         контракты/схема/сервисы; risk: high — безопасность, деньги, данные, миграции). Модель исполнения не
         меняется здесь: отступление от политики — только в code_start с reason; выбор оператора — как есть."""
@@ -274,22 +282,15 @@ def _grants_line(g: dict | None) -> str:
     return (", ".join(got) + (f" — {g['reason']}" if g.get("reason") else "")) if got else "нет"
 
 
-def _turns(jobs: Jobs, job: str) -> int:
-    """Число ходов по событиям: сообщения ассистента в events.jsonl (2.7)."""
-    path = jobs.job_dir(job) / "events.jsonl"
+def _snapshot(jobs: Jobs, job: str) -> dict:
+    """Снимок с ходами и действиями по событиям (ТЗ WSH-3.4, Б1): у корня цепочки — по всем звеньям."""
+    snap = jobs.snapshot(job)
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return 0
-    n = 0
-    for line in lines:
-        try:
-            e = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(e, dict) and e.get("type") == "assistant":
-            n += 1
-    return n
+        links = [jobs.read(x["id"]) for x in snap["chain"]] if snap.get("chain") else [jobs.read(job)]
+    except WsError:  # звено пропало между чтениями — снимок без счёта
+        return snap
+    snap.update(jobs.counts(links))
+    return snap
 
 
 def _recent_events(jobs: Jobs, job: str) -> list[str]:

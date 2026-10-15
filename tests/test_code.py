@@ -20,7 +20,8 @@ from wshub.registry import RegistryError, parse
 FAKE = Path(__file__).parent / "fake_claude.py"
 FAKE_ENV = ["FAKE_REC", "FAKE_SLEEP", "FAKE_SIGINT", "FAKE_TOUCH", "FAKE_COST", "FAKE_SUBTYPE",
             "FAKE_DENIALS", "FAKE_SIGMARK", "FAKE_RECLOG", "FAKE_NO_PLAN", "FAKE_PLAN", "FAKE_COST_PLAN",
-            "FAKE_SLEEP_PLAN", "FAKE_SELF_CANCEL", "FAKE_DOCKER", "FAKE_GIT_META", "FAKE_COMMIT"]
+            "FAKE_SLEEP_PLAN", "FAKE_SELF_CANCEL", "FAKE_DOCKER", "FAKE_GIT_META", "FAKE_COMMIT",
+            "FAKE_SWITCH", "FAKE_RESET"]
 TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost", "plan_ready")
 
 
@@ -686,7 +687,7 @@ def test_audit_every_tool(code):
 
 
 def test_code_status_turns(code):
-    """Замечание 16: code_status отдаёт число ходов по событиям."""
+    """Замечание 16: code_status отдаёт число ходов по событиям; ходы — как num_turns (ТЗ WSH-3.4, Б1)."""
     import asyncio
 
     from wshub import code_server
@@ -696,7 +697,8 @@ def test_code_status_turns(code):
     out = asyncio.run(mcp.call_tool("code_status", {"job": d["id"]}))
     content = out[0] if isinstance(out, tuple) else out
     snap = json.loads(content[0].text)
-    assert snap["turns"] == 2  # фейк шлёт два события assistant
+    # фейк: init, два события assistant (текст и Read без результата) — один ход, одно действие
+    assert (snap["turns"], snap["actions"]) == (1, 1)
 
 
 def test_terminal_cli_bad_header_no_traceback(code, capsys):

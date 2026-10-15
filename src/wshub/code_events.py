@@ -100,6 +100,7 @@ class Scan:
         self.rate: dict | None = None
         self.denials = 0
         self.errors = 0
+        self.api_key_source: str | None = None  # из init: "none" — подписка (карточка, В1.5)
 
     @property
     def turns(self) -> int:
@@ -128,6 +129,8 @@ class Scan:
         if t == "system":
             if e.get("subtype") == "init":
                 self.inits += 1
+                if isinstance(e.get("apiKeySource"), str):
+                    self.api_key_source = e["apiKeySource"]
             elif e.get("subtype") == "permission_denied" and isinstance(e.get("tool_use_id"), str):
                 self._deny(e["tool_use_id"], marks)
             return

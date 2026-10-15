@@ -1,0 +1,394 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Задача Code</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --fg: #1f2328; --muted: #656d76; --line: #d0d7de; --bg: transparent; --panel: rgba(127,127,127,.06);
+    --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --fail: #cf222e; --info: #656d76;
+  }
+  :root[data-theme="dark"] {
+    --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --accent: #4493f8;
+    --ok: #3fb950; --warn: #d29922; --fail: #f85149; --info: #8d96a0;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --fg: #e6edf3; --muted: #8d96a0; --line: #30363d; --accent: #4493f8;
+      --ok: #3fb950; --warn: #d29922; --fail: #f85149; --info: #8d96a0;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 10px 14px; font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
+  header { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .title { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .muted { color: var(--muted); }
+  .mono { font-family: ui-monospace, monospace; font-size: 12px; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; border: 1px solid var(--line); font-size: 12px; font-weight: 600; white-space: nowrap; }
+  .pill.run { border-color: var(--accent); color: var(--accent); }
+  .pill.ok { border-color: var(--ok); color: var(--ok); }
+  .pill.wait { border-color: var(--warn); color: var(--warn); }
+  .pill.fail { border-color: var(--fail); color: var(--fail); }
+  .tag { display: inline-block; padding: 0 6px; margin-right: 4px; border-radius: 4px; background: var(--panel); border: 1px solid var(--line); font-size: 11px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: baseline; margin-top: 6px; }
+  .phases span { margin-right: 6px; }
+  .phases .cur { font-weight: 600; color: var(--accent); }
+  .phases .done { color: var(--ok); }
+  ol.feed { list-style: none; margin: 6px 0 0; padding: 0; border-top: 1px solid var(--line); }
+  ol.feed li { display: flex; gap: 8px; padding: 2px 0; border-bottom: 1px solid var(--line); min-width: 0; }
+  ol.feed .t { color: var(--muted); width: 44px; flex: none; text-align: right; }
+  ol.feed .tool { width: 64px; flex: none; font-weight: 600; }
+  ol.feed .arg { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  ol.feed .m { flex: none; font-size: 11px; font-weight: 600; }
+  ol.feed .m.deny { color: var(--fail); }
+  ol.feed .m.err { color: var(--warn); }
+  .nums { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px; }
+  .nums b { font-weight: 600; }
+  .end { margin-top: 8px; border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; background: var(--panel); }
+  .end .danger { color: var(--fail); font-weight: 600; }
+  .end pre { margin: 4px 0 0; white-space: pre-wrap; font: inherit; }
+  .bar { display: flex; gap: 6px; margin-top: 8px; align-items: center; flex-wrap: wrap; }
+  button { font: inherit; padding: 3px 10px; border: 1px solid var(--line); border-radius: 6px; background: transparent; color: var(--fg); cursor: pointer; }
+  button.danger { border-color: var(--fail); color: var(--fail); }
+  button:disabled { opacity: .5; cursor: default; }
+  #note { font-size: 12px; }
+  #note.err { color: var(--fail); }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<header>
+  <span class="title" id="title">wshub-code</span>
+  <span class="mono muted" id="jid"></span>
+  <span class="pill" id="state">…</span>
+  <span class="mono" id="elapsed"></span>
+</header>
+<div class="row" id="grants" hidden></div>
+<div class="row phases" id="phases" hidden></div>
+<ol class="feed" id="feed"></ol>
+<div class="nums">
+  <span>ходы <b id="turns">0</b></span>
+  <span>действия <b id="actions">0</b></span>
+  <span>стоимость <b id="cost">—</b></span>
+  <span>окно лимита <b id="rate">—</b></span>
+</div>
+<div class="end" id="end" hidden></div>
+<div class="bar">
+  <button id="cancel" class="danger" hidden>Отменить</button>
+  <button id="log">Журнал</button>
+  <span id="note" class="muted"></span>
+</div>
+
+<script>
+"use strict";
+// Минимальный клиент MCP Apps (SEP-1865, протокол 2026-01-26): JSON-RPC 2.0 поверх postMessage к хосту.
+// Копия клиента из panel.html (request, notify, обработчик message, applyContext, call) — без внешних загрузок.
+const PROTOCOL = "2026-01-26";
+const host = window.parent;
+const pending = new Map();
+let nextId = 1;
+
+function request(method, params) {
+  const id = nextId++;
+  host.postMessage({ jsonrpc: "2.0", id, method, params }, "*");
+  return new Promise((resolve, reject) => {
+    pending.set(id, { resolve, reject });
+    setTimeout(() => { if (pending.delete(id)) reject(new Error("хост не ответил")); }, 30000);
+  });
+}
+
+function notify(method, params) {
+  host.postMessage({ jsonrpc: "2.0", method, params }, "*");
+}
+
+window.addEventListener("message", (ev) => {
+  if (ev.source !== host) return;
+  const m = ev.data;
+  if (!m || m.jsonrpc !== "2.0") return;
+  if (m.id !== undefined && pending.has(m.id) && !m.method) {
+    const p = pending.get(m.id); pending.delete(m.id);
+    m.error ? p.reject(new Error(m.error.message || "ошибка хоста")) : p.resolve(m.result);
+  } else if (m.method === "ui/notifications/host-context-changed") {
+    applyContext(m.params);
+  } else if (m.method === "ui/notifications/tool-result") {
+    onToolResult(m.params);
+  } else if (m.method === "ui/resource-teardown" && m.id !== undefined) {
+    stopped = true;
+    host.postMessage({ jsonrpc: "2.0", id: m.id, result: {} }, "*");
+  }
+});
+
+function applyContext(ctx) {
+  if (ctx && (ctx.theme === "light" || ctx.theme === "dark")) document.documentElement.dataset.theme = ctx.theme;
+}
+
+async function call(name, args) {
+  const res = await request("tools/call", { name, arguments: args || {} });
+  const text = (res.content || []).map((c) => c.text || "").join("\n");
+  if (res.isError) throw new Error(text.replace(/^Error executing tool \S+: /, "") || "ошибка инструмента " + name);
+  if (res.structuredContent) return res.structuredContent.result !== undefined && Object.keys(res.structuredContent).length === 1
+    ? res.structuredContent.result : res.structuredContent;
+  return JSON.parse(text);
+}
+
+// ---------- карточка ----------
+// Текст из событий и ответов — только через textContent: в DOM он не попадает как HTML.
+
+const $ = (id) => document.getElementById(id);
+const FINAL = ["completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost"];
+const FEED_ROWS = 6;
+let job = null, key = null, offset = 0, data = null, stopped = false, timer = null;
+let actions = [];          // последние действия: {id, t, tool, arg, mark}
+let elapsedBase = 0, elapsedAt = 0, ticking = false;
+let confirmCancel = false;
+let logMode = false;       // «Журнал»: показать все загруженные действия, а не последние FEED_ROWS
+const asked = new Set();   // состояния, по которым карточка уже спросила code_card_ack
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = String(text);
+  return e;
+}
+
+function clock(s) {
+  s = Math.max(0, Math.floor(s));
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = s % 60;
+  return (h ? h + ":" + String(m).padStart(2, "0") : m) + ":" + String(sec).padStart(2, "0");
+}
+
+function setNote(text, err) {
+  const n = $("note");
+  n.textContent = text || "";
+  n.className = err ? "err" : "muted";
+}
+
+function toolResultText(params) {
+  const r = params || {};
+  if (r.structuredContent && typeof r.structuredContent.result === "string") return r.structuredContent.result;
+  return (r.content || []).map((c) => c.text || "").join("\n");
+}
+
+function onToolResult(params) {
+  if (job) return;
+  const text = toolResultText(params).trim();
+  if (text.startsWith("отказ:")) {
+    stopped = true;
+    $("state").textContent = "отказ";
+    $("state").className = "pill fail";
+    setNote(text, true);
+    return;
+  }
+  let obj = null;
+  try { obj = JSON.parse(text); } catch (e) { obj = null; }
+  if (!obj || typeof obj.job !== "string") { setNote("ответ без job — карточке нечего показывать", true); return; }
+  job = obj.job;
+  $("jid").textContent = job.slice(-6);
+  poll();
+}
+
+function pillClass(state) {
+  if (state === "completed") return "pill ok";
+  if (state === "plan_ready") return "pill wait";
+  if (FINAL.includes(state)) return "pill fail";
+  return "pill run";
+}
+
+function renderFeed() {
+  const ol = $("feed");
+  ol.replaceChildren(...(logMode ? actions : actions.slice(-FEED_ROWS)).map((a) => {
+    const li = el("li");
+    li.append(el("span", "t mono", a.t === null || a.t === undefined ? "" : clock(a.t)),
+              el("span", "tool", a.tool), el("span", "arg mono", a.arg));
+    if (a.mark) li.append(el("span", "m " + (a.mark === "отказ" ? "deny" : "err"), a.mark));
+    return li;
+  }));
+}
+
+function render(d) {
+  data = d;
+  $("title").textContent = [d.project, d.profile, d.task].filter(Boolean).join(" · ");
+  $("state").textContent = d.state + (d.reason ? " · " + d.reason : "");
+  $("state").className = pillClass(d.state);
+  elapsedBase = d.elapsed_s || 0; elapsedAt = Date.now();
+  $("elapsed").textContent = clock(elapsedBase);
+
+  const g = $("grants");
+  const tags = [];
+  if (d.grants && d.grants.push) tags.push("пуш");
+  if (d.grants && d.grants.forge) tags.push("API");
+  g.replaceChildren(...tags.map((t) => { const s = el("span", "tag", t); if (d.grants.reason) s.title = d.grants.reason; return s; }));
+  g.hidden = !tags.length;
+
+  const ph = $("phases");
+  ph.hidden = !d.phases;
+  if (d.phases) {
+    ph.replaceChildren(...d.phases.map((p, i) => {
+      const s = el("span", p.active ? "cur" : (p.done ? "done" : "muted"), (i ? "→ " : "") + p.label);
+      return s;
+    }));
+  }
+
+  const have = new Set(actions.map((a) => a.id).filter(Boolean));
+  for (const a of d.actions || []) if (!a.id || !have.has(a.id)) actions.push(a);  // после «Журнала» — без дублей
+  if (actions.length > 50) actions = actions.slice(-50);
+  for (const a of actions) if (d.marks && d.marks[a.id]) a.mark = d.marks[a.id];
+  renderFeed();
+
+  $("turns").textContent = d.turns;
+  $("actions").textContent = d.actions_count;
+  $("cost").textContent = d.cost_usd !== null && d.cost_usd !== undefined
+    ? "$" + Number(d.cost_usd).toFixed(2) + (d.billing === "подписка" ? " (подписка, оценка)" : "")
+    : (d.billing === "подписка" ? "подписка" : "—");
+  $("rate").textContent = d.rate ? Object.entries(d.rate).map(([k, v]) => (k === "five_hour" ? "5 ч" : k === "seven_day" ? "7 дн" : k) + " " + Math.round(v * 100) + "%").join(", ") : "—";
+
+  $("cancel").hidden = FINAL.includes(d.state);
+  renderEnd(d.end);
+}
+
+function renderEnd(end) {
+  const box = $("end");
+  box.hidden = !end;
+  if (!end) return;
+  const rows = [];
+  if (end.warning) rows.push(el("div", "danger", end.warning));
+  const oc = end.outside || {};
+  const parts = ["коммиты " + (oc.commits_count || 0), "docker " + (oc.docker_count || 0)];
+  rows.push(el("div", null, "вне кода: " + parts.join(", ")));
+  for (const m of oc.head_moved || []) rows.push(el("div", "danger", m));
+  const ex = end.external || {};
+  if (ex.push_count || ex.forge_count) {
+    rows.push(el("div", null, "внешние действия: пуш " + (ex.push_count || 0) + ", вызовов API " + (ex.forge_count || 0)));
+  }
+  for (const link of ex.links || []) {
+    const d = el("div", "mono");
+    d.textContent = link;
+    rows.push(d);
+  }
+  if (end.result_head) rows.push(el("pre", null, end.result_head));
+  box.replaceChildren(...rows);
+}
+
+function tick() {
+  if (!data || FINAL.includes(data.state) || data.state === "plan_ready") { ticking = false; return; }
+  $("elapsed").textContent = clock(elapsedBase + (Date.now() - elapsedAt) / 1000);
+  setTimeout(tick, 1000);
+}
+
+async function poll() {
+  if (stopped || !job) return;
+  clearTimeout(timer);
+  try {
+    const d = await call("code_card_data", { job, offset });
+    key = d.key;
+    offset = d.offset;
+    render(d);
+    if (!ticking) { ticking = true; tick(); }
+    await maybeNotify(d);
+    if (FINAL.includes(d.state)) { stopped = true; return; }  // конечное состояние цепочки — опрос окончен
+  } catch (e) {
+    setNote(e.message, true);
+  }
+  const slow = document.hidden || (data && data.state === "plan_ready");
+  timer = setTimeout(poll, slow ? 15000 : 3000);
+}
+
+document.addEventListener("visibilitychange", () => { if (!document.hidden && job && !stopped) poll(); });
+
+// ---------- сообщение в чат (notify = "card") ----------
+
+async function maybeNotify(d) {
+  if (d.notify !== "card") return;
+  let text = null;
+  if (d.state === "plan_ready" && d.plan_mode === "review") {
+    text = "wshub-code: план задачи " + job + " готов и ждёт решения. Прочитай: code_plan(\"" + job + "\").";
+  } else if (FINAL.includes(d.state)) {
+    text = "wshub-code: задача " + job + " — " + d.state + (d.reason ? ", " + d.reason : "") +
+      ". Итог: code_result(\"" + job + "\").";
+  }
+  if (!text) return;
+  const once = d.state + "/" + (d.active || job);
+  if (asked.has(once)) return;
+  let ack = null;
+  try {
+    ack = await call("code_card_ack", { job, state: d.state, key });
+  } catch (e) {  // отметка не записана — сообщение не отправлено: пусть человек спросит сам, следующий опрос повторит
+    setNote("Не удалось написать в чат. Напиши в чат: code_result(\"" + job + "\")", true);
+    return;
+  }
+  asked.add(once);
+  if (!ack || ack.first !== true) return;
+  try {
+    await request("ui/message", { role: "user", content: [{ type: "text", text }] });
+  } catch (e) {
+    setNote("Не удалось написать в чат. Напиши в чат: code_result(\"" + job + "\")", true);
+  }
+}
+
+// ---------- кнопки ----------
+
+$("cancel").addEventListener("click", async () => {
+  if (!job || !key) return;
+  if (!confirmCancel) {
+    confirmCancel = true;
+    $("cancel").textContent = "Точно отменить?";
+    setNote("нажми ещё раз, чтобы отменить задачу");
+    setTimeout(() => { confirmCancel = false; $("cancel").textContent = "Отменить"; }, 5000);
+    return;
+  }
+  confirmCancel = false;
+  $("cancel").disabled = true;
+  try {
+    await call("code_card_cancel", { job, key });
+    setNote("отмена начата");
+    poll();
+  } catch (e) {
+    setNote(e.message, true);
+  } finally {
+    $("cancel").disabled = false;
+    $("cancel").textContent = "Отменить";
+  }
+});
+
+$("log").addEventListener("click", async () => {
+  if (!job) return;
+  if (logMode) {
+    logMode = false;
+    $("log").textContent = "Журнал";
+    renderFeed();
+    return;
+  }
+  try {
+    const d = await call("code_card_data", { job, offset, log: true });
+    key = d.key;
+    actions = (d.log || []).slice(-50);
+    for (const a of actions) if (d.marks && d.marks[a.id]) a.mark = d.marks[a.id];
+    logMode = true;
+    $("log").textContent = "Свернуть";
+    renderFeed();
+  } catch (e) {
+    setNote(e.message, true);
+  }
+});
+
+new ResizeObserver(() => notify("ui/notifications/size-changed", { height: document.documentElement.scrollHeight }))
+  .observe(document.body);
+
+(async () => {
+  try {
+    const init = await request("ui/initialize", {
+      protocolVersion: PROTOCOL,
+      appInfo: { name: "wshub-code-card", version: "0.2.0" },
+      appCapabilities: {},
+    });
+    applyContext(init && init.hostContext);
+    notify("ui/notifications/initialized", {});
+  } catch (e) {
+    setNote("хост не ответил на ui/initialize", true);
+  }
+})();
+</script>
+</body>
+</html>

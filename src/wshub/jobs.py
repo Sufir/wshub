@@ -465,6 +465,8 @@ class Jobs:
                 "phase": plan.phase, "plan_mode": plan.plan_mode, "budget_total": plan.budget_total,
                 "max_turns_total": plan.max_turns_total, "chain_root": chain_root or jid,
                 "session_name": plan.session_name(), "grants": grants,
+                # режим notify — на момент старта корня; звенья и resume берут его у корня (ТЗ WSH-3.4, В3.1)
+                "notify": self._root_notify(chain_root) or glob.notify,
             }
             sid = resume or str(_uuid4())
             data["session_id"] = sid if not resume else resume
@@ -513,6 +515,14 @@ class Jobs:
             "reason": c.reason if c else None, "parent": parent,
             "grants": {k: v for k, v in grants.items() if v}})
         return data
+
+    def _root_notify(self, root: str | None) -> str | None:
+        if not root:
+            return None
+        try:
+            return self.read(root).get("notify")
+        except JobError:
+            return None
 
     def _check_daily_budget(self, plan: Plan, live: list[dict], now: float | None):
         day = datetime.fromtimestamp(now or time.time()).date()
@@ -584,6 +594,24 @@ class Jobs:
         if st == "completed" and active.get("next"):
             return "starting"  # звено утверждено, следующее ещё не записано
         return st
+
+    def chain_cached(self, root: str) -> list[dict]:
+        """Звенья цепочки без обхода всех задач на каждом вызове (карточка опрашивает каждые 3 с; ТЗ WSH-3.4,
+        В2.1): состав цепочки меняется только с новой задачей, а она меняет mtime каталога задач. Сами job.json
+        звеньев читаются каждый раз."""
+        try:
+            stamp = self.root.stat().st_mtime_ns
+        except OSError:
+            return self.chain(root)
+        cache = self.__dict__.setdefault("_chain_cache", {})
+        hit = cache.get(root)
+        if hit and hit[0] == stamp:
+            out = [read_json(self.job_dir(i) / "job.json") for i in hit[1]]
+            if all(out):
+                return out
+        links = self.chain(root)
+        cache[root] = (stamp, [x["id"] for x in links])
+        return links
 
     def chain(self, root: str) -> list[dict]:
         """Звенья цепочки по порядку создания: фаза плана, переделки плана, исполнение, resume."""

@@ -36,7 +36,9 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PROFILES = ("recon", "task", "review")
 CODE_DENY_READ = ("~/.ssh", "~/.aws", "~/.gnupg", "~/.config/wshub", "~/.local/state/wshub",
                   "~/.claude/.credentials.json", "~/.claude.json")
-CODE_KEYS = {"claude", "max_wait_s", "network", "deny_read", "pass_env", "policy"}
+CODE_KEYS = {"claude", "max_wait_s", "network", "deny_read", "pass_env", "policy", "notify"}
+NOTIFY_MODES = ("poll", "card")  # как чат узнаёт о плане и итоге задачи (ТЗ WSH-3.4, В3)
+MAX_WAIT_CAP = 55  # code_wait дольше — хост обрывает вызов примерно на 60 с
 WS_CODE_LISTS = ("bash_allow", "sandbox_exclude", "network", "deny_read", "allow_read", "deny_edit",
                  "claude_md_excludes", "read_extra")
 READ_EXTRA_BAD = re.compile(r"[?\[\]{}()\\]")  # в read_extra из символов шаблона допустима только «*»
@@ -110,11 +112,12 @@ class PolicyRow:
 @dataclass(frozen=True)
 class CodeGlobal:
     claude: str = "claude"
-    max_wait_s: int = 40
+    max_wait_s: int = 50
     network: tuple[str, ...] = ()
     deny_read: tuple[str, ...] = CODE_DENY_READ
     pass_env: tuple[str, ...] = ()
     policy: tuple[PolicyRow, ...] = ()
+    notify: str = "poll"  # poll — чат ждёт code_wait; card — карточка задачи сама пишет в чат
 
 
 @dataclass(frozen=True)
@@ -287,6 +290,13 @@ def _code(t, warnings: list[str]) -> CodeGlobal:
         vals["claude"] = t["claude"]
     if "max_wait_s" in t:
         vals["max_wait_s"] = _number(t["max_wait_s"], "code.max_wait_s", integer=True)
+        if vals["max_wait_s"] > MAX_WAIT_CAP:
+            raise RegistryError(f"code.max_wait_s: не больше {MAX_WAIT_CAP} — хост обрывает вызов инструмента "
+                                "примерно на 60 с")
+    if "notify" in t:
+        if t["notify"] not in NOTIFY_MODES:
+            raise RegistryError(f"code.notify: одно из {', '.join(NOTIFY_MODES)}")
+        vals["notify"] = t["notify"]
     for k in ("network", "deny_read"):
         if k in t:
             vals[k] = _str_list(t[k], f"code.{k}")

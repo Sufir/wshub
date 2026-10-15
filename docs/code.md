@@ -269,6 +269,18 @@ header. У источника `policy` канала нет. **`choice_fields`** 
    подстановке, сетевые утилиты, пути к служебным каталогам; `--output` у любой подкоманды git; `-O` /
    `--open-files-in-pager` у `git grep`, включая сокращения и склейки; `GIT_*`, `PAGER`, `LESSOPEN`,
    `LESSCLOSE` перед git). Ошибка разбора — отказ.
+
+   **Пол docker** — пятый пункт хука. Для `docker` и `docker compose` отказ, если команда монтирует не
+   именованный том и не абсолютный путь внутри рабочего каталога задачи (`-v`, `--volume`, `--mount`, склейки
+   вида `-itv/путь:…`, подстановки `$(pwd)`); ослабляет изоляцию контейнера (`--privileged`, `--cap-add`,
+   `--device`, `--pid`, `--ipc`, `--uts`, `--userns`, `--security-opt`, `--volumes-from`, `--runtime`,
+   `--network host`); указывает другой демон или чужую конфигурацию docker (`-H`, `--context`, `--config`,
+   переменные окружения перед `docker`); работает с файлами хоста или выгружает данные наружу (`cp`,
+   `--env-file`, `--cidfile`, `push`, `login`, `save` / `load` / `import` / `export`, `docker build` и
+   `buildx`, `compose build --ssh` / `--secret`); удаляет тома (`down -v`, `rm -v`, `volume rm` / `prune`,
+   `system prune`); задаёт `-f` с файлом, имя которого не похоже на compose-файл (`docker-compose*.yml`,
+   `compose*.yaml`), или `compose --env-file`. Команды docker идут вне песочницы (`sandbox_exclude`), и
+   этот пол — их единственная граница.
 4. **Окружение** — белый список: `HOME`, `USER`, `LOGNAME`, `PATH`, `LANG`, `LC_*`, `TZ`, `DOCKER_HOST`,
    `DOCKER_CONFIG`, плюс `pass_env`; `TERM=dumb`. Секретов (`SSH_AUTH_SOCK`, имена с `TOKEN`/`SECRET`/
    `PASSWORD`/`KEY`) нет даже из `pass_env`. SSH-агента у Code нет — запушить нечем.
@@ -299,7 +311,13 @@ header. У источника `policy` канала нет. **`choice_fields`** 
   отклоняются.
 
 Команды docker выполняются вне песочницы только через `sandbox_exclude` проекта (только профиль `task`),
-который правит человек; правка compose-файлов и Dockerfile закрыта `deny_edit`. Это принятый остаточный риск v0.
+который правит человек; правка compose-файлов и Dockerfile закрыта `deny_edit`. Рекомендация для реестра:
+`bash_allow` и `sandbox_exclude` = `["docker compose *"]`; `docker *` — тоже допустимо, пол хука действует и на
+`docker run`. Принятые остаточные риски:
+
+- у контейнеров есть сеть, песочница их не касается: смонтированное (рабочий каталог) контейнер может отправить наружу;
+- `exec` в контейнер стека видит его окружение, `docker compose config` печатает подставленные значения — локальные пароли dev-стека;
+- флаги проверяются по всем аргументам, включая команду внутри контейнера: на редком аргументе (`--privileged`, `--env-file`, `-v a:/b`) возможен ложный, но закрытый отказ.
 
 ## Состояния задачи
 

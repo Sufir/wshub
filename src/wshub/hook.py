@@ -11,7 +11,14 @@ sandbox_exclude, которые идут вне песочницы. Отказ, 
    (внешний diff, пейджер, чужой каталог git);
 2. сетевой клиент (ssh, scp, rsync, curl, wget, nc …);
 3. путь внутрь служебных каталогов wshub (реестр, состояние) — их передаёт settings.json аргументами;
-4. оболочка, читающая команды из stdin, или интерпретатор с кодом в строке, где упомянуто запрещённое.
+4. оболочка, читающая команды из stdin, или интерпретатор с кодом в строке, где упомянуто запрещённое;
+5. docker и docker compose, если команда выходит из изоляции контейнера на хост или стирает данные:
+   монтирование не из рабочего каталога (источник — только именованный том или абсолютный путь внутри
+   cwd), --privileged и другие флаги ослабления изоляции, --network host, другой демон или конфигурация
+   docker (-H, --context, --config), файлы хоста в командах (cp, --env-file, --cidfile …), выгрузка наружу
+   (push, login, save/export), docker build (контекст сборки читает хост), удаление томов (down -v,
+   volume rm/prune, system prune), compose-файл с чужим именем (-f), переменные окружения перед docker.
+   Сама команда docker — вне песочницы (sandbox_exclude), поэтому этот пол — единственная её граница.
 
 Звенья команды: ; && || | & и перевод строки, $( ), обратные кавычки, <( ), {…}, sh -c / bash -c, eval,
 обёртки (env, nohup, timeout, xargs, find -exec …). Ошибка разбора — отказ (fail closed).
@@ -72,6 +79,38 @@ KEYWORDS = {"!", "{", "}", "if", "then", "else", "elif", "fi", "do", "done", "wh
             "case", "esac", "select", "function", "coproc"}
 ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\+?=")
 PUNCT = set("();<>|&")
+DOCKER = {"docker", "docker-compose"}
+# глобальные опции docker: другой демон, контекст или конфигурация (в каталоге конфигурации — cli-plugins)
+DOCKER_GLOBAL_DENY = {"-H", "--host", "-c", "--context", "--config"}
+DOCKER_GLOBAL_WITH_VALUE = {"-H", "--host", "-c", "--context", "--config", "-l", "--log-level", "--tlscacert",
+                            "--tlscert", "--tlskey"}
+# подкоманды docker: файлы хоста, выгрузка наружу, swarm и плагины, сборка с контекстом с хоста
+DOCKER_SUB_DENY = {
+    "cp": "копирует файлы между хостом и контейнером в обход песочницы",
+    "push": "выгружает образ наружу", "login": "работает с учётными данными реестра",
+    "logout": "работает с учётными данными реестра", "save": "пишет образ в файл хоста",
+    "load": "читает образ из файла хоста", "import": "читает файл хоста", "export": "пишет файл хоста",
+    "build": "контекст сборки читается с хоста — используй docker compose build",
+    "buildx": "сборщик с выводом на хост и удалёнными сборщиками", "builder": "управляет сборщиками",
+    "context": "переключает демон docker", "plugin": "ставит плагины демона",
+    "swarm": "swarm вне задач", "node": "swarm вне задач", "service": "swarm вне задач",
+    "stack": "swarm вне задач", "secret": "swarm вне задач", "config": "swarm вне задач",
+    "trust": "подпись образов вне задач", "manifest": "выгрузка манифестов вне задач",
+}
+# управляющие группы docker: docker container cp, docker image push … — то же, что верхний уровень
+DOCKER_MGMT = {"container", "image", "volume", "system", "network"}
+COMPOSE_GLOBAL_WITH_VALUE = {"-f", "--file", "-p", "--project-name", "--project-directory", "--env-file",
+                             "--profile", "--ansi", "--progress", "--parallel"}
+COMPOSE_SUB_DENY = {"cp": "копирует файлы между хостом и контейнером в обход песочницы",
+                    "push": "выгружает образы наружу", "publish": "выгружает проект наружу"}
+COMPOSE_FILE_RE = re.compile(r"^(docker-)?compose[\w.-]*\.ya?ml$")
+# флаги, ослабляющие изоляцию контейнера, и файлы хоста в аргументах
+DOCKER_FLAG_DENY = {"--privileged", "--cap-add", "--device", "--device-cgroup-rule", "--pid", "--ipc", "--uts",
+                    "--userns", "--security-opt", "--cgroupns", "--cgroup-parent", "--runtime", "--volumes-from"}
+DOCKER_FILE_FLAGS = {"--env-file", "--label-file", "--cidfile", "--iidfile"}
+DOCKER_SHORT_BOOL = set("itdPqT")  # короткие флаги без значения, которые бывают в склейке с -v
+NAMED_VOLUME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
 CODE_DENY = re.compile(
     r"\bgit\b[^\n;|&]{0,200}?\b(" + "|".join(sorted(GIT_DENY | {"config"})) + r")\b"
     r"|\b(" + "|".join(sorted(NET_TOOLS - {"http", "https"})) + r")\b")
@@ -159,6 +198,8 @@ def _check_segment(tokens: list[str], cwd: Path, roots: list[str], depth: int) -
             _check_shell(tokens, j, cwd, roots, depth)
         if n in INTERPRETERS:
             _check_interpreter(tokens, j)
+        if n in DOCKER:
+            _check_docker(tokens, j, cwd)
     for j, tok in enumerate(tokens):  # git в любой позиции: обёртки, которые обёртка не распознала
         if _is_git(tok):
             _check_git(tokens, j)
@@ -261,6 +302,144 @@ def _check_git_args(sub: str, args: list[str]) -> None:
                 raise _Deny("git grep -O запускает программу — в задачах запрещено")
             if ch in GIT_GREP_SHORT_WITH_VALUE:
                 break
+
+
+def _check_docker(tokens: list[str], j: int, cwd: Path) -> None:
+    """docker и docker compose: выход из изоляции контейнера на хост и удаление данных (пункт 5 докстринга)."""
+    for t in tokens[:j]:
+        if ASSIGN.match(t):
+            raise _Deny("переменные окружения перед docker меняют подстановки compose и адрес демона — "
+                        "в задачах запрещено")
+    args = tokens[j + 1:]
+    k = 0
+    compose = _base(tokens[j]) == "docker-compose"
+    if not compose:
+        while k < len(args) and args[k].startswith("-"):
+            opt = args[k].split("=", 1)[0]
+            if opt in DOCKER_GLOBAL_DENY:
+                raise _Deny(f"docker {opt} меняет демон или конфигурацию docker — в задачах запрещено")
+            k += 2 if opt in DOCKER_GLOBAL_WITH_VALUE and "=" not in args[k] else 1
+        if k >= len(args):
+            return
+        sub = _docker_word(args[k])
+        k += 1
+        if sub != "compose":
+            if sub in DOCKER_MGMT and k < len(args):  # docker container cp, docker image push …
+                sub2 = _docker_word(args[k])
+                if sub == "system" and sub2 == "prune":
+                    raise _Deny("docker system prune удаляет тома и данные — в задачах запрещено")
+                if sub == "volume" and sub2 in ("rm", "remove", "prune"):
+                    raise _Deny(f"docker volume {sub2} удаляет тома (данные БД) — в задачах запрещено")
+                if sub2 in DOCKER_SUB_DENY:
+                    raise _Deny(f"docker {sub} {sub2}: {DOCKER_SUB_DENY[sub2]} — в задачах запрещено")
+                if sub == "container" and sub2 in ("run", "create", "exec", "rm"):
+                    _check_docker_sub(sub2, args[k + 1:], cwd, "docker container")
+                return
+            _check_docker_sub(sub, args[k:], cwd, "docker")
+            return
+    while k < len(args) and args[k].startswith("-"):  # глобальные опции compose
+        t = args[k]
+        opt, eq, val = t.partition("=")
+        if not eq and len(t) > 2 and not t.startswith("--") and t[:2] in ("-f", "-p"):
+            opt, val, eq = t[:2], t[2:], "="  # -fcompose.yml
+        if opt in COMPOSE_GLOBAL_WITH_VALUE:
+            if not eq:
+                val = args[k + 1] if k + 1 < len(args) else ""
+                k += 1
+            if opt in ("-f", "--file") and ("$" in val or not COMPOSE_FILE_RE.match(_base(val))):
+                raise _Deny(f"docker compose {opt} {val}: compose-файл только с именем docker-compose*.yml или "
+                            "compose*.yaml — в задачах запрещено")
+            if opt == "--env-file":
+                raise _Deny("docker compose --env-file подменяет подстановки compose — в задачах запрещено")
+        k += 1
+    if k >= len(args):
+        return
+    _check_docker_sub(_docker_word(args[k]), args[k + 1:], cwd, "docker compose")
+
+
+def _docker_word(tok: str) -> str:
+    if "$" in tok or any(c in tok for c in "*?[`"):
+        raise _Deny("подкоманда docker собрана из переменной или шаблона — хук не может её проверить, отказ")
+    return tok
+
+
+def _check_docker_sub(sub: str, rest: list[str], cwd: Path, label: str) -> None:
+    deny = COMPOSE_SUB_DENY if label == "docker compose" else DOCKER_SUB_DENY
+    if sub in deny:
+        raise _Deny(f"{label} {sub}: {deny[sub]} — в задачах запрещено")
+    if sub in ("down", "rm") and any(t in ("-v", "--volumes") or t.startswith("--volumes=")
+                                     or (t.startswith("-") and not t.startswith("--") and "v" in t[1:])
+                                     for t in rest):
+        raise _Deny(f"{label} {sub} -v удаляет тома (данные БД) — в задачах запрещено")
+    if sub == "build" and any(t.split("=", 1)[0] in ("--ssh", "--secret", "-o", "--output") for t in rest):
+        raise _Deny(f"{label} build --ssh/--secret/--output передаёт сборке ключи или файлы хоста — в задачах "
+                    "запрещено")
+    _check_container_flags(rest, cwd, label, mounts=sub in ("run", "create"))
+
+
+def _check_container_flags(rest: list[str], cwd: Path, label: str, mounts: bool) -> None:
+    """Флаги по всем аргументам, включая команду внутри контейнера: опасные имена там редки, а точное
+    место конца опций без полного списка флагов docker не найти (отказ здесь — закрытый)."""
+    for i, t in enumerate(rest):
+        nxt = rest[i + 1] if i + 1 < len(rest) else ""
+        opt, eq, val = t.partition("=")
+        if opt in DOCKER_FLAG_DENY:
+            raise _Deny(f"{label} {opt} ослабляет изоляцию контейнера — в задачах запрещено")
+        if opt in DOCKER_FILE_FLAGS:
+            raise _Deny(f"{label} {opt} читает или пишет файл хоста в обход песочницы — в задачах запрещено")
+        if opt in ("--network", "--net") and (val if eq else nxt) == "host":
+            raise _Deny(f"{label} {opt} host отдаёт контейнеру сеть хоста — в задачах запрещено")
+        if not mounts:
+            continue
+        if opt in ("-v", "--volume"):
+            _check_mount_spec(val if eq else nxt, cwd, label)
+        elif opt == "--mount":
+            _check_mount_opt(val if eq else nxt, cwd, label)
+        elif t.startswith("-") and not t.startswith("--") and len(t) > 2:  # склейка: -itv /a:/b, -v/a:/b
+            for idx, ch in enumerate(t[1:], 1):
+                if ch == "v":
+                    _check_mount_spec(t[idx + 1:] or nxt, cwd, label)
+                    break
+                if ch not in DOCKER_SHORT_BOOL:
+                    break
+
+
+def _check_mount_spec(spec: str, cwd: Path, label: str) -> None:
+    """-v ИСТОЧНИК:ЦЕЛЬ[:опции]. Без «:» — анонимный том или чужой -v внутренней команды: не монтирование хоста.
+    Подстановка ($, `) — отказ: источник не проверить ($(pwd) разбор режет на звенья, остаётся «$»)."""
+    if any(c in spec for c in "$`"):
+        raise _Deny(f"{label}: источник монтирования из подстановки — хук не может его проверить, укажи "
+                    "абсолютный путь внутри рабочего каталога")
+    if ":" not in spec:
+        return
+    _check_mount_source(spec.split(":", 1)[0], cwd, label)
+
+
+def _check_mount_opt(spec: str, cwd: Path, label: str) -> None:
+    if any(c in spec for c in "$`"):
+        raise _Deny(f"{label} --mount из подстановки — хук не может его проверить, отказ")
+    kv = dict(p.split("=", 1) if "=" in p else (p, "") for p in spec.split(","))
+    kind = kv.get("type", "volume")
+    src = kv.get("source", kv.get("src", ""))
+    if kind == "bind":
+        _check_mount_source(src, cwd, label)
+    elif kind == "volume":
+        if src and not NAMED_VOLUME_RE.match(src):
+            raise _Deny(f"{label} --mount: у тома {src!r} имя должно быть именем тома — в задачах запрещено")
+    elif kind != "tmpfs":
+        raise _Deny(f"{label} --mount type={kind}: в задачах только volume, bind внутри рабочего каталога, tmpfs")
+
+
+def _check_mount_source(src: str, cwd: Path, label: str) -> None:
+    if NAMED_VOLUME_RE.match(src):
+        return  # именованный том
+    if not src.startswith("/") or any(c in src for c in "$`*?["):
+        raise _Deny(f"{label}: источник монтирования {src!r} — только именованный том или абсолютный путь "
+                    "внутри рабочего каталога задачи")
+    real, base = os.path.realpath(src), os.path.realpath(str(cwd))
+    if real != base and not real.startswith(base + "/"):
+        raise _Deny(f"{label}: монтирование {src} вне рабочего каталога задачи ({base}) открывает контейнеру "
+                    "файлы хоста — в задачах запрещено")
 
 
 def _git_reason(sub: str) -> str:

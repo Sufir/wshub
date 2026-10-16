@@ -540,7 +540,7 @@ def last_rate(jobs: Jobs) -> dict | None:
         return None
     _ts, d, b = best
     return {"job": d.get("id"), "project": d.get("project"), "at": b.get("rate_at"),
-            "line": billing_line({"rate": b["rate"]})}
+            "line": billing_line({"source": "none", "rate": b["rate"]})}  # rate приходит только на подписке
 
 
 def _recent_events(jobs: Jobs, job: str) -> list[str]:

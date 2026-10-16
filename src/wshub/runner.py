@@ -20,13 +20,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from . import code_events, gitsafe
+from . import claude_cli, code_events, gitsafe
 from .jobs import (
     COMMITS_MAX,
     DOCKER_MAX,
     GIT_START,
     JobError,
     Jobs,
+    billing_settings_problem,
     cancel_timers,
     clip_list,
     config_keys,
@@ -46,9 +47,14 @@ DOCKER_CMD_MAX = 200  # символов команды в блоке «Вне �
 DOCKER_RE = re.compile(r"(?:^|;|&&|\|\|?)\s*(?:docker|docker-compose)(?=\s|$)", re.MULTILINE)
 # окна лимита подписки в строке оплаты (ТЗ WSH-4.1, п. 2.6); прочие окна — под своим именем, после этих
 WINDOWS = {"five_hour": "5 ч", "seven_day": "неделя"}
+NO_INIT = "init не было"  # billing.mismatch: result пришёл без init — источник оплаты не подтверждён
 BILLING_HINT = {
     "billing_mismatch": "claude сообщил источник оплаты не «none» (не подписка) — задача остановлена; проверь "
                         "apiKeyHelper и env в .claude/settings*.json рабочего каталога",
+    "billing_mismatch/settings": "файл настроек claude в рабочем каталоге изменился посреди звена и задаёт оплату не "
+                                 "по подписке (или его не проверить) — задача остановлена; убери ключ из "
+                                 ".claude/settings*.json рабочего каталога",
+    "billing_mismatch/no_init": "claude не прислал событие init — источник оплаты не подтверждён, задача остановлена",
     "overage": "задача начала тратить extra usage сверх подписки (isUsingOverage) и остановлена; разрешить — "
                "[code] allow_overage = true в реестре",
 }
@@ -76,12 +82,21 @@ def _short(ts) -> str | None:
 
 def billing_line(billing: dict | None, reason: str | None = None) -> str:
     """Строка оплаты (ТЗ WSH-4.1, п. 2.6): окна из unifiedWindows (utilization × 100), сброс, overage; «близко к
-    лимиту» при allowed_warning; три причины остановки — хвостом строки."""
+    лимиту» при allowed_warning; три причины остановки — хвостом строки. До первого init — источник ещё не известен;
+    result без init — «НЕ подтверждена» (ревью круга 1, п. 2)."""
     b = billing or {}
-    if reason == "billing_mismatch" or ("source" in b and b["source"] != "none"):
-        src = b.get("source")
-        return (f"оплата: НЕ подписка (apiKeySource: {src if src is not None else 'поля нет'})"
-                + (" · задача остановлена" if reason == "billing_mismatch" else ""))
+    m = b.get("mismatch")
+    if m or reason == "billing_mismatch" or ("source" in b and b["source"] != "none"):
+        if m == NO_INIT:
+            head = f"оплата: НЕ подтверждена ({NO_INIT})"
+        elif m:
+            head = f"оплата: НЕ подписка ({m})"
+        else:
+            src = b.get("source")
+            head = f"оплата: НЕ подписка (apiKeySource: {src if src is not None else 'поля нет'})"
+        return head + (" · задача остановлена" if reason == "billing_mismatch" else "")
+    if "source" not in b:
+        return "оплата: источник ещё не известен"
     rate = b.get("rate") if isinstance(b.get("rate"), dict) else None
     if not rate:
         line = "оплата: подписка (данных о лимитах ещё нет)"
@@ -126,6 +141,11 @@ def billing_hint(reason: str | None, billing: dict | None) -> str | None:
         rate = (billing or {}).get("rate")
         t = _short(rate.get("resetsAt")) if isinstance(rate, dict) else None
         return f"лимит подписки исчерпан; после {t or 'сброса лимита'} продолжи: code_resume"
+    m = (billing or {}).get("mismatch")
+    if reason == "billing_mismatch" and m == NO_INIT:
+        return BILLING_HINT["billing_mismatch/no_init"]
+    if reason == "billing_mismatch" and isinstance(m, str) and m.startswith("settings: "):
+        return BILLING_HINT["billing_mismatch/settings"]
     return BILLING_HINT.get(reason)
 
 
@@ -423,6 +443,33 @@ class Supervisor:
         self.jdir = self.jobs.job_dir(jid)
         self.d = self.jobs.read(jid)
         self.stop: str | None = None  # billing_mismatch | overage — остановка стражем подписки (ТЗ WSH-4.1)
+        self.stop_source = None  # result.billing_source при billing_mismatch: apiKeySource или «settings: …»
+        self._settings_sig: tuple | None = None  # сигнатура .claude/settings*.json; None — ещё не проверяли
+
+    def _halt(self, reason: str, source=None, shown: str | None = None) -> None:
+        """Причина остановки стражем — первая остаётся. shown — что показать в строке оплаты (billing.mismatch)."""
+        if self.stop:
+            return
+        self.stop, self.stop_source = reason, source
+        if shown:
+            self.d.setdefault("billing", {})["mismatch"] = shown
+
+    def _settings_changed(self) -> bool:
+        """Изменились ли файлы настроек claude рабочего каталога: (st_mtime_ns, st_size, st_ino) каждого, появился
+        или исчез — только тогда надзиратель проверяет их заново (ревью круга 1, п. 1). Первый вызов — всегда."""
+        sig = []
+        for name in claude_cli.CLAUDE_SETTINGS:
+            try:
+                st = os.stat(Path(self.d["dir"]) / name)
+                sig.append((st.st_mtime_ns, st.st_size, st.st_ino))
+            except (FileNotFoundError, NotADirectoryError):
+                sig.append(None)
+            except OSError as e:
+                sig.append(("error", e.errno))
+        if tuple(sig) == self._settings_sig:
+            return False
+        self._settings_sig = tuple(sig)
+        return True
 
     def _save(self, **kw):
         self.d.update(kw)
@@ -502,8 +549,14 @@ class Supervisor:
     def _watch(self, stream: _Stream) -> None:
         """Сверка оплаты по потоку (ТЗ WSH-4.1, п. 2.4): init — источник и фактическая модель, rate_limit_event —
         последний rate_limit_info и счётчик. apiKeySource не "none" или поля нет — billing_mismatch; isUsingOverage
-        без [code] allow_overage — overage. Первая причина остаётся."""
+        без [code] allow_overage — overage. Первая причина остаётся. Файлы настроек claude рабочего каталога, если
+        изменились, проверяются заново той же функцией, что до старта: claude перечитывает их на ходу (факт 6)."""
         changed = False
+        if self._settings_changed():
+            problem = billing_settings_problem(Path(self.d["dir"]))
+            if problem and not self.stop:
+                self._halt("billing_mismatch", f"settings: {problem[0]}", f"settings: {problem[0]}")
+                changed = True
         for e in stream.read():
             if e.get("type") not in ("system", "rate_limit_event"):
                 continue
@@ -515,14 +568,14 @@ class Supervisor:
                 b["model"] = e.get("model")
                 changed = True
                 if src != "none":
-                    self.stop = self.stop or "billing_mismatch"
+                    self._halt("billing_mismatch", src, f"apiKeySource: {src if src is not None else 'поля нет'}")
             elif e.get("type") == "rate_limit_event":
                 b["rate_events"] = int(b.get("rate_events") or 0) + 1
                 info = e.get("rate_limit_info")
                 if isinstance(info, dict):
                     b.update(rate=info, rate_at=_iso(time.time()), rate_ts=time.time())
                     if info.get("isUsingOverage") and not self._allow_overage():
-                        self.stop = self.stop or "overage"
+                        self._halt("overage")
                 changed = True
         if changed:
             try:
@@ -575,12 +628,16 @@ class Supervisor:
         except Exception as e:  # noqa: BLE001 — блок прозрачности не должен ронять итог звена
             result["outside_code"] = {"commits": [], "commits_count": 0, "git_meta_changed": [], "docker": [],
                                       "docker_count": 0, "errors": [f"блок не собран: {e}"[:500]]}
+        if res_event and "source" not in (self.d.get("billing") or {}):
+            # result есть, а init не было — источник оплаты не подтверждён: fail closed (ревью круга 1, п. 2)
+            self._halt("billing_mismatch", None, NO_INIT)
         billing = self.d.get("billing") or {}
         rate = billing.get("rate") if isinstance(billing.get("rate"), dict) else {}
         if self.stop:  # страж подписки важнее отмены и таймаута: деньги (ТЗ WSH-4.1, решения плана)
             state, reason = "failed", self.stop
             if self.stop == "billing_mismatch":
-                result["billing_source"] = billing.get("source")  # фактический источник; None — поля нет
+                # фактический источник: apiKeySource (None — поля или init нет) или «settings: <файл> задаёт <ключ>»
+                result["billing_source"] = self.stop_source
         elif self.d.get("state") == "cancelling":
             state, reason = ("timeout", "max_hours") if self.d.get("reason") == "timeout" else ("cancelled", "cancel")
         elif not res_event:

@@ -26,6 +26,9 @@
   FAKE_RATE    — JSON rate_limit_info: событие rate_limit_event; FAKE_RATE_AT — напечатать после N-го события
                  (по умолчанию — перед итогом, как на подписке, PoC WSH-4.0); FAKE_RATE_COUNT — сколько раз (1)
   FAKE_LIMIT_ERROR — итог с is_error: true (исчерпан лимит подписки)
+  FAKE_NO_INIT — не печатать init (источник оплаты не подтверждён)
+  FAKE_WRITE_SETTINGS — на середине FAKE_SLEEP записать этот текст в .claude/settings.local.json cwd (настройки,
+                 изменённые посреди звена мимо deny)
 В режиме plan фейк, как настоящий claude 2.1.291 (PoC WSH-3, 0.3.1), пишет план инструментом Write
 в $HOME/.claude/plans/<slug>.md и завершается success.
 """
@@ -115,7 +118,8 @@ def main() -> int:
                                                             else "fake")}
     if os.environ.get("FAKE_SOURCE", "none") != "-":
         init["apiKeySource"] = os.environ.get("FAKE_SOURCE", "none")
-    emit(init)
+    if not os.environ.get("FAKE_NO_INIT"):
+        emit(init)
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "начинаю"}]}})
     if os.environ.get("FAKE_TOUCH"):
         open(os.path.join(os.getcwd(), os.environ["FAKE_TOUCH"]), "w").close()
@@ -157,9 +161,15 @@ def main() -> int:
     step = 0.05
     target = float(os.environ.get("FAKE_SLEEP_PLAN") if perm_mode == "plan" and os.environ.get("FAKE_SLEEP_PLAN")
                    else os.environ.get("FAKE_SLEEP", "0"))
+    wrote = False
     while slept < target:
         time.sleep(step)
         slept += step
+        if os.environ.get("FAKE_WRITE_SETTINGS") and not wrote and slept >= target / 2:
+            os.makedirs(os.path.join(os.getcwd(), ".claude"), exist_ok=True)
+            with open(os.path.join(os.getcwd(), ".claude", "settings.local.json"), "w", encoding="utf-8") as f:
+                f.write(os.environ["FAKE_WRITE_SETTINGS"])
+            wrote = True
         if interrupted["v"] and os.environ.get("FAKE_SIGINT") == "ignore":
             continue
 

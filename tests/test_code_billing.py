@@ -27,6 +27,7 @@ RATE = {"status": "allowed", "resetsAt": 1792059600, "rateLimitType": "five_hour
 LINE = ("оплата: подписка · 5 ч — 11 %, сброс 15.10 10:20 · неделя — 23 %, сброс 20.10 19:00 · "
         "overage: выкл (org_level_disabled)")
 NO_DATA = "оплата: подписка (данных о лимитах ещё нет)"
+UNKNOWN = "оплата: источник ещё не известен"
 
 
 @pytest.fixture
@@ -344,7 +345,8 @@ def test_billing_line_format(utc):
     assert billing_line({"source": "none", "rate": RATE}) == LINE
     warn = {**RATE, "status": "allowed_warning"}
     assert billing_line({"source": "none", "rate": warn}) == "близко к лимиту · " + LINE
-    assert billing_line(None) == NO_DATA and billing_line({"source": "none"}) == NO_DATA
+    assert billing_line({"source": "none"}) == NO_DATA
+    assert billing_line(None) == UNKNOWN and billing_line({}) == UNKNOWN  # до первого init — не «подписка»
     assert billing_line({"source": None}, "billing_mismatch") == \
         "оплата: НЕ подписка (apiKeySource: поля нет) · задача остановлена"
 
@@ -388,8 +390,8 @@ def test_billing_line_bad_numbers(utc):
     """Infinity и NaN из json.loads не роняют строку оплаты — окно пропускается."""
     rate = {**RATE, "unifiedWindows": {"five_hour": {"utilization": float("inf")},
                                        "seven_day": {"utilization": 0.23, "resetsAt": 1792522800}}}
-    assert billing_line({"rate": rate}) == ("оплата: подписка · неделя — 23 %, сброс 20.10 19:00 · "
-                                            "overage: выкл (org_level_disabled)")
+    assert billing_line({"source": "none", "rate": rate}) == ("оплата: подписка · неделя — 23 %, сброс 20.10 19:00 · "
+                                                              "overage: выкл (org_level_disabled)")
 
 
 def test_billing_written_while_running(code, monkeypatch, utc):
@@ -459,19 +461,105 @@ def test_billing_line_chain_root_uses_active_link(code, monkeypatch, utc):
     assert res["billing"] == LINE and res["model_line"].endswith("→ claude-opus-5-5")
 
 
-def test_prestart_on_auto_execute(code, monkeypatch):
-    """plan = auto: исполнение запускает сам надзиратель через approve → start — проверка до старта срабатывает и
-    там; план остаётся plan_ready с chain_error."""
-    monkeypatch.setenv("FAKE_SLEEP_PLAN", "2")
-    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(size="M", risk="low")))["id"]
-    assert code.jobs.read(root)["plan_mode"] == "auto"
-    _settings(code, "settings.local.json", {"apiKeyHelper": "x"})  # после проверки плана, до исполнения
-    end = time.time() + 30
-    while time.time() < end and not code.jobs.read(root).get("chain_error"):
-        time.sleep(0.2)
+def test_prestart_on_auto_execute(code):
+    """plan = auto: исполнение запускает сам надзиратель (_auto_execute → approve → start) — проверка до старта
+    срабатывает и там; план остаётся plan_ready с chain_error. Файл кладётся между планом и исполнением: в живой фазе
+    плана его поймала бы уже повторная проверка надзирателя (test_settings_written_mid_plan_stops)."""
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(size="L", risk="low")))["id"]
+    assert wait_terminal(code.jobs, root)["state"] == "plan_ready"
+    d = code.jobs.read(root)
+    d["plan_mode"] = "auto"
+    code.jobs.write(root, d)
+    _settings(code, "settings.local.json", {"apiKeyHelper": "x"})
+    Supervisor(code.hub, root)._auto_execute()
     d = code.jobs.read(root)
     assert d["state"] == "plan_ready" and "задаёт apiKeyHelper" in d["chain_error"]
     assert len(code.jobs.chain(root)) == 1
+
+
+def test_settings_written_mid_plan_stops(code, monkeypatch):
+    """Фаза плана (plan = auto): файл с apiKeyHelper появился посреди плана — план остановлен billing_mismatch,
+    до plan_ready и исполнения не доходит."""
+    monkeypatch.setenv("FAKE_SLEEP_PLAN", "3")
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(size="M", risk="low")))["id"]
+    assert code.jobs.read(root)["plan_mode"] == "auto"
+    _settings(code, "settings.local.json", {"apiKeyHelper": "x"})  # проверка до старта плана уже пройдена
+    wait_terminal(code.jobs, root)
+    d = code.jobs.read(root)
+    assert (d["state"], d["reason"]) == ("failed", "billing_mismatch")
+    assert d["result"]["billing_source"].endswith("settings.local.json задаёт apiKeyHelper")
+    assert len(code.jobs.chain(root)) == 1
+
+
+# ---------- ревью круга 1, п. 1: настройки, изменённые посреди звена ----------
+
+def test_settings_written_mid_run_stops(code, monkeypatch):
+    """Задача посреди звена (после первой проверки надзирателя) пишет .claude/settings.local.json мимо deny —
+    надзиратель замечает смену файла, проверяет его той же функцией, что до старта, и останавливает задачу."""
+    mark = code.state.parent / "sigmark"
+    t0 = time.time()
+    jid, d = _run(code, monkeypatch, FAKE_WRITE_SETTINGS='{"apiKeyHelper": "/bin/echo k"}', FAKE_SLEEP="10",
+                  FAKE_SIGMARK=str(mark))  # файл появится на 5-й секунде — после первой проверки надзирателя
+    assert time.time() - t0 < 9  # остановлен, не доработал свои 10 с
+    assert mark.read_text() == "INT"
+    src = f"settings: {Path(d['dir']) / '.claude' / 'settings.local.json'} задаёт apiKeyHelper"
+    assert (d["state"], d["reason"], d["result"]["billing_source"]) == ("failed", "billing_mismatch", src)
+    assert d["billing"]["source"] == "none"  # init был по подписке — поймала именно повторная проверка
+    st = json.loads(_call(code, "code_status", {"job": jid}))
+    assert st["billing"] == f"оплата: НЕ подписка ({src}) · задача остановлена"
+    assert "изменился посреди звена" in st["reason_hint"]
+    assert _finish_params(code, jid)["billing_source"] == "none"
+
+
+def test_settings_written_mid_run_unverifiable_stops(code, monkeypatch):
+    jid, d = _run(code, monkeypatch, FAKE_WRITE_SETTINGS='{"env": ', FAKE_SLEEP="6")
+    assert (d["state"], d["reason"]) == ("failed", "billing_mismatch")
+    assert d["result"]["billing_source"].startswith("settings: ")
+    assert "не разбирается как JSON" in d["result"]["billing_source"]
+
+
+def test_settings_written_mid_run_harmless(code, monkeypatch):
+    """Посторонний env в тех же файлах посреди звена — задача доходит до completed."""
+    _jid, d = _run(code, monkeypatch, FAKE_WRITE_SETTINGS='{"env": {"FOO": "1"}}', FAKE_SLEEP="3")
+    assert (code.root / ".claude" / "settings.local.json").read_text() == '{"env": {"FOO": "1"}}'  # фейк писал
+    assert (d["state"], d["reason"]) == ("completed", None)
+
+
+# ---------- ревью круга 1, п. 2: нет init — fail closed ----------
+
+def test_no_init_fails_closed(code, monkeypatch):
+    """result есть, а init не было — failed/billing_mismatch, billing_source = null, «НЕ подтверждена». Пока init
+    нет, у живой задачи строка — «источник ещё не известен», а не «подписка»."""
+    for k, v in {"FAKE_NO_INIT": "1", "FAKE_SLEEP": "4"}.items():
+        monkeypatch.setenv(k, v)
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    end = time.time() + 10
+    while time.time() < end and code.jobs.read(jid)["state"] != "running":
+        time.sleep(0.1)
+    st = json.loads(_call(code, "code_status", {"job": jid}))
+    assert st["state"] == "running" and st["billing"] == UNKNOWN
+    wait_terminal(code.jobs, jid)
+    d = code.jobs.read(jid)
+    assert (d["state"], d["reason"]) == ("failed", "billing_mismatch")
+    assert "billing_source" in d["result"] and d["result"]["billing_source"] is None
+    res = json.loads(_call(code, "code_result", {"job": jid}))
+    assert res["billing"] == "оплата: НЕ подтверждена (init не было) · задача остановлена"
+    assert "init" in res["reason_hint"]
+
+
+def test_no_init_no_result_keeps_reason(code, monkeypatch):
+    """Нет ни init, ни result (claude убит SIGKILL при отмене) — прежняя причина."""
+    for k, v in {"FAKE_NO_INIT": "1", "FAKE_SLEEP": "20", "FAKE_SIGINT": "ignore-all",
+                 "WSHUB_CODE_CANCEL_SIGTERM_S": "1", "WSHUB_CODE_CANCEL_SIGKILL_S": "1"}.items():
+        monkeypatch.setenv(k, v)
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    end = time.time() + 10
+    while time.time() < end and code.jobs.read(jid)["state"] != "running":
+        time.sleep(0.1)
+    code.jobs.cancel(jid)
+    wait_terminal(code.jobs, jid, timeout=60)
+    d = code.jobs.read(jid)
+    assert (d["state"], d["reason"]) == ("cancelled", "cancel") and "billing_source" not in d["result"]
 
 
 def test_no_rate_data_line(code, monkeypatch):

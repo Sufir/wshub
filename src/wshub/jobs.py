@@ -113,13 +113,15 @@ class Plan:
         return f"{self.project}/{self.ticket}" + ("/plan" if self.phase == "plan" else "")
 
 
-def check_billing_settings(d: Path) -> None:
-    """Проверка до старта (ТЗ WSH-4.1, п. 2.1 и 7.1): .claude/settings.json и settings.local.json рабочего каталога
-    (claude читает их только оттуда) не задают apiKeyHelper и в env — имена, меняющие источник оплаты. Файла нет —
-    пропуск; пустой (0 байт или одни пробелы) — настроек нет: так остаётся точка монтирования песочницы. Не обычный
-    файл (после симлинка), больше SETTINGS_MAX, не JSON-объект — отказ: хаб не может проверить, что в нём."""
-    def unverifiable(p: Path, why: str) -> JobError:
-        return JobError(f"{p} {why}: хаб не может проверить, что в нём, — задача могла бы пойти не по подписке")
+def billing_settings_problem(d: Path) -> tuple[str, bool] | None:
+    """Ядро проверки настроек claude (ТЗ WSH-4.1, п. 2.1 и 7.1): .claude/settings.json и settings.local.json рабочего
+    каталога (claude читает их только оттуда) не задают apiKeyHelper и в env — имена, меняющие источник оплаты. Файла
+    нет — пропуск; пустой (0 байт или одни пробелы) — настроек нет: так остаётся точка монтирования песочницы. Не
+    обычный файл (после симлинка), больше SETTINGS_MAX, не JSON-объект — хаб не может проверить, что в нём.
+    Ответ: None — чисто; (текст, False) — «<файл> задаёт <ключ>»; (текст, True) — не проверить. Не бросает: её же
+    повторяет надзиратель посреди звена (ревью круга 1, п. 1)."""
+    def unverifiable(p: Path, why: str) -> tuple[str, bool]:
+        return f"{p} {why}: хаб не может проверить, что в нём", True
 
     for name in claude_cli.CLAUDE_SETTINGS:
         p = d / name
@@ -128,28 +130,40 @@ def check_billing_settings(d: Path) -> None:
         except (FileNotFoundError, NotADirectoryError):
             continue
         except OSError as e:
-            raise unverifiable(p, f"не открывается ({e.strerror})") from None
+            return unverifiable(p, f"не открывается ({e.strerror})")
         try:  # тип — по сырому дескриптору: fdopen на каталоге сам бросает IsADirectoryError
             if not stat.S_ISREG(os.fstat(fd).st_mode):
-                raise unverifiable(p, "— не обычный файл (каталог, устройство, FIFO)")
+                return unverifiable(p, "— не обычный файл (каталог, устройство, FIFO)")
             with os.fdopen(fd, "rb", closefd=False) as fh:
                 data = fh.read(SETTINGS_MAX + 1)
+        except OSError as e:
+            return unverifiable(p, f"не читается ({e.strerror})")
         finally:
             os.close(fd)
         if len(data) > SETTINGS_MAX:
-            raise unverifiable(p, f"больше {SETTINGS_MAX // 1024} КБ")
+            return unverifiable(p, f"больше {SETTINGS_MAX // 1024} КБ")
         try:
             text = data.decode("utf-8")
             obj = json.loads(text) if text.strip() else {}
-        except ValueError as e:
-            raise unverifiable(p, f"не разбирается как JSON ({e})") from None
+        except (ValueError, RecursionError) as e:
+            return unverifiable(p, f"не разбирается как JSON ({e})")
         if not isinstance(obj, dict):
-            raise unverifiable(p, "— не JSON-объект")
+            return unverifiable(p, "— не JSON-объект")
         env = obj.get("env")
         keys = (["apiKeyHelper"] if "apiKeyHelper" in obj else []) + \
             [f"env.{k}" for k in (env if isinstance(env, dict) else {}) if billing_env(k)]
         if keys:
-            raise JobError(f"задача пошла бы не по подписке: {p} задаёт {keys[0]}")
+            return f"{p} задаёт {keys[0]}", False
+    return None
+
+
+def check_billing_settings(d: Path) -> None:
+    """Проверка до старта (ТЗ WSH-4.1, п. 2.1): нарушение или непроверяемый файл — JobError."""
+    problem = billing_settings_problem(d)
+    if problem:
+        msg, unsure = problem
+        raise JobError(f"{msg}, — задача могла бы пойти не по подписке" if unsure
+                       else f"задача пошла бы не по подписке: {msg}")
 
 
 def _order(value: str, order: tuple[str, ...], name: str) -> int:

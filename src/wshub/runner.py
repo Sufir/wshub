@@ -54,7 +54,8 @@ BILLING_HINT = {
     "billing_mismatch/settings": "файл настроек claude в рабочем каталоге изменился посреди звена и задаёт оплату не "
                                  "по подписке (или его не проверить) — задача остановлена; убери ключ из "
                                  ".claude/settings*.json рабочего каталога",
-    "billing_mismatch/no_init": "claude не прислал событие init — источник оплаты не подтверждён, задача остановлена",
+    "billing_mismatch/no_init": "claude не прислал событие init — источник оплаты не подтверждён, задача остановлена; "
+                                "если claude упал на старте — смотри текст итога (result) и stderr.log",
     "overage": "задача начала тратить extra usage сверх подписки (isUsingOverage) и остановлена; разрешить — "
                "[code] allow_overage = true в реестре",
 }
@@ -759,7 +760,9 @@ class Supervisor:
                                  "session_id": res.get("session_id"), "phase": self.d.get("phase"),
                                  "docker_count": oc.get("docker_count"), "commits_count": oc.get("commits_count"),
                                  "git_meta_changed": oc.get("git_meta_changed"),
-                                 "billing_source": b.get("source"), "billing_model": b.get("model"),
+                                 # при billing_mismatch — как в итоге (apiKeySource, «settings: …» или None)
+                                 "billing_source": res.get("billing_source", b.get("source")),
+                                 "billing_model": b.get("model"),
                                  "rate_events": b.get("rate_events") or 0, "rate": _rate_brief(b.get("rate"))})
 
 

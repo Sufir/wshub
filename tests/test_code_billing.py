@@ -13,7 +13,7 @@ import pytest
 from test_code import FAKE_ENV, GOLDEN, _golden_settings, make_code, registry_text, wait_terminal
 from test_code_plan import _call
 
-from wshub import claude_cli, code_cli
+from wshub import claude_cli, code_cli, runner
 from wshub.core import Hub
 from wshub.jobs import JobError, Jobs
 from wshub.registry import CodeGlobal, ProjectCode, parse
@@ -122,6 +122,7 @@ def test_prestart_refuses_billing_keys(code, name, content, key):
     ("fifo", "не обычный файл"),
     ("device_link", "не обычный файл"),
     ("dir_link", "не обычный файл"),
+    ("deep", "не разбирается как JSON"),
 ])
 def test_prestart_refuses_unverifiable(code, kind, why):
     """7.1: проверка после resolve(); не обычный файл (в том числе цель симлинка), > 1 МБ, не JSON-объект — отказ.
@@ -147,6 +148,8 @@ def test_prestart_refuses_unverifiable(code, kind, why):
     elif kind == "dir_link":
         (code.root / "elsewhere").mkdir()
         p.symlink_to(code.root / "elsewhere")
+    elif kind == "deep":  # RecursionError в json.loads — «не проверить», а не исключение
+        p.write_text("[" * 100000, encoding="utf-8")
     plan = code.jobs.plan("proj", code.taskfile())
     t0 = time.time()
     with pytest.raises(JobError, match=why) as e:
@@ -508,7 +511,48 @@ def test_settings_written_mid_run_stops(code, monkeypatch):
     st = json.loads(_call(code, "code_status", {"job": jid}))
     assert st["billing"] == f"оплата: НЕ подписка ({src}) · задача остановлена"
     assert "изменился посреди звена" in st["reason_hint"]
-    assert _finish_params(code, jid)["billing_source"] == "none"
+    assert _finish_params(code, jid)["billing_source"] == src  # журнал — как итог, без противоречия
+
+
+BAD = '{"apiKeyHelper": "x"}'
+CLEAN = '{"model": "' + "s" * (len(BAD) - 13) + '"}'  # та же длина, что у BAD
+
+
+@pytest.mark.parametrize("change", ["size", "mtime", "ino", "settings_json"])
+def test_settings_signature(code, monkeypatch, tmp_path, change):
+    """Повторная проверка — ровно по смене (st_mtime_ns, st_size, st_ino): каждая часть сигнатуры по отдельности
+    (две другие сохранены) ведёт к проверке; появление settings.json — тоже; без смены файлы не перечитываются."""
+    assert len(CLEAN) == len(BAD)
+    jid, _ = _run(code, monkeypatch)
+    p = _settings(code, "settings.local.json", CLEAN)
+    calls = []
+    real = runner.billing_settings_problem
+    monkeypatch.setattr(runner, "billing_settings_problem", lambda d: calls.append(d) or real(d))
+    sup = Supervisor(code.hub, jid)
+    none = _Stream(tmp_path / "none.jsonl")
+    sup._watch(none)
+    sup._watch(none)
+    assert sup.stop is None and len(calls) == 1  # первый вызов проверяет, без смены — нет
+    st = os.stat(p)
+    if change == "size":
+        p.write_text(BAD + " ", encoding="utf-8")  # тот же inode
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns))
+    elif change == "mtime":
+        p.write_text(BAD, encoding="utf-8")  # та же длина, тот же inode
+        os.utime(p, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+    elif change == "ino":
+        tmp = p.with_name("new.json")
+        tmp.write_text(BAD, encoding="utf-8")
+        os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        os.replace(tmp, p)
+    else:
+        _settings(code, "settings.json", BAD)
+    if change != "settings_json":
+        new = os.stat(p)
+        diff = [new.st_mtime_ns != st.st_mtime_ns, new.st_size != st.st_size, new.st_ino != st.st_ino]
+        assert diff.count(True) == 1, diff  # меняется ровно одна часть сигнатуры
+    sup._watch(none)
+    assert sup.stop == "billing_mismatch" and len(calls) == 2
 
 
 def test_settings_written_mid_run_unverifiable_stops(code, monkeypatch):
@@ -544,7 +588,23 @@ def test_no_init_fails_closed(code, monkeypatch):
     assert "billing_source" in d["result"] and d["result"]["billing_source"] is None
     res = json.loads(_call(code, "code_result", {"job": jid}))
     assert res["billing"] == "оплата: НЕ подтверждена (init не было) · задача остановлена"
-    assert "init" in res["reason_hint"]
+    assert "не прислал событие init" in res["reason_hint"] and "stderr.log" in res["reason_hint"]
+    assert _finish_params(code, jid)["billing_source"] is None
+
+
+def test_no_init_beats_limit_and_plan(code, monkeypatch):
+    """Нет init + итог с ошибкой при rejected — billing_mismatch, а не subscription_limit; нет init в фазе плана —
+    billing_mismatch, до plan_ready не доходит."""
+    _jid, d = _run(code, monkeypatch, FAKE_NO_INIT="1", FAKE_RATE=json.dumps({**RATE, "status": "rejected"}),
+                   FAKE_LIMIT_ERROR="1")
+    assert (d["state"], d["reason"]) == ("failed", "billing_mismatch")
+    monkeypatch.delenv("FAKE_RATE")
+    monkeypatch.delenv("FAKE_LIMIT_ERROR")
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile("PLAN.md", size="L", risk="low")))["id"]
+    wait_terminal(code.jobs, root)
+    d = code.jobs.read(root)
+    assert (d["phase"], d["state"], d["reason"]) == ("plan", "failed", "billing_mismatch")
+    assert len(code.jobs.chain(root)) == 1
 
 
 def test_no_init_no_result_keeps_reason(code, monkeypatch):

@@ -3,6 +3,7 @@ rate_limit_event в потоке, причины billing_mismatch / overage / su
 Настоящий claude не вызывается — tests/fake_claude.py (FAKE_SOURCE, FAKE_RATE…)."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -16,7 +17,7 @@ from wshub import claude_cli, code_cli
 from wshub.core import Hub
 from wshub.jobs import JobError, Jobs
 from wshub.registry import CodeGlobal, ProjectCode, parse
-from wshub.runner import billing_line
+from wshub.runner import Supervisor, _Stream, billing_line
 
 # rate_limit_info с подписки (PoC WSH-4.0, факт 3): 1792059600 = 15.10 10:20Z, 1792522800 = 20.10 19:00Z
 RATE = {"status": "allowed", "resetsAt": 1792059600, "rateLimitType": "five_hour", "overageStatus": "rejected",
@@ -33,18 +34,26 @@ def code(tmp_path, monkeypatch):
     return make_code(tmp_path, monkeypatch)
 
 
+@contextlib.contextmanager
+def _tz(name: str):
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
+
+
 @pytest.fixture
 def utc():
     """Часы хоста — UTC: строка оплаты сверяется с примером ТЗ буквально. Надзиратель наследует TZ."""
-    old = os.environ.get("TZ")
-    os.environ["TZ"] = "UTC"
-    time.tzset()
-    yield
-    if old is None:
-        os.environ.pop("TZ", None)
-    else:
-        os.environ["TZ"] = old
-    time.tzset()
+    with _tz("UTC"):
+        yield
 
 
 def _job_dirs(code) -> int:
@@ -269,7 +278,7 @@ def test_billing_mismatch_stops(code, monkeypatch, source):
 
 
 def test_billing_mismatch_after_claude_exit(code, monkeypatch):
-    """claude вышел раньше опроса надзирателя: хвост потока дочитывается, итог — не completed."""
+    """claude сам успешно вышел до остановки (фейк без FAKE_SLEEP): итог — billing_mismatch, а не completed."""
     _jid, d = _run(code, monkeypatch, FAKE_SOURCE="apiKeyHelper")
     assert (d["state"], d["reason"], d["result"]["billing_source"]) == ("failed", "billing_mismatch", "apiKeyHelper")
 
@@ -317,8 +326,9 @@ def test_subscription_limit(code, monkeypatch, utc):
         assert out["billing"].endswith("· лимит подписки исчерпан, сброс 15.10 10:20")
 
 
-def test_error_with_allowed_keeps_old_reason(code, monkeypatch):
-    _jid, d = _run(code, monkeypatch, FAKE_RATE=json.dumps(RATE), FAKE_LIMIT_ERROR="1",
+@pytest.mark.parametrize("status", ["allowed", "allowed_warning"])
+def test_error_with_allowed_keeps_old_reason(code, monkeypatch, status):
+    _jid, d = _run(code, monkeypatch, FAKE_RATE=json.dumps({**RATE, "status": status}), FAKE_LIMIT_ERROR="1",
                    FAKE_SUBTYPE="error_during_execution")
     assert (d["state"], d["reason"]) == ("failed", "error_during_execution")
 
@@ -365,6 +375,103 @@ def test_billing_line_everywhere(code, monkeypatch, capsys, utc):
     jid2, _ = _run(code, monkeypatch, FAKE_RATE=json.dumps(newer), FAKE_RATE_COUNT="1")
     rows = json.loads(_call(code, "code_projects", {}))
     assert rows[0]["rate"]["job"] == jid2 and "5 ч — 50 %" in rows[0]["rate"]["line"]
+
+
+def test_billing_line_host_clock():
+    """Время сброса — по часам хоста, а не в UTC (TZ без tzdata: MSK-3 — UTC+3)."""
+    with _tz("MSK-3"):
+        line = billing_line({"source": "none", "rate": RATE})
+    assert "5 ч — 11 %, сброс 15.10 13:20" in line and "неделя — 23 %, сброс 20.10 22:00" in line
+
+
+def test_billing_line_bad_numbers(utc):
+    """Infinity и NaN из json.loads не роняют строку оплаты — окно пропускается."""
+    rate = {**RATE, "unifiedWindows": {"five_hour": {"utilization": float("inf")},
+                                       "seven_day": {"utilization": 0.23, "resetsAt": 1792522800}}}
+    assert billing_line({"rate": rate}) == ("оплата: подписка · неделя — 23 %, сброс 20.10 19:00 · "
+                                            "overage: выкл (org_level_disabled)")
+
+
+def test_billing_written_while_running(code, monkeypatch, utc):
+    """billing пишется в job.json по ходу работы (не только в _finish): живая строка оплаты в code_status."""
+    for k, v in {"FAKE_RATE": json.dumps(RATE), "FAKE_RATE_AT": "1", "FAKE_SLEEP": "20",
+                 "FAKE_INIT_MODEL": "claude-sonnet-5-5"}.items():
+        monkeypatch.setenv(k, v)
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    end = time.time() + 15
+    while time.time() < end and not (code.jobs.read(jid).get("billing") or {}).get("rate"):
+        time.sleep(0.1)
+    d = code.jobs.read(jid)
+    assert d["state"] == "running" and d["billing"]["source"] == "none"
+    assert d["billing"]["model"] == "claude-sonnet-5-5" and d["billing"]["rate_events"] == 1
+    assert json.loads(_call(code, "code_status", {"job": jid}))["billing"] == LINE
+    code.jobs.cancel(jid)
+    wait_terminal(code.jobs, jid, timeout=60)
+
+
+def test_watch_unit(code, monkeypatch, tmp_path):
+    """Сверка _watch напрямую: второй init с "none" не затирает несовпадение, первая причина остаётся, строка
+    с глубокой вложенностью не роняет разбор; реестр не читается — overage не разрешён (даже при allow_overage)."""
+    _rewrite(code, code.cfg.read_text().replace("[code]\n", "[code]\nallow_overage = true\n"))
+    jid, _ = _run(code, monkeypatch)
+    over = {"type": "rate_limit_event", "rate_limit_info": {**RATE, "isUsingOverage": True}}
+    p = tmp_path / "ev.jsonl"
+    p.write_text("[" * 100000 + "\n" + "\n".join(json.dumps(e) for e in (
+        {"type": "system", "subtype": "init", "apiKeySource": "apiKeyHelper", "model": "m1"},
+        {"type": "system", "subtype": "init", "apiKeySource": "none", "model": "m2"}, over)) + "\n")
+    sup = Supervisor(code.hub, jid)
+    sup._watch(_Stream(p))
+    assert sup.stop == "billing_mismatch"  # overage после него причину не меняет
+    b = code.jobs.read(jid)["billing"]  # _watch пишет job.json сам
+    assert (b["source"], b["model"], b["rate_events"]) == ("apiKeyHelper", "m2", 1)
+
+    sup = Supervisor(code.hub, jid)
+    sup._watch(_Stream(tmp_path / "none.jsonl"))  # файла нет — пусто, без ошибки
+    assert sup.stop is None
+
+    def broken():
+        raise RuntimeError("реестр не читается")
+
+    q = tmp_path / "over.jsonl"
+    q.write_text(json.dumps(over) + "\n")
+    sup = Supervisor(code.hub, jid)
+    sup._watch(_Stream(q))
+    assert sup.stop is None  # allow_overage = true
+    monkeypatch.setattr(sup.hub.registry, "get", broken)
+    sup._watch(_Stream(q))
+    assert sup.stop == "overage"
+
+
+def test_billing_line_chain_root_uses_active_link(code, monkeypatch, utc):
+    """У корня цепочки (план → исполнение) строка оплаты и модель — по активному звену, а не по звену плана."""
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(size="L", risk="low")))["id"]
+    assert wait_terminal(code.jobs, root)["state"] == "plan_ready"
+    assert json.loads(_call(code, "code_status", {"job": root}))["billing"] == NO_DATA
+    monkeypatch.setenv("FAKE_RATE", json.dumps(RATE))
+    monkeypatch.setenv("FAKE_INIT_MODEL", "claude-opus-5-5")
+    code.jobs.approve(root)
+    end = time.time() + 30
+    while time.time() < end and json.loads(_call(code, "code_status", {"job": root}))["state"] != "completed":
+        time.sleep(0.2)
+    st = json.loads(_call(code, "code_status", {"job": root}))
+    assert st["state"] == "completed" and st["billing"] == LINE
+    res = json.loads(_call(code, "code_result", {"job": root}))
+    assert res["billing"] == LINE and res["model_line"].endswith("→ claude-opus-5-5")
+
+
+def test_prestart_on_auto_execute(code, monkeypatch):
+    """plan = auto: исполнение запускает сам надзиратель через approve → start — проверка до старта срабатывает и
+    там; план остаётся plan_ready с chain_error."""
+    monkeypatch.setenv("FAKE_SLEEP_PLAN", "2")
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(size="M", risk="low")))["id"]
+    assert code.jobs.read(root)["plan_mode"] == "auto"
+    _settings(code, "settings.local.json", {"apiKeyHelper": "x"})  # после проверки плана, до исполнения
+    end = time.time() + 30
+    while time.time() < end and not code.jobs.read(root).get("chain_error"):
+        time.sleep(0.2)
+    d = code.jobs.read(root)
+    assert d["state"] == "plan_ready" and "задаёт apiKeyHelper" in d["chain_error"]
+    assert len(code.jobs.chain(root)) == 1
 
 
 def test_no_rate_data_line(code, monkeypatch):

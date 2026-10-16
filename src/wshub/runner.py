@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import signal
@@ -90,7 +91,8 @@ def billing_line(billing: dict | None, reason: str | None = None) -> str:
         for k in [*(k for k in WINDOWS if k in wins), *sorted(k for k in wins if k not in WINDOWS)]:
             w = wins[k]
             u = w.get("utilization") if isinstance(w, dict) else None
-            if not isinstance(u, (int, float)) or isinstance(u, bool):
+            # json.loads пропускает Infinity и NaN — на них round() падает
+            if not isinstance(u, (int, float)) or isinstance(u, bool) or not math.isfinite(u):
                 continue
             t = _short(w.get("resetsAt"))
             parts.append(f"{WINDOWS.get(k, k)} — {round(u * 100)} %" + (f", сброс {t}" if t else ""))
@@ -149,7 +151,7 @@ def _rate_brief(rate) -> dict | None:
     if not isinstance(rate, dict):
         return None
     wins = rate.get("unifiedWindows") if isinstance(rate.get("unifiedWindows"), dict) else {}
-    w = wins.get(rate.get("rateLimitType"))
+    w = wins.get(rate.get("rateLimitType")) if isinstance(rate.get("rateLimitType"), str) else None
     return {"window": rate.get("rateLimitType"), "utilization": w.get("utilization") if isinstance(w, dict) else None,
             "status": rate.get("status"), "isUsingOverage": rate.get("isUsingOverage")}
 
@@ -174,7 +176,7 @@ class _Stream:
         for raw in data[:end].splitlines():
             try:
                 e = json.loads(raw)
-            except ValueError:
+            except (ValueError, RecursionError):  # глубокая вложенность не должна ронять надзирателя
                 continue
             if isinstance(e, dict):
                 out.append(e)
@@ -523,7 +525,10 @@ class Supervisor:
                         self.stop = self.stop or "overage"
                 changed = True
         if changed:
-            self._save()
+            try:
+                self._save()
+            except OSError:  # сбой записи (диск) не ломает цикл: остановка по self.stop идёт, billing допишет _finish
+                pass
 
     def _allow_overage(self) -> bool:
         try:

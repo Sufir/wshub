@@ -4,6 +4,8 @@
 процессов, слежение за отменой и пределом времени, разбор итога, снимок git, запись result.json и job.json.
 Фаза плана (ТЗ WSH-3, 2.3): копия плана в plan.md, состояние plan_ready, при plan = auto — запуск исполнения.
 Блок «Вне кода» (ТЗ WSH-3.3): коммиты звена, изменения .git/hooks и .git/config, вызовы docker.
+Страж подписки (ТЗ WSH-4.1): сверка init и rate_limit_event в потоке, поле billing, остановка не по подписке и на
+overage, причина subscription_limit, строка оплаты для ответов.
 """
 from __future__ import annotations
 
@@ -41,6 +43,142 @@ PLAN_MAX = 200 * 1024  # байт: копия плана в каталоге з�
 DOCKER_CMD_MAX = 200  # символов команды в блоке «Вне кода»
 # docker как команда: в начале (строки) или после ;, &&, ||, | (ТЗ WSH-3.3, п. 1.3)
 DOCKER_RE = re.compile(r"(?:^|;|&&|\|\|?)\s*(?:docker|docker-compose)(?=\s|$)", re.MULTILINE)
+# окна лимита подписки в строке оплаты (ТЗ WSH-4.1, п. 2.6); прочие окна — под своим именем, после этих
+WINDOWS = {"five_hour": "5 ч", "seven_day": "неделя"}
+BILLING_HINT = {
+    "billing_mismatch": "claude сообщил источник оплаты не «none» (не подписка) — задача остановлена; проверь "
+                        "apiKeyHelper и env в .claude/settings*.json рабочего каталога",
+    "overage": "задача начала тратить extra usage сверх подписки (isUsingOverage) и остановлена; разрешить — "
+               "[code] allow_overage = true в реестре",
+}
+
+
+def _iso(ts) -> str | None:
+    """Время по часам хоста в формате поля created в job.json."""
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    try:
+        return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _short(ts) -> str | None:
+    """Время сброса в строке оплаты: «15.10 10:20» по часам хоста (resetsAt — unix-секунды, факт 3)."""
+    if not isinstance(ts, (int, float)) or isinstance(ts, bool):
+        return None
+    try:
+        return datetime.fromtimestamp(ts).strftime("%d.%m %H:%M")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def billing_line(billing: dict | None, reason: str | None = None) -> str:
+    """Строка оплаты (ТЗ WSH-4.1, п. 2.6): окна из unifiedWindows (utilization × 100), сброс, overage; «близко к
+    лимиту» при allowed_warning; три причины остановки — хвостом строки."""
+    b = billing or {}
+    if reason == "billing_mismatch" or ("source" in b and b["source"] != "none"):
+        src = b.get("source")
+        return (f"оплата: НЕ подписка (apiKeySource: {src if src is not None else 'поля нет'})"
+                + (" · задача остановлена" if reason == "billing_mismatch" else ""))
+    rate = b.get("rate") if isinstance(b.get("rate"), dict) else None
+    if not rate:
+        line = "оплата: подписка (данных о лимитах ещё нет)"
+    else:
+        wins = rate.get("unifiedWindows") if isinstance(rate.get("unifiedWindows"), dict) else {}
+        parts = ["оплата: подписка"]
+        for k in [*(k for k in WINDOWS if k in wins), *sorted(k for k in wins if k not in WINDOWS)]:
+            w = wins[k]
+            u = w.get("utilization") if isinstance(w, dict) else None
+            if not isinstance(u, (int, float)) or isinstance(u, bool):
+                continue
+            t = _short(w.get("resetsAt"))
+            parts.append(f"{WINDOWS.get(k, k)} — {round(u * 100)} %" + (f", сброс {t}" if t else ""))
+        ov = _overage(rate)
+        if ov:
+            parts.append(ov)
+        line = " · ".join(parts)
+        if rate.get("status") == "allowed_warning":
+            line = "близко к лимиту · " + line
+    if reason == "overage":
+        line += " · задача остановлена: overage"
+    elif reason == "subscription_limit":
+        t = _short((rate or {}).get("resetsAt"))
+        line += " · лимит подписки исчерпан" + (f", сброс {t}" if t else "")
+    return line
+
+
+def _overage(rate: dict) -> str | None:
+    if rate.get("isUsingOverage"):
+        return "overage: используется"
+    st = rate.get("overageStatus")
+    if st == "rejected":
+        why = rate.get("overageDisabledReason")
+        return "overage: выкл" + (f" ({why})" if why else "")
+    return "overage: вкл" if isinstance(st, str) else None
+
+
+def billing_hint(reason: str | None, billing: dict | None) -> str | None:
+    """reason_hint трёх причин стража подписки; у subscription_limit — когда продолжать."""
+    if reason == "subscription_limit":
+        rate = (billing or {}).get("rate")
+        t = _short(rate.get("resetsAt")) if isinstance(rate, dict) else None
+        return f"лимит подписки исчерпан; после {t or 'сброса лимита'} продолжи: code_resume"
+    return BILLING_HINT.get(reason)
+
+
+def apply_billing(jobs: Jobs, view: dict, model: bool = False) -> dict:
+    """Строка оплаты, подсказка трёх причин и (model) фактическая модель в снимке или итоге — по активному звену
+    (code_status, code_wait, code_result, wshub code status/result)."""
+    try:
+        d = jobs.read(view.get("active") or view.get("id") or view.get("job"))
+    except JobError:
+        return view
+    b = d.get("billing") or {}
+    view["billing"] = billing_line(b, d.get("reason"))
+    hint = billing_hint(d.get("reason"), b)
+    if hint:
+        view["reason_hint"] = hint
+    if model:
+        view["model_line"] = f"модель: {d.get('model')} → {b.get('model') or 'неизвестна (init не было)'}"
+    return view
+
+
+def _rate_brief(rate) -> dict | None:
+    """Сжатый rate_limit_info для журнала: окно, его utilization, status, isUsingOverage."""
+    if not isinstance(rate, dict):
+        return None
+    wins = rate.get("unifiedWindows") if isinstance(rate.get("unifiedWindows"), dict) else {}
+    w = wins.get(rate.get("rateLimitType"))
+    return {"window": rate.get("rateLimitType"), "utilization": w.get("utilization") if isinstance(w, dict) else None,
+            "status": rate.get("status"), "isUsingOverage": rate.get("isUsingOverage")}
+
+
+class _Stream:
+    """events.jsonl по мере записи (ТЗ WSH-4.1, п. 2.4): новые целые строки с последнего прочитанного байта."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.offset = 0
+
+    def read(self) -> list[dict]:
+        try:
+            with self.path.open("rb") as fh:
+                fh.seek(self.offset)
+                data = fh.read()
+        except OSError:
+            return []
+        end = data.rfind(b"\n") + 1
+        self.offset += end
+        out = []
+        for raw in data[:end].splitlines():
+            try:
+                e = json.loads(raw)
+            except ValueError:
+                continue
+            if isinstance(e, dict):
+                out.append(e)
+        return out
 
 
 def _clip_bytes(text: str, limit: int) -> str:
@@ -282,6 +420,7 @@ class Supervisor:
         self.jid = jid
         self.jdir = self.jobs.job_dir(jid)
         self.d = self.jobs.read(jid)
+        self.stop: str | None = None  # billing_mismatch | overage — остановка стражем подписки (ТЗ WSH-4.1)
 
     def _save(self, **kw):
         self.d.update(kw)
@@ -344,15 +483,53 @@ class Supervisor:
                    started=time.time())
         max_s = float(self.d.get("max_hours") or 4) * 3600
         escalated = None
+        stream = _Stream(self.jdir / "events.jsonl")
         while proc.poll() is None:
             time.sleep(POLL)
+            self._watch(stream)
             over = time.time() - self.d["started"] > max_s
-            if (self._cancelled() or over) and escalated is None:
-                self._save(state="cancelling", reason="timeout" if over else "cancel")
+            if (self._cancelled() or over or self.stop) and escalated is None:
+                # остановка стражем — тем же путём, что code_cancel (ТЗ WSH-4.1, п. 2.4)
+                self._save(state="cancelling", reason=self.stop or ("timeout" if over else "cancel"))
                 escalated = self._escalate(proc)
         proc.wait()
         events.close()
         stderr.close()
+        self._watch(stream)  # хвост потока: claude мог выйти раньше очередного опроса
+
+    def _watch(self, stream: _Stream) -> None:
+        """Сверка оплаты по потоку (ТЗ WSH-4.1, п. 2.4): init — источник и фактическая модель, rate_limit_event —
+        последний rate_limit_info и счётчик. apiKeySource не "none" или поля нет — billing_mismatch; isUsingOverage
+        без [code] allow_overage — overage. Первая причина остаётся."""
+        changed = False
+        for e in stream.read():
+            if e.get("type") not in ("system", "rate_limit_event"):
+                continue
+            b = self.d.setdefault("billing", {})
+            if e.get("type") == "system" and e.get("subtype") == "init":
+                src = e.get("apiKeySource")
+                if b.get("source", "none") == "none":  # несовпадение не затирается следующим init
+                    b["source"] = src
+                b["model"] = e.get("model")
+                changed = True
+                if src != "none":
+                    self.stop = self.stop or "billing_mismatch"
+            elif e.get("type") == "rate_limit_event":
+                b["rate_events"] = int(b.get("rate_events") or 0) + 1
+                info = e.get("rate_limit_info")
+                if isinstance(info, dict):
+                    b.update(rate=info, rate_at=_iso(time.time()), rate_ts=time.time())
+                    if info.get("isUsingOverage") and not self._allow_overage():
+                        self.stop = self.stop or "overage"
+                changed = True
+        if changed:
+            self._save()
+
+    def _allow_overage(self) -> bool:
+        try:
+            return self.hub.registry.get().code.glob.allow_overage is True
+        except Exception:  # noqa: BLE001 — реестр не читается: overage не разрешён
+            return False
 
     def _escalate(self, proc) -> bool:
         """SIGINT процессу Code → пауза → SIGTERM его группе → пауза → SIGKILL группе (п. 2.5.4)."""
@@ -393,10 +570,19 @@ class Supervisor:
         except Exception as e:  # noqa: BLE001 — блок прозрачности не должен ронять итог звена
             result["outside_code"] = {"commits": [], "commits_count": 0, "git_meta_changed": [], "docker": [],
                                       "docker_count": 0, "errors": [f"блок не собран: {e}"[:500]]}
-        if self.d.get("state") == "cancelling":
+        billing = self.d.get("billing") or {}
+        rate = billing.get("rate") if isinstance(billing.get("rate"), dict) else {}
+        if self.stop:  # страж подписки важнее отмены и таймаута: деньги (ТЗ WSH-4.1, решения плана)
+            state, reason = "failed", self.stop
+            if self.stop == "billing_mismatch":
+                result["billing_source"] = billing.get("source")  # фактический источник; None — поля нет
+        elif self.d.get("state") == "cancelling":
             state, reason = ("timeout", "max_hours") if self.d.get("reason") == "timeout" else ("cancelled", "cancel")
         elif not res_event:
             state, reason = "failed", "no_result"
+        elif res_event.get("is_error") and rate.get("status") == "rejected":  # лимит подписки (п. 2.5, факт 9)
+            state, reason = "failed", "subscription_limit"
+            result["resets_at"] = _iso(rate.get("resetsAt"))
         else:
             state, reason = _map_state(res_event.get("subtype"), res_event.get("is_error"))
         result["session_id"] = result["session_id"] or self.d.get("session_id")
@@ -495,6 +681,7 @@ class Supervisor:
     def _journal(self):
         res = self.d.get("result") or {}
         oc = res.get("outside_code") or {}
+        b = self.d.get("billing") or {}
         sha = hashlib.sha256((self.d.get("prompt") or "").encode()).hexdigest()
         try:
             prompt = (self.jdir / "prompt.txt").read_text(encoding="utf-8")
@@ -509,7 +696,9 @@ class Supervisor:
                                  "session_cost_usd": res.get("total_cost_usd"), "num_turns": res.get("num_turns"),
                                  "session_id": res.get("session_id"), "phase": self.d.get("phase"),
                                  "docker_count": oc.get("docker_count"), "commits_count": oc.get("commits_count"),
-                                 "git_meta_changed": oc.get("git_meta_changed")})
+                                 "git_meta_changed": oc.get("git_meta_changed"),
+                                 "billing_source": b.get("source"), "billing_model": b.get("model"),
+                                 "rate_events": b.get("rate_events") or 0, "rate": _rate_brief(b.get("rate"))})
 
 
 def run_job(hub, jid: str) -> int:

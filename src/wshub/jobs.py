@@ -27,11 +27,12 @@ from pathlib import Path
 
 from . import claude_cli, code_policy, gitsafe, taskfile
 from .core import WsError
-from .registry import ProjectCode, RegistryError
+from .registry import ProjectCode, RegistryError, billing_env
 from .runtime import atomic_write_text, pid_alive, proc_start, read_json
 
 B32 = "abcdefghijklmnopqrstuvwxyz234567"
 TASKFILE_MAX = 1024 * 1024
+SETTINGS_MAX = 1024 * 1024  # байт: .claude/settings*.json крупнее — отказ до старта (ТЗ WSH-4.1, 7.1)
 MODELS = ("haiku", "sonnet", "opus", "fable")
 EFFORTS = ("low", "medium", "high", "xhigh", "max")
 LIVE = ("starting", "prefetch", "running", "cancelling", "orphaned")
@@ -110,6 +111,45 @@ class Plan:
 
     def session_name(self) -> str:
         return f"{self.project}/{self.ticket}" + ("/plan" if self.phase == "plan" else "")
+
+
+def check_billing_settings(d: Path) -> None:
+    """Проверка до старта (ТЗ WSH-4.1, п. 2.1 и 7.1): .claude/settings.json и settings.local.json рабочего каталога
+    (claude читает их только оттуда) не задают apiKeyHelper и в env — имена, меняющие источник оплаты. Файла нет —
+    пропуск; пустой (0 байт или одни пробелы) — настроек нет: так остаётся точка монтирования песочницы. Не обычный
+    файл (после симлинка), больше SETTINGS_MAX, не JSON-объект — отказ: хаб не может проверить, что в нём."""
+    def unverifiable(p: Path, why: str) -> JobError:
+        return JobError(f"{p} {why}: хаб не может проверить, что в нём, — задача могла бы пойти не по подписке")
+
+    for name in claude_cli.CLAUDE_SETTINGS:
+        p = d / name
+        try:
+            fd = os.open(p, os.O_RDONLY | os.O_NONBLOCK)  # FIFO не повесит старт: открытие не ждёт писателя
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        except OSError as e:
+            raise unverifiable(p, f"не открывается ({e.strerror})") from None
+        try:  # тип — по сырому дескриптору: fdopen на каталоге сам бросает IsADirectoryError
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise unverifiable(p, "— не обычный файл (каталог, устройство, FIFO)")
+            with os.fdopen(fd, "rb", closefd=False) as fh:
+                data = fh.read(SETTINGS_MAX + 1)
+        finally:
+            os.close(fd)
+        if len(data) > SETTINGS_MAX:
+            raise unverifiable(p, f"больше {SETTINGS_MAX // 1024} КБ")
+        try:
+            text = data.decode("utf-8")
+            obj = json.loads(text) if text.strip() else {}
+        except ValueError as e:
+            raise unverifiable(p, f"не разбирается как JSON ({e})") from None
+        if not isinstance(obj, dict):
+            raise unverifiable(p, "— не JSON-объект")
+        env = obj.get("env")
+        keys = (["apiKeyHelper"] if "apiKeyHelper" in obj else []) + \
+            [f"env.{k}" for k in (env if isinstance(env, dict) else {}) if billing_env(k)]
+        if keys:
+            raise JobError(f"задача пошла бы не по подписке: {p} задаёт {keys[0]}")
 
 
 def _order(value: str, order: tuple[str, ...], name: str) -> int:
@@ -415,6 +455,7 @@ class Jobs:
               chain_root: str | None = None, link: tuple[str, str] | None = None, now: float | None = None) -> dict:
         """Записать и запустить звено. link = (id фазы плана, причина) — переход из plan_ready: под тем же flock
         проверяем, что план всё ещё plan_ready и не утверждён, и отмечаем его (code_approve/replan/auto)."""
+        check_billing_settings(plan.dir)  # до каталога задачи: отказ не оставляет файлов (ТЗ WSH-4.1, п. 2.1)
         glob = self.hub.registry.get().code.glob
         read_extra = self._read_extra(plan.root, plan.proj)  # до каталога задачи: отказ не оставляет файлов
         # claude и его флаги (вызовы подпроцесса) — до flock: не трогают общее состояние, не держат лок

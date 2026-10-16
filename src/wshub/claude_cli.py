@@ -17,7 +17,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .registry import CodeGlobal, ProjectCode
+from .registry import CodeGlobal, ProjectCode, billing_env
 from .runtime import atomic_write_text
 
 SUBAGENT_TOOL = "Task"  # так инструмент называется в init.tools у 2.1.291; в документации Agent — алиас
@@ -41,6 +41,9 @@ HELPER_FORGE = "wshub forge *"
 ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ", "DOCKER_HOST", "DOCKER_CONFIG")
 # исполняемая часть git: Code её не меняет — иначе git хаба (вне песочницы) запустит его программу
 GIT_PROTECTED = (".git/config", ".git/hooks", ".git/info", ".git/modules")
+# настройки claude в рабочем каталоге: claude перечитывает их на ходу, в том числе apiKeyHelper и env — правка из
+# задачи переключила бы оплату посреди сессии (ТЗ WSH-4.1, факт 6). До старта их проверяет jobs
+CLAUDE_SETTINGS = (".claude/settings.json", ".claude/settings.local.json")
 SANDBOX_DENY_READ = ("~/", "/mnt/")  # домашний каталог и диски Windows; нужное открывает allowRead
 SANDBOX_ALLOW_READ = ("~/.gitconfig", "~/.config/git/")
 RULE_UNSAFE = re.compile(r"[*?\[\]{}()\\]")  # путь с такими символами в правиле — шаблон, а не один файл
@@ -112,7 +115,8 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     allow += [f"Bash({c})" for c in helper]
     deny = [*(f"Bash({c})" for c in DENY_BASH), "Read(**/.env*)", "WebFetch", "WebSearch",
             *(f"Edit({m})" for m in proj.deny_edit),
-            *(f"Edit(./{g}{'' if g.endswith('config') else '/**'})" for g in GIT_PROTECTED)]
+            *(f"Edit(./{g}{'' if g.endswith('config') else '/**'})" for g in GIT_PROTECTED),
+            *(f"Edit(./{s})" for s in CLAUDE_SETTINGS)]
     for p in deny_paths(glob, proj, protected, home):
         r = _abs_rule(p)
         deny += [f"Read({r})", f"Edit({r})", f"Read({r}/**)", f"Edit({r}/**)"]
@@ -206,9 +210,10 @@ def argv(claude: str, prompt: str, *, job_dir: Path, model: str, effort: str, ma
 
 
 def environment(environ: dict, pass_env: tuple[str, ...]) -> dict:
-    """Белый список, а не наследование. Секретов нет даже из pass_env (реестр такие имена не пропускает)."""
+    """Белый список, а не наследование. Секретов нет даже из pass_env (реестр такие имена не пропускает), как и
+    переменных, меняющих источник оплаты (ТЗ WSH-4.1, п. 2.3: реестр о них только предупреждает)."""
     names = set(ENV_PASS) | {k for k in environ if k.startswith("LC_")} | set(pass_env)
-    env = {k: v for k, v in environ.items() if k in names and not _secret_name(k)}
+    env = {k: v for k, v in environ.items() if k in names and not _secret_name(k) and not billing_env(k)}
     env["TERM"] = "dumb"
     return env
 

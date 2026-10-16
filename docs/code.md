@@ -29,6 +29,7 @@ network = []             # sandbox.network.allowedDomains для всех про
 deny_read = ["~/.ssh", "~/.aws", "~/.gnupg", "~/.config/wshub", "~/.local/state/wshub",
              "~/.claude/.credentials.json", "~/.claude.json"]
 pass_env = []            # имена переменных окружения сверх белого списка (секреты запрещены)
+allow_overage = false    # extra usage сверх подписки: false — задача с isUsingOverage останавливается (раздел «Оплата»)
 
 [workspace.team-service.code]
 enabled = true
@@ -629,6 +630,72 @@ merge_request.create`.
 
 `card` включать, когда проверено, что хост показывает карточку и принимает `ui/message` (поддержка `ui/message` в
 Claude документацией не подтверждена). Без MCP Apps карточки нет — работает только `poll`.
+
+## Оплата
+
+Задача Code идёт **только по подписке** claude.ai: режима оплаты по ключу API у неё нет. Подписку claude
+показывает в событии `init` полем `apiKeySource: "none"`; ключ из `apiKeyHelper` или `env.ANTHROPIC_API_KEY` в
+настройках проекта переключает оплату молча, и `forceLoginMethod` в `--settings` это не перебивает (PoC WSH-4.0).
+Поэтому хаб держит оплату в три слоя.
+
+**До старта** (`code_start`, `code_resume`, `code_approve`, `code_replan`, `plan = auto`) хаб читает
+`.claude/settings.json` и `.claude/settings.local.json` рабочего каталога задачи: claude берёт их только оттуда.
+Отказ, если файл задаёт ключ `apiKeyHelper` или в объекте `env` — имя `ANTHROPIC_*`, `CLAUDE_CODE_USE_*`,
+`CLAUDE_CODE_OAUTH_*` или `AWS_BEARER_TOKEN_BEDROCK` (семейства — префиксами): «задача пошла бы не по подписке:
+<файл> задаёт <ключ>». Отказ и тогда, когда хаб не может проверить, что в файле: не JSON-объект, больше 1 МБ, не
+обычный файл (каталог, устройство, FIFO — в том числе через симлинк). Пустой файл (0 байт или одни пробелы) —
+«настроек нет»: так остаётся точка монтирования песочницы. Каталог задачи при отказе не создаётся.
+
+**Что запрещено задаче.** claude перечитывает файлы настроек на ходу, в том числе `apiKeyHelper` и `env`: правка
+посреди сессии переключила бы оплату. Во всех профилях и в фазе плана — `deny` на `Edit(./.claude/settings.json)` и
+`Edit(./.claude/settings.local.json)`. Переменные тех же семейств не доходят до окружения задачи, даже если они в
+`[code] pass_env`; реестр с такими именами в `pass_env` — предупреждение, а не ошибка.
+
+**Сверка в потоке.** Надзиратель читает `events.jsonl` по мере записи, в том же цикле, что следит за отменой:
+
+- `init` — в `job.json` пишется `billing.source` (`apiKeySource`) и `billing.model` (фактическая модель за
+  алиасом). `apiKeySource` не `"none"` или поля нет — остановка тем же путём, что `code_cancel`;
+- `rate_limit_event` — последний `rate_limit_info` целиком в `billing.rate`, время прихода в `billing.rate_at`,
+  счётчик событий звена в `billing.rate_events`; `isUsingOverage: true` — остановка, если не `allow_overage = true`.
+
+Три причины завершения (состояние `failed`), каждая — в строке оплаты и в `reason_hint`:
+
+- `billing_mismatch` — задача пошла не по подписке; фактический источник — `result.billing_source` (`null` — поля
+  `apiKeySource` не было);
+- `overage` — задача начала тратить extra usage сверх подписки; разрешить — `[code] allow_overage = true`
+  (глобально, по умолчанию `false`);
+- `subscription_limit` — итог с `is_error: true` при последнем `status: "rejected"`: лимит подписки исчерпан;
+  `result.resets_at` — время сброса, подсказка — «после <время> продолжи: code_resume». На ключ задача не переходит.
+
+Причина стража важнее отмены и таймаута: если claude вышел раньше, чем надзиратель прочитал событие, причина всё
+равно ставится по хвосту потока.
+
+**Строка оплаты** — поле `billing` в `code_status`, полном ответе `code_wait`, `code_result`, `wshub code status` и
+`wshub code result`:
+
+```
+оплата: подписка · 5 ч — 11 %, сброс 15.10 10:20 · неделя — 23 %, сброс 20.10 19:00 · overage: выкл (org_level_disabled)
+```
+
+Окна — из `unifiedWindows` (`five_hour` — «5 ч», `seven_day` — «неделя», прочие — под своим именем), процент —
+`utilization × 100`, время сброса — по часам хоста. `status: "allowed_warning"` — «близко к лимиту · » в начале
+строки; событий ещё не было — «оплата: подписка (данных о лимитах ещё нет)». `code_result` показывает и модель:
+`model_line` — «модель: sonnet → claude-sonnet-5-5». `code_projects` в поле `rate` каждой строки — последний
+известный снимок лимитов (`job`, `project`, `at`, `line`) из самой свежей задачи хаба с `billing.rate`; нет такой
+задачи — `null`. В журнал строкой `code_finish` идут `billing_source`, `billing_model`, `rate_events` и `rate`
+(окно, его `utilization`, `status`, `isUsingOverage`). Тихая строка `code_wait` и карточка задачи строку оплаты не
+показывают.
+
+**Остаточные риски:**
+
+- остановка по `init` не гарантирует нулевой расход: если запрос к API уходит раньше `init`, на чужой счёт попадёт не
+  больше одного запроса. Главная защита — проверка до старта и запрет правки настроек;
+- задача может получить `.claude/settings*.json` не правкой, а через git (`checkout`, `merge` ветки с таким файлом):
+  сверка в потоке поймает это только при следующем старте звена;
+- сколько `rate_limit_event` приходит в многоходовом запуске, не проверено (покажет `rate_events`): overage может
+  обнаружиться поздно. Основная защита — extra usage выключен на уровне организации (`org_level_disabled`);
+- значение `status: "rejected"` взято из стороннего источника, живьём исчерпание лимита не проверялось;
+- шкала `utilization` (доля 0..1) — по одному наблюдению.
 
 ## Состояния задачи
 

@@ -157,10 +157,11 @@ def _follow(jobs, jid: str) -> None:
 
 def _status(hub: Hub, args: list[str]) -> int:
     from .jobs import Jobs
+    from .runner import apply_billing
     jobs = Jobs(hub)
     pos, _ = _parse(args)
     if pos:
-        snap = jobs.snapshot(pos[0])
+        snap = apply_billing(jobs, jobs.snapshot(pos[0]))  # строка оплаты (ТЗ WSH-4.1, п. 2.6)
         print(json.dumps(snap, ensure_ascii=False, indent=1))
         hub._audit_code("cli_code_status", snap.get("project"), pos[0])
     else:
@@ -172,11 +173,12 @@ def _status(hub: Hub, args: list[str]) -> int:
 
 def _result(hub: Hub, args: list[str]) -> int:
     from .jobs import Jobs, meta_warning
+    from .runner import apply_billing
     jobs = Jobs(hub)
     pos, _ = _parse(args)
     if len(pos) != 1:
         raise WsError("нужно: wshub code result <job>")
-    out = jobs.result_view(pos[0])
+    out = apply_billing(jobs, jobs.result_view(pos[0]), model=True)  # строка оплаты и модель (ТЗ WSH-4.1)
     warn = meta_warning(out)
     if warn:
         print(warn)

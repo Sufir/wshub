@@ -18,6 +18,8 @@ from . import code_events, code_policy
 from .core import WsError
 from .jobs import TERMINAL, JobError, Jobs, _end_ts, _sum, meta_warning, outside_view, phase_cost
 from .registry import RegistryError, forge_url
+from .runner import apply_billing, billing_line
+from .runtime import read_json
 from .taskfile import TaskError
 
 # ошибки пользователя, которые инструмент превращает в «отказ: …», а не в падение
@@ -104,6 +106,7 @@ def build_code_server(hub) -> FastMCP:
             _audit("code_projects", status="error", error=str(e))
             return f"отказ: {e}"
         out = []
+        rate = last_rate(jobs)
         for name, ws in reg.workspaces.items():
             proj = reg.code.projects.get(name)
             if proj is None or not proj.enabled:
@@ -122,7 +125,9 @@ def build_code_server(hub) -> FastMCP:
                         "forge_access": proj.forge_access, "forge_write": proj.forge_write,
                         "forge_url": forge_url(proj), "forge_token": proj.forge_token,
                         # действующая политика: строки проекта, глобальные, встроенные — от сильной к слабой
-                        "policy": code_policy.effective(reg.code.glob, proj)})
+                        "policy": code_policy.effective(reg.code.glob, proj),
+                        # последний снимок лимитов подписки — общий для хаба (ТЗ WSH-4.1, п. 2.7)
+                        "rate": rate})
         for name, err in reg.code.project_errors.items():
             out.append({"project": name, "error": err})
         _audit("code_projects")
@@ -207,7 +212,7 @@ def build_code_server(hub) -> FastMCP:
         чтобы открыть сессию в терминале, и пути к существующим файлам. Правка .git/hooks или .git/config —
         предупреждение первой строкой."""
         try:
-            out = jobs.result_view(job, docker_max=RESULT_DOCKER_MAX)
+            out = apply_billing(jobs, jobs.result_view(job, docker_max=RESULT_DOCKER_MAX), model=True)
         except USER_ERR as e:
             _audit("code_result", job=job, status="error", error=str(e))
             return f"отказ: {e}"
@@ -510,14 +515,32 @@ def _grants_line(g: dict | None) -> str:
 
 
 def _snapshot(jobs: Jobs, job: str) -> dict:
-    """Снимок с ходами и действиями по событиям (ТЗ WSH-3.4, Б1): у корня цепочки — по всем звеньям."""
-    snap = jobs.snapshot(job)
+    """Снимок с ходами и действиями по событиям (ТЗ WSH-3.4, Б1): у корня цепочки — по всем звеньям; строка оплаты
+    (ТЗ WSH-4.1, п. 2.6)."""
+    snap = apply_billing(jobs, jobs.snapshot(job))
     try:
         links = [jobs.read(x["id"]) for x in snap["chain"]] if snap.get("chain") else [jobs.read(job)]
     except WsError:  # звено пропало между чтениями — снимок без счёта
         return snap
     snap.update(jobs.counts(links))
     return snap
+
+
+def last_rate(jobs: Jobs) -> dict | None:
+    """Последний известный снимок лимитов подписки (ТЗ WSH-4.1, п. 2.7): самая свежая задача хаба с billing.rate —
+    id, проект, время прихода события и строка оплаты. Нет такой задачи — None."""
+    best = None
+    for jd in jobs.root.glob("*/job.json") if jobs.root.is_dir() else []:
+        d = read_json(jd)
+        b = d.get("billing") if isinstance(d, dict) and isinstance(d.get("billing"), dict) else {}
+        ts = b.get("rate_ts")
+        if isinstance(b.get("rate"), dict) and isinstance(ts, (int, float)) and (best is None or ts > best[0]):
+            best = (ts, d, b)
+    if best is None:
+        return None
+    _ts, d, b = best
+    return {"job": d.get("id"), "project": d.get("project"), "at": b.get("rate_at"),
+            "line": billing_line({"rate": b["rate"]})}
 
 
 def _recent_events(jobs: Jobs, job: str) -> list[str]:

@@ -20,6 +20,12 @@
   FAKE_RESET   — git reset --hard HEAD~1 (HEAD назад)
   FAKE_GIT_META — создать .git/hooks/pre-commit и дописать секцию в .git/config (обход через смонтированный каталог)
   FAKE_COMMIT  — сделать коммит в cwd
+  FAKE_SOURCE  — apiKeySource в init (по умолчанию "none" — подписка; "-" — поля нет). Не FAKE_KEY_SOURCE: имя
+                 с KEY реестр не пускает в pass_env (ТЗ WSH-4.1, 7.1)
+  FAKE_INIT_MODEL — model в init (по умолчанию — значение --model)
+  FAKE_RATE    — JSON rate_limit_info: событие rate_limit_event; FAKE_RATE_AT — напечатать после N-го события
+                 (по умолчанию — перед итогом, как на подписке, PoC WSH-4.0); FAKE_RATE_COUNT — сколько раз (1)
+  FAKE_LIMIT_ERROR — итог с is_error: true (исчерпан лимит подписки)
 В режиме plan фейк, как настоящий claude 2.1.291 (PoC WSH-3, 0.3.1), пишет план инструментом Write
 в $HOME/.claude/plans/<slug>.md и завершается success.
 """
@@ -30,9 +36,23 @@ import subprocess
 import sys
 import time
 
+EMITTED = [0]  # сколько событий напечатано: после FAKE_RATE_AT-го — rate_limit_event
+
 
 def emit(obj):
     sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    EMITTED[0] += 1
+    if os.environ.get("FAKE_RATE_AT") and EMITTED[0] == int(os.environ["FAKE_RATE_AT"]):
+        emit_rate()
+
+
+def emit_rate():
+    if not os.environ.get("FAKE_RATE"):
+        return
+    info = json.loads(os.environ["FAKE_RATE"])
+    for _ in range(int(os.environ.get("FAKE_RATE_COUNT", "1"))):
+        sys.stdout.write(json.dumps({"type": "rate_limit_event", "rate_limit_info": info}, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
@@ -89,8 +109,13 @@ def main() -> int:
     signal.signal(signal.SIGINT, on_sig)
     signal.signal(signal.SIGTERM, on_sig)
 
-    emit({"type": "system", "subtype": "init", "session_id": sid, "tools": ["Read", "Edit", "Bash", "Task"],
-          "permissionMode": perm_mode, "cwd": os.getcwd()})
+    init = {"type": "system", "subtype": "init", "session_id": sid, "tools": ["Read", "Edit", "Bash", "Task"],
+            "permissionMode": perm_mode, "cwd": os.getcwd(),
+            "model": os.environ.get("FAKE_INIT_MODEL") or (argv[argv.index("--model") + 1] if "--model" in argv
+                                                            else "fake")}
+    if os.environ.get("FAKE_SOURCE", "none") != "-":
+        init["apiKeySource"] = os.environ.get("FAKE_SOURCE", "none")
+    emit(init)
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "начинаю"}]}})
     if os.environ.get("FAKE_TOUCH"):
         open(os.path.join(os.getcwd(), os.environ["FAKE_TOUCH"]), "w").close()
@@ -169,9 +194,12 @@ def main() -> int:
         f.write(str(total))
     denials = [{"tool_name": t, "tool_input": {"command": t}}
                for t in os.environ.get("FAKE_DENIALS", "").split(",") if t]
+    if not os.environ.get("FAKE_RATE_AT"):
+        emit_rate()
+    limit = bool(os.environ.get("FAKE_LIMIT_ERROR"))
     emit({"type": "result", "subtype": os.environ.get("FAKE_SUBTYPE", "success"), "session_id": sid,
           "total_cost_usd": total, "num_turns": 2, "duration_ms": 10,
-          "is_error": False, "result": "готово", "permission_denials": denials})
+          "is_error": limit, "result": "You've hit your limit" if limit else "готово", "permission_denials": denials})
     return 0
 
 

@@ -36,7 +36,7 @@ EFFORTS = ("low", "medium", "high", "xhigh", "max")
 PROFILES = ("recon", "task", "review")
 CODE_DENY_READ = ("~/.ssh", "~/.aws", "~/.gnupg", "~/.config/wshub", "~/.local/state/wshub",
                   "~/.claude/.credentials.json", "~/.claude.json")
-CODE_KEYS = {"claude", "max_wait_s", "network", "deny_read", "pass_env", "policy", "notify"}
+CODE_KEYS = {"claude", "max_wait_s", "network", "deny_read", "pass_env", "policy", "notify", "allow_overage"}
 NOTIFY_MODES = ("poll", "card")  # как чат узнаёт о плане и итоге задачи (ТЗ WSH-3.4, В3)
 MAX_WAIT_CAP = 55  # code_wait дольше — хост обрывает вызов примерно на 60 с
 WS_CODE_LISTS = ("bash_allow", "sandbox_exclude", "network", "deny_read", "allow_read", "deny_edit",
@@ -56,6 +56,13 @@ PLAN_MODES = ("no", "auto", "review")
 POLICY_KEYS = ("profile", "size", "risk", "model", "effort", "plan", "plan_model", "plan_effort")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
+# переменные, меняющие источник оплаты Claude Code (ТЗ WSH-4.1, факт 8): префиксами — новые имена тех же семейств
+# ловятся сами. В задачу не идут (claude_cli.environment), в .claude/settings*.json проекта — отказ до старта
+BILLING_ENV_RE = re.compile(r"^(ANTHROPIC_|CLAUDE_CODE_USE_|CLAUDE_CODE_OAUTH_)|^AWS_BEARER_TOKEN_BEDROCK$")
+
+
+def billing_env(name: str) -> bool:
+    return BILLING_ENV_RE.match(name) is not None
 
 
 class RegistryError(Exception):
@@ -118,6 +125,7 @@ class CodeGlobal:
     pass_env: tuple[str, ...] = ()
     policy: tuple[PolicyRow, ...] = ()
     notify: str = "poll"  # poll — чат ждёт code_wait; card — карточка задачи сама пишет в чат
+    allow_overage: bool = False  # extra usage сверх подписки; false — задача с isUsingOverage останавливается (WSH-4.1)
 
 
 @dataclass(frozen=True)
@@ -308,7 +316,13 @@ def _code(t, warnings: list[str]) -> CodeGlobal:
             if SECRET_ENV_RE.search(n) or n == "SSH_AUTH_SOCK":
                 raise RegistryError(f"code.pass_env: {n} — секреты (TOKEN, SECRET, PASSWORD, KEY, SSH_AUTH_SOCK) "
                                     "в Claude Code не передаются")
+            if billing_env(n):
+                warnings.append(f"code.pass_env: {n} меняет источник оплаты Claude Code — в задачу не передаётся")
         vals["pass_env"] = names
+    if "allow_overage" in t:
+        if not isinstance(t["allow_overage"], bool):
+            raise RegistryError("code.allow_overage: true или false")
+        vals["allow_overage"] = t["allow_overage"]
     if "policy" in t:
         vals["policy"] = _policy(t["policy"], "[[code.policy]]", "global")
     return CodeGlobal(**vals)

@@ -1,6 +1,7 @@
 """Реестр проектов (workspaces.toml). Сервер его только читает и перечитывает при смене mtime."""
 from __future__ import annotations
 
+import math
 import re
 import sys
 from dataclasses import dataclass, field, replace
@@ -524,21 +525,35 @@ def forge_url(proj: ProjectCode) -> str | None:
     return PRESETS[proj.forge].default_url if proj.forge in PRESETS else None
 
 
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")  # fromisoformat с 3.11 принимает и «20261023» — формат держим сами
+
+
 def _date(v, where: str) -> date:
     if isinstance(v, date) and not isinstance(v, datetime):
         return v
     try:
-        if isinstance(v, str):
+        if isinstance(v, str) and DATE_RE.match(v):
             return date.fromisoformat(v)
     except ValueError:
         pass
     raise RegistryError(f"{where}: дата \"ГГГГ-ММ-ДД\"")
 
 
+def _usd(v, where: str, zero: bool = False) -> float:
+    """Сумма в USD: конечное число (TOML допускает nan и inf — они отключили бы потолки), > 0 или ≥ 0."""
+    ok = isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and (v > 0 or zero and v == 0)
+    if not ok:
+        raise RegistryError(f"{where}: число {'≥ 0' if zero else 'больше 0'}")
+    return float(v)
+
+
 def _api(t, warnings: list[str]) -> Api:
     """[api]: общий выключатель, потолки трат и секции провайдеров. Провайдер — только из словаря в коде."""
-    from .llm.providers import PROVIDERS
-    from .llm.types import TIERS
+    try:
+        from .llm.providers import PROVIDERS
+        from .llm.types import TIERS
+    except Exception as e:  # сломанный модуль провайдера ломает только API, а не весь реестр (ревью, находка 17)
+        raise RegistryError(f"провайдеры API не загрузились: {type(e).__name__}: {e}") from None
     t = _table(t, "[api]")
     warnings += [unknown_key(f"api.{k}") for k in t if k not in API_KEYS]
     vals: dict = {}
@@ -548,7 +563,7 @@ def _api(t, warnings: list[str]) -> Api:
         vals["enabled"] = t["enabled"]
     for k in ("max_usd_per_call", "daily_usd"):
         if k in t:
-            vals[k] = float(_number(t[k], f"api.{k}"))
+            vals[k] = _usd(t[k], f"api.{k}")
     provs: dict[str, ApiProvider] = {}
     for name, p in _table(t.get("providers", {}), "[api.providers]").items():
         where = f"[api.providers.{name}]"
@@ -559,10 +574,7 @@ def _api(t, warnings: list[str]) -> Api:
         warnings += [unknown_key(f"api.providers.{name}.{k}") for k in p if k not in API_PROVIDER_KEYS]
         pv: dict = {}
         if "included_usd" in p:
-            v = p["included_usd"]
-            if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
-                raise RegistryError(f"{where} included_usd: число ≥ 0")
-            pv["included_usd"] = float(v)
+            pv["included_usd"] = _usd(p["included_usd"], f"{where} included_usd", zero=True)
         if "credits_until" in p:
             pv["credits_until"] = _date(p["credits_until"], f"{where} credits_until")
         if "models" in p:

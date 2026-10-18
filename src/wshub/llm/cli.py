@@ -7,6 +7,7 @@ import math
 import re
 import secrets
 import sys
+import warnings
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -137,14 +138,23 @@ def _key(config: Path, state: Path, now, args: list[str]) -> int:
     path = keys.key_path(config.parent, name)
     if op == "check":
         bad = keys.problems(path)
-        if not bad and path.stat().st_size == 0:
-            bad = [f"ключ {path} пуст; задай: wshub api key set {name}"]
+        if not bad:
+            try:
+                keys.read(path)  # пустой или не текстовый ключ — тот же отказ, что при запросе; значение не выводится
+            except keys.KeyProblem as e:
+                bad = [str(e)]
         if bad:
             print("\n".join(bad))
             return 1
         print(f"ключ есть, права верны: {path}")
         return 0
-    value = getpass.getpass(f"Ключ {name} (ввод не отображается): ")
+    with warnings.catch_warnings():  # без терминала getpass вводит с эхом — тогда отказ, а не открытый ввод
+        warnings.simplefilter("error", getpass.GetPassWarning)
+        try:
+            value = getpass.getpass(f"Ключ {name} (ввод не отображается): ")
+        except getpass.GetPassWarning:
+            raise ApiError("нет терминала для скрытого ввода — ключ не записан; "
+                           "запусти команду в терминале") from None
     if not value.strip():
         raise ApiError("пустой ввод — ключ не записан")
     keys.write(path, value)

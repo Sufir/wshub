@@ -5,7 +5,9 @@ import json
 import os
 import re
 import stat
+import sys
 import types
+import warnings
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,7 +19,7 @@ from wshub import registry
 from wshub.llm import cli, keys, ledger
 from wshub.llm import core as api_core
 from wshub.llm.providers import PROVIDERS, fake
-from wshub.llm.types import Request, Usage
+from wshub.llm.types import Request, Response, Usage
 
 TZ = timezone(timedelta(hours=3))
 NOW = datetime(2026, 10, 18, 12, 0, tzinfo=TZ)
@@ -94,34 +96,61 @@ def req(**kw) -> Request:
 
 # ---------- модульность (ТЗ, п. 4.1) ----------
 
+class Echo2:
+    """Второй провайдер — свой класс, не FakeProvider: ядро знает только интерфейс provider.Provider."""
+    name = "echo2"
+    caps = frozenset()
+    PRICES = {"e2-small": 1e-6, "e2-mid": 2e-6, "e2-big": 5e-6}  # USD за токен входа и выхода
+
+    def __init__(self):
+        self.calls: list[Request] = []
+
+    def models(self):
+        return {"cheap": "e2-small", "standard": "e2-mid", "strong": "e2-big"}
+
+    def price(self, model, usage):
+        return self.PRICES[model] * (usage.input + usage.output)
+
+    def estimate(self, request):
+        return Usage(input=10)
+
+    def run(self, request, key):
+        self.calls.append(request)
+        return Response("эхо-2", None, Usage(input=10, output=3), request.model, self.name)
+
+
 def test_second_provider_from_test_only(api, monkeypatch):
     """Провайдер, объявленный только в тесте (подмена словаря), проходит run, stats и зоны без правки ядра."""
-    models = {"cheap": "m2-cheap", "standard": "m2-standard", "strong": "m2-strong"}
-    prices = {"m2-cheap": (1, 5, 0, 0), "m2-standard": (3, 15, 0, 0), "m2-strong": (15, 75, 0, 0)}
-    prov = use(monkeypatch, fake.FakeProvider(name="fake2", models=models, prices=prices), "fake2")
-    set_api(api.env, API + '\n[api.providers.fake2]\nincluded_usd = 1\ncredits_until = "2026-10-31"\n')
-    keys.write(keys.key_path(api.env.cfg.parent, "fake2"), MARKER)
-    rc, out, _ = api.run(provider="fake2")
-    assert rc == 0 and "API: m2-cheap" in out and len(prov.calls) == 1
-    assert api.rows()[-1]["provider"] == "fake2" and api.rows()[-1]["zone"] == "included"
+    prov = use(monkeypatch, Echo2(), "echo2")
+    set_api(api.env, API + '\n[api.providers.echo2]\nincluded_usd = 1\ncredits_until = "2026-10-31"\n')
+    keys.write(keys.key_path(api.env.cfg.parent, "echo2"), MARKER)
+    rc, out, _ = api.run(provider="echo2")
+    assert rc == 0 and out.startswith("эхо-2\nAPI: e2-small") and len(prov.calls) == 1
+    assert api.rows()[-1]["provider"] == "echo2" and api.rows()[-1]["zone"] == "included"
+    assert api.rows()[-1]["cost_usd"] == pytest.approx(13e-6)
     rc, out, _ = api.cli("stats")
-    assert rc == 0 and "fake2: включённые" in out and "по моделям: m2-cheap" in out
-    assert api.cli("credits", "fake2", "--left", "0", "--until", "31.10")[0] == 0
-    rc, _, err = api.run(provider="fake2")
-    assert rc == 1 and "wshub api allow fake2" in err and len(prov.calls) == 1
-    assert api.cli("allow", "fake2", "--usd", "1", "--until", "31.10")[0] == 0
-    rc, out, _ = api.run(provider="fake2")
+    assert rc == 0 and "echo2: включённые" in out and "по моделям: e2-small" in out
+    assert api.cli("credits", "echo2", "--left", "0", "--until", "31.10")[0] == 0
+    rc, _, err = api.run(provider="echo2")
+    assert rc == 1 and "wshub api allow echo2" in err and len(prov.calls) == 1
+    assert api.cli("allow", "echo2", "--usd", "1", "--until", "31.10")[0] == 0
+    rc, out, _ = api.run(provider="echo2")
     assert rc == 0 and api.rows()[-1]["zone"] == "purchased" and "купленная зона" in out
+    (api.env.proj / "s.json").write_text('{"type": "object"}')
+    rc, _, err = api.run("--schema", "s.json", provider="echo2")  # caps пустые — ядро отказывает и ему
+    assert rc == 1 and "провайдер echo2 не поддерживает schema" in err and len(prov.calls) == 2
 
 
-IMPORT_RE = re.compile(r"^\s*(?:from\s+\S*providers\.\w+\s+import|from\s+\S*providers\s+import\s+(?!PROVIDERS\b)"
-                       r"|import\s+\S*providers\.\w+)", re.M)
+IMPORT_RE = re.compile(r"^\s*(?:from\s+\S*providers\.\w+\s+import|from\s+\S*providers\s+import\s+(?!PROVIDERS\s*$)"
+                       r"|import\s+\S*providers\.\w+|from\s+\S+\s+import\s+.*\bproviders\b)", re.M)
 
 
 def test_providers_imported_only_through_dict():
     """Ядро и остальной код не импортируют модули провайдеров по имени; загрузки кода по строке в llm нет."""
-    assert IMPORT_RE.search("from .providers import fake")  # шаблон не пустой
-    assert IMPORT_RE.search("from wshub.llm.providers.fake import FakeProvider")
+    for bad_line in ("from .providers import fake", "from wshub.llm.providers.fake import FakeProvider",
+                     "from .providers import PROVIDERS, fake", "from . import providers",
+                     "import wshub.llm.providers.fake"):
+        assert IMPORT_RE.search(bad_line), bad_line  # шаблон ловит все виды импорта
     assert not IMPORT_RE.search("from .providers import PROVIDERS")
     src = Path(wshub.__file__).parent
     allowed = src / "llm" / "providers" / "__init__.py"
@@ -129,6 +158,10 @@ def test_providers_imported_only_through_dict():
     assert any(f.name == "core.py" and f.parent.name == "llm" for f in files)
     bad = [str(f) for f in files if IMPORT_RE.search(f.read_text(encoding="utf-8"))]
     assert bad == []
+    # ядро и реестр не знают имён конкретных провайдеров: ни класса, ни строки "fake"
+    named = [str(f) for f in files if f.parent.name != "providers"
+             and re.search(r"FakeProvider|[\"']fake[\"']", f.read_text(encoding="utf-8"))]
+    assert named == []
     dynamic = [str(f) for f in (src / "llm").rglob("*.py")
                if re.search(r"import_module|__import__|importlib", f.read_text(encoding="utf-8"))]
     assert dynamic == []
@@ -188,8 +221,23 @@ def test_strong_requires_operator_choice(api, monkeypatch):
     assert prov.calls == []
     rc, out, _ = api.run("--choice", "operator", tier="strong")
     assert rc == 0 and "API: fake-strong" in out
+    with pytest.raises(api_core.ApiError, match="--choice operator"):  # ядро само, без отсечки CLI
+        api.engine().plan(req(tier="strong"), "fake", choice="nobody")
     set_api(api.env, API + "strong_requires_choice = false\n")
     assert api.run(tier="strong")[0] == 0
+
+
+@pytest.mark.parametrize("models,args", [
+    ('{ strong = "fake-standard" }', ("--model", "fake-strong")),  # своя strong провайдера убрана из уровней
+    ('{ cheap = "fake-strong" }', ("--tier", "cheap")),  # strong поставлена на другой уровень
+    ('{ strong = "x-big" }', ("--model", "x-big")),  # strong из реестра
+])
+def test_strong_choice_not_bypassed_by_tier_override(api, monkeypatch, models, args):
+    prov = use(monkeypatch, fake.FakeProvider(prices={**fake.PRICES, "x-big": (15.0, 75.0, 0, 0)}))
+    set_api(api.env, API + f"models = {models}\n")
+    rc, _, err = api.run(*args, tier=None)
+    assert rc == 1 and "--choice operator" in err and prov.calls == []
+    assert api.run(*args, "--choice", "operator", tier=None)[0] == 0
 
 
 def test_unknown_model_price_refused(api, monkeypatch):
@@ -281,6 +329,22 @@ def test_key_set_empty_refused(api, monkeypatch):
     assert rc == 1 and "пустой ввод" in err and not kp.exists()
 
 
+def test_key_check_blank_key_file(api):
+    _kp(api).write_text("  \n")  # права прежние, 0600
+    rc, out, _ = api.cli("key", "check", "fake")
+    assert rc == 1 and "пуст" in out
+
+
+def test_key_set_without_terminal_refused(api, monkeypatch):
+    def echoing(prompt=""):  # так getpass ведёт себя без терминала: предупреждает и читает с эхом
+        warnings.warn("Can not control echo on the terminal.", cli.getpass.GetPassWarning, stacklevel=1)
+        return "new-key-value"
+
+    monkeypatch.setattr(cli.getpass, "getpass", echoing)
+    rc, _, err = api.cli("key", "set", "fake")
+    assert rc == 1 and "нет терминала" in err and keys.read(_kp(api)) == MARKER
+
+
 def test_key_set_refuses_open_keys_dir(api, monkeypatch):
     os.chmod(_kp(api).parent, 0o755)
     monkeypatch.setattr(cli.getpass, "getpass", lambda prompt="": "new")
@@ -311,10 +375,27 @@ def test_key_marker_never_leaks(api, monkeypatch):
     assert MARKER not in str(e) and MARKER not in repr(e.args)
     assert e.__context__ is None and e.__cause__ is None
     assert api.rows()[-1]["ok"] is False and "<ключ скрыт>" in api.rows()[-1]["error"]
-    assert all(MARKER not in o for o in api.outputs) and len(api.outputs) >= 8
+    for fail in ("bad header {key!r}", f"token {MARKER[:12]}… rejected", f"suffix …{MARKER[-9:]}"):
+        prov.fail = fail  # ключ в repr и куски ключа — тоже вырезаются
+        rc, _, err = api.run()
+        assert rc == 1 and "<ключ скрыт>" in err
+    assert all(MARKER not in o and MARKER[:12] not in o and MARKER[-9:] not in o for o in api.outputs)
+    assert len(api.outputs) >= 11
     files = [p for p in api.env.state.rglob("*") if p.is_file()]
     assert api.ledger_path in files
-    assert [str(p) for p in files if MARKER.encode() in p.read_bytes()] == []
+    assert [str(p) for p in files if MARKER[:SCRUB].encode() in p.read_bytes()
+            or MARKER[-SCRUB:].encode() in p.read_bytes()] == []
+
+
+SCRUB = api_core.SCRUB_MIN
+
+
+def test_scrub_parts_of_key():
+    key = "abcdefghijklmnop"
+    assert api_core.scrub(f"x {key} y", key) == "x <ключ скрыт> y"
+    assert api_core.scrub(f"x {key[:8]}…", key) == "x <ключ скрыт>…"
+    assert api_core.scrub(f"x {key[:7]}", key) == f"x {key[:7]}"  # короче SCRUB_MIN — не трогаем
+    assert api_core.scrub("short k1 here", "k1") == "short <ключ скрыт> here"  # короткий ключ — целиком
 
 
 def test_keys_inside_closed_dirs(env):
@@ -384,6 +465,34 @@ def test_revoke(api):
     assert api.engine().zones("fake").allow_usd is None
 
 
+def test_until_day_itself_counts(api):
+    """Срок включается целиком: в сам день credits_until и allow --until ещё можно тратить."""
+    api.t = datetime(2026, 10, 31, 23, 30, tzinfo=TZ)
+    assert api.run()[0] == 0 and api.rows()[-1]["zone"] == "included"
+    api.spend(5)
+    api.cli("allow", "fake", "--usd", "1", "--until", "31.10")
+    assert api.run()[0] == 0 and api.rows()[-1]["zone"] == "purchased"
+
+
+def test_run_rechecks_zone_under_lock(api, monkeypatch):
+    """План, проверенный раньше, не тратит, если остаток кончился до отправки (параллельный запрос, revoke)."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    eng = api.engine()
+    plan = eng.plan(req(), "fake")
+    assert plan.zone == "included"
+    api.spend(5)
+    with pytest.raises(api_core.ApiError, match="исчерпаны"):
+        eng.run(plan)
+    api.cli("allow", "fake", "--usd", "1", "--until", "20.10")
+    plan = eng.plan(req(), "fake")
+    assert plan.zone == "purchased"
+    api.cli("allow", "fake", "--revoke")
+    with pytest.raises(api_core.ApiError, match="только по разрешению"):
+        eng.run(plan)
+    assert prov.calls == [] and len(api.rows()) == 1
+    assert api.ledger_path.with_suffix(".lock").exists()
+
+
 def test_included_zero_after_credits_until(api):
     api.t = datetime(2026, 11, 1, 9, 0, tzinfo=TZ)
     rc, _, err = api.run()
@@ -433,6 +542,14 @@ def test_ceiling_daily(api, monkeypatch):
     assert rc == 1 and "daily_usd" in err and len(prov.calls) == 1
 
 
+def test_ceiling_daily_counts_all_providers(api, monkeypatch):
+    prov = use(monkeypatch, fake.FakeProvider())
+    set_api(api.env, API.replace("included_usd = 5", "included_usd = 100"))
+    api.spend(9.999, ts=NOW - timedelta(hours=1), provider="other")
+    rc, _, err = api.run()
+    assert rc == 1 and "daily_usd" in err and prov.calls == []
+
+
 def test_estimate_makes_no_request(api, monkeypatch):
     prov = use(monkeypatch, fake.FakeProvider())
     _kp(api).unlink()  # ключ для оценки не нужен
@@ -447,10 +564,13 @@ def test_estimate_makes_no_request(api, monkeypatch):
 # ---------- «сгорит» (п. 4.6) ----------
 
 @pytest.mark.parametrize("included,until,burn", [(100, "2026-10-23", True), (100, "2026-10-25", False),
-                                                 (10, "2026-10-23", False), (100, "2026-10-18", True)])
+                                                 (10, "2026-10-23", False), (10.01, "2026-10-23", True),
+                                                 (100, "2026-10-18", True)])
 def test_burn_line(api, included, until, burn):
     set_api(api.env, API.replace("included_usd = 5", f"included_usd = {included}")
             .replace('"2026-10-31"', f'"{until}"'))
+    rc, out, _ = api.run("--estimate")  # без траты: остаток ровно included — граница «больше $10»
+    assert rc == 0 and ("⚠ сгорит:" in out) is burn
     rc, out, _ = api.run()
     assert rc == 0 and ("⚠ сгорит:" in out) is burn
     rc, out, _ = api.cli("stats")
@@ -481,6 +601,10 @@ def test_api_error_breaks_only_api(api):
     ('[api.providers.fake]\nmodels = { best = "x" }\n', "models"),
     ('[api.providers.fake]\nstrong_requires_choice = "yes"\n', "strong_requires_choice"),
     ("[api]\ndaily_usd = 0\n", "daily_usd"),
+    ("[api]\nmax_usd_per_call = nan\n", "max_usd_per_call"),  # nan и inf отключили бы потолки
+    ("[api]\ndaily_usd = inf\n", "daily_usd"),
+    ('[api.providers.fake]\nincluded_usd = inf\ncredits_until = "2026-10-31"\n', "included_usd"),
+    ('[api.providers.fake]\ncredits_until = "20261031"\n', "credits_until"),
 ])
 def test_api_section_errors(text, err):
     reg = registry.parse(text)
@@ -498,6 +622,13 @@ def test_api_registry_values():
     assert any("[api.providers.nope]: неизвестный провайдер" in w for w in reg.warnings)
     assert "неизвестный ключ api.future — пропущен" in reg.warnings
     assert registry.parse("").api == registry.Api()
+
+
+def test_broken_provider_import_breaks_only_api(env, monkeypatch):
+    monkeypatch.setitem(sys.modules, "wshub.llm.providers", None)  # импорт словаря провайдеров падает
+    reg = registry.parse(env.cfg.read_text(encoding="utf-8") + "\n" + API)
+    assert reg.api.error and "провайдеры API не загрузились" in reg.api.error
+    assert "payload" in reg.workspaces and reg.code.error is None
 
 
 def test_api_disabled_and_project_without_api(api, monkeypatch):
@@ -538,6 +669,9 @@ def test_input_outside_symlink_deny_refused(api, monkeypatch):
         rc, out, e = api.run(inp=inp)
         assert rc == 1 and err in e, inp
         assert "TOPSECRET" not in out + e and "supersecret" not in out + e
+    (api.env.proj / "env-link").symlink_to(api.env.proj / ".env")  # симлинк внутри корня на deny-файл
+    rc, out, e = api.run(inp="env-link")
+    assert rc == 1 and "политикой deny" in e and "supersecret" not in out + e
     rc, _, e = api.run("--system", ".env")
     assert rc == 1 and "политикой deny" in e
     rc, _, e = api.run("--schema", "../outside/secret.txt")
@@ -582,6 +716,32 @@ def test_broken_ledger_line_skipped(api):
     assert rc == 0 and "журнал: пропущено строк 1" in out
     assert "журнал: пропущено строк 1" in api.cli("stats")[1]
     assert api.engine().zones("fake").included_spent > 0.5
+
+
+def test_torn_ledger_line_does_not_swallow_next(api, monkeypatch):
+    """Обрыв без перевода строки: следующая запись (revoke) не склеивается с обрывком и не теряется."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    api.spend(5)
+    api.cli("allow", "fake", "--usd", "1", "--until", "20.10")
+    with api.ledger_path.open("a") as f:
+        f.write('{"ts": "2026-10-18T10:00:00+03:00", "kind": "ru')  # оборванная запись, без «\n»
+    assert api.cli("allow", "fake", "--revoke")[0] == 0
+    rc, _, err = api.run()
+    assert rc == 1 and "исчерпаны" in err and prov.calls == []
+    led = ledger.read(api.ledger_path)
+    assert led.skipped == 1 and led.rows[-1]["kind"] == "revoke"
+
+
+def test_stats_breakdown_and_days(api):
+    api.spend(0.5, ts=NOW - timedelta(days=3))
+    api.spend(0.25, zone="purchased")
+    rc, out, _ = api.cli("stats")
+    assert rc == 0 and "за цикл" in out
+    assert "по зонам: включённая ≈$0.50 (1) · купленная ≈$0.25 (1)" in out
+    assert "по проектам: payload ≈$0.75 (2)" in out and "по моделям: fake-cheap ≈$0.75 (2)" in out
+    rc, out, _ = api.cli("stats", "--days", "1")
+    assert rc == 0 and "за 1 дн." in out and "по проектам: payload ≈$0.25 (1)" in out
+    assert api.cli("stats", "--days", "0")[0] == 2
 
 
 def test_unreadable_ledger_fails_closed(api, monkeypatch):

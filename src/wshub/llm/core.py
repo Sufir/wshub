@@ -26,6 +26,20 @@ def usd(v: float) -> str:
     return f"≈${v:.2f}"
 
 
+HIDDEN = "<ключ скрыт>"
+SCRUB_MIN = 8  # куски ключа от стольких символов вырезаются из текста ошибки
+
+
+def scrub(text: str, key: str) -> str:
+    """Ключ и любые его куски от SCRUB_MIN символов (обрезанный, в repr) — вон из текста
+    (ревью WSH-4.2, находка 4)."""
+    for n in range(len(key), min(SCRUB_MIN, len(key)) - 1, -1):
+        for i in range(len(key) - n + 1):
+            if key[i:i + n] in text:
+                text = text.replace(key[i:i + n], HIDDEN)
+    return text
+
+
 def ddmm(d) -> str:
     return d.strftime("%d.%m") if d else "—"
 
@@ -94,7 +108,8 @@ class Api:
                                   ("cache", req.cache != "none")) if used and c not in prov.caps]
         if need:
             raise ApiError(f"провайдер {name} не поддерживает {', '.join(need)} — запрос не отправлен")
-        tiers = {**prov.models(), **conf.models}
+        own = prov.models()
+        tiers = {**own, **conf.models}
         if req.tier and req.model:
             raise ApiError("уровень (--tier) и модель (--model) — что-то одно")
         if req.tier:
@@ -106,7 +121,10 @@ class Api:
             tier = next((t for t in reversed(TIERS) if tiers.get(t) == model), None)
         else:
             raise ApiError("нужен уровень (--tier) или модель (--model)")
-        if tier == "strong" and conf.strong_requires_choice and choice != "operator":
+        # сильная — и по уровню, и по модели: strong из реестра или собственная strong провайдера, даже если
+        # переопределение уровней её убрало или поставило на другой уровень (ревью WSH-4.2, находка 2)
+        strong = tier == "strong" or model in {tiers.get("strong"), own.get("strong")} - {None}
+        if strong and conf.strong_requires_choice and choice != "operator":
             raise ApiError(f"сильная модель ({model}) — только явным выбором оператора: --choice operator "
                            f"(strong_requires_choice в [api.providers.{name}])")
         req = replace(req, model=model, tier=tier)
@@ -143,21 +161,34 @@ class Api:
         return None, msg
 
     def run(self, plan: Plan) -> Response:
-        """Один запрос по проверенному плану. Ключ — только здесь; в журнал, ответ и исключения не попадает."""
+        """Один запрос по проверенному плану. Зона и потолки проверяются заново под блокировкой журнала до записи
+        строки: параллельный запрос или команда оператора между plan и run не дают потратить сверх остатка
+        (ревью WSH-4.2, находки 3 и 18). Ключ — только здесь; в журнал, ответ и исключения не попадает."""
         if plan.zone is None:
             raise ApiError(f"{plan.refusal} — запрос не отправлен")
+        name = plan.provider.name
+        with ledger.locked(self.ledger_path):
+            _prov, conf = self.provider(name)
+            led = self.read_ledger()
+            z = ledger.zones(led, name, conf, self.now().date())
+            zone, refusal = self._zone(name, plan.estimate_usd, z, led)
+            if zone is None:
+                raise ApiError(f"{refusal} — запрос не отправлен")
+            return self._send(plan, zone)
+
+    def _send(self, plan: Plan, zone: str) -> Response:
         name, req = plan.provider.name, plan.request
         try:
             key = keys.read(keys.key_path(self.config_dir, name))
         except keys.KeyProblem as e:
             raise ApiError(str(e)) from None
         rec = {"ts": ledger.stamp(self.now()), "kind": "run", "provider": name, "model": req.model,
-               "tier": req.tier, "project": req.project, "template": req.template, "zone": plan.zone}
+               "tier": req.tier, "project": req.project, "template": req.template, "zone": zone}
         error = None
         try:
             resp = plan.provider.run(req, key)
         except Exception as e:  # любой сбой провайдера — в журнал и в понятный отказ
-            error = f"{type(e).__name__}: {e}".replace(key, "<ключ скрыт>")
+            error = scrub(f"{type(e).__name__}: {e}", key)
         del key
         if error is not None:  # исключение поднимаем вне except: без __context__ с исходным текстом
             ledger.append(self.ledger_path, {**rec, "usage": Usage().as_dict(), "cost_usd": 0.0, "ok": False,

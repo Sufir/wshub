@@ -5,8 +5,10 @@
 при ненулевом размере не разбирается ни одна строка (решение архитектора, ТЗ WSH-4.2, п. 6.1)."""
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
@@ -75,13 +77,34 @@ def read(path: Path) -> Ledger:
 
 
 def append(path: Path, rec: dict) -> None:
-    """Одна строка одним write в режиме O_APPEND; файл создаётся с правами 0600."""
+    """Одна строка одним write в режиме O_APPEND под flock; файл создаётся с правами 0600. Если прошлая запись
+    оборвалась без перевода строки, сначала дописывается «\\n» — иначе новая строка склеилась бы с обрывком
+    и пропала вместе с ним (ревью WSH-4.2, находка 1)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     line = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT, 0o600)
     try:
-        os.write(fd, line)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            line = b"\n" + line
+        if os.write(fd, line) != len(line):
+            raise LedgerError(f"журнал трат {path}: строка записана не целиком")
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def locked(path: Path):
+    """Исключительная блокировка журнала на «проверка зоны → запрос → запись» (рядом лежит <журнал>.lock):
+    параллельные запросы не проходят проверку на одном и том же остатке."""
+    lock = Path(path).with_suffix(".lock")
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
     finally:
         os.close(fd)
 

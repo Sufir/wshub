@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import re
+import shlex
 import sys
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
@@ -47,7 +48,15 @@ READ_EXTRA_BAD = re.compile(r"[?\[\]{}()\\]")  # в read_extra из символ
 WS_CODE_KEYS = {"enabled", "dirs", "prompts", "profiles", "model_min", "model_max", "effort_max", "max_turns",
                 "max_budget_usd", "daily_budget_usd", "max_parallel", "max_hours", "prefetch", "status_regex",
                 "policy", "plan_budget_share", "plan_max_turns", "execute_prompt", *WS_CODE_LISTS,
-                *("push", "push_protect", "forge", "forge_access", "forge_write", "forge_url", "forge_token")}
+                *("push", "push_protect", "forge", "forge_access", "forge_write", "forge_url", "forge_token"),
+                "gates"}
+# гейты проекта (ТЗ WSH-3.5, Г1): имя — как hook.GATE_NAME_RE, таймаут в секундах
+GATE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+GATE_KEYS = {"cmd", "timeout_s"}
+GATE_TIMEOUT = 600
+GATE_TIMEOUT_MAX = 3600
+GATE_SHELL = ("гейт — одна команда без оболочки: конвейеры, перенаправления и подстановки не работают; нужна цепочка — "
+              "скрипт в репозитории или cmd списком")
 # регламент пуша и API хостинга (ТЗ WSH-3.4, А1): no — закрыто, task — по разрешению задачи, always — всем
 GRANT_MODES = ("no", "task", "always")
 FORGE_URL_RE = re.compile(r"^(https://[^/\s?#@]+|http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?)(/[^\s?#]*)?$")
@@ -135,6 +144,14 @@ class CodeGlobal:
 
 
 @dataclass(frozen=True)
+class Gate:
+    """Гейт проекта (ТЗ WSH-3.5, Г1): проверка вне песочницы командой `wshub gate <имя>` задачи профиля task."""
+    name: str
+    cmd: tuple[str, ...]
+    timeout_s: int = GATE_TIMEOUT
+
+
+@dataclass(frozen=True)
 class ProjectCode:
     enabled: bool = False
     dirs: tuple[str, ...] = ()
@@ -169,6 +186,7 @@ class ProjectCode:
     forge_write: bool = False  # POST, PUT, PATCH; DELETE — никогда
     forge_url: str | None = None  # адрес API; None — адрес пресета по умолчанию
     forge_token: str | None = None  # путь к файлу токена, как в реестре (~ раскрывается при чтении)
+    gates: tuple[Gate, ...] = ()  # гейты проекта (ТЗ WSH-3.5)
 
 
 @dataclass(frozen=True)
@@ -466,6 +484,8 @@ def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
             raise RegistryError(f"{where} execute_prompt: имя шаблона — латиница, цифры, «_», «-»")
         vals["execute_prompt"] = t["execute_prompt"]
     vals.update(_forge(where, t))
+    if "gates" in t:
+        vals["gates"] = _gates(name, t["gates"], warnings)
     pc = ProjectCode(**vals)
     if MODELS.index(pc.model_min) > MODELS.index(pc.model_max):
         raise RegistryError(f"{where}: model_min ({pc.model_min}) выше model_max ({pc.model_max})")
@@ -515,6 +535,49 @@ def _forge(where: str, t: dict) -> dict:
     if "forge" in vals and "forge_url" not in vals and PRESETS[vals["forge"]].default_url is None:
         raise RegistryError(f"{where}: для forge = {vals['forge']} нужен forge_url — адрес API")
     return vals
+
+
+def _gates(name: str, t, warnings: list[str]) -> tuple[Gate, ...]:
+    """[workspace.<имя>.code.gates] (ТЗ WSH-3.5, Г1): имя → строка (= cmd) или таблица {cmd, timeout_s}. cmd строкой —
+    shlex.split без оболочки, операторы оболочки, $ и обратная кавычка — ошибка; списком — argv как есть."""
+    where = f"[workspace.{name}.code.gates]"
+    out = []
+    for g, v in _table(t, where).items():
+        w = f"{where} {g}"
+        if not isinstance(g, str) or not GATE_NAME_RE.match(g):
+            raise RegistryError(f"{where}: имя гейта {g!r} — строчная латиница, цифры, «-» и «_», до 40 символов")
+        timeout = GATE_TIMEOUT
+        if isinstance(v, dict):
+            warnings += [unknown_key(f"workspace.{name}.code.gates.{g}.{k}") for k in v if k not in GATE_KEYS]
+            if "cmd" not in v:
+                raise RegistryError(f"{w}: нужен cmd")
+            if "timeout_s" in v:
+                timeout = v["timeout_s"]
+                if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= GATE_TIMEOUT_MAX:
+                    raise RegistryError(f"{w} timeout_s: целое от 1 до {GATE_TIMEOUT_MAX}")
+            v = v["cmd"]
+        if isinstance(v, str):
+            if "\x00" in v:
+                raise RegistryError(f"{w} cmd: без NUL")
+            try:
+                cmd = shlex.split(v)
+                lex = shlex.shlex(v, posix=True, punctuation_chars=True)
+                lex.whitespace_split = True
+                ops = [x for x in lex if x and all(c in "();<>|&" for c in x)]
+            except ValueError as e:
+                raise RegistryError(f"{w} cmd: строка не разбирается ({e})") from None
+            if ops or any(c in x for x in cmd for c in "$`"):
+                raise RegistryError(f"{w} cmd: {GATE_SHELL}")
+        elif isinstance(v, list) and all(isinstance(x, str) and x and "\x00" not in x for x in v):
+            cmd = list(v)
+        else:
+            raise RegistryError(f"{w} cmd: строка или список непустых строк без NUL")
+        if not cmd or not cmd[0]:
+            raise RegistryError(f"{w} cmd: пустая команда")
+        if not cmd[0].startswith("/") and "/" in cmd[0] and ".." in cmd[0].split("/"):
+            raise RegistryError(f"{w} cmd: {cmd[0]!r} — относительный путь от рабочего каталога задачи без «..»")
+        out.append(Gate(g, tuple(cmd), timeout))
+    return tuple(out)
 
 
 def forge_url(proj: ProjectCode) -> str | None:

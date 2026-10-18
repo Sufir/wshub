@@ -38,6 +38,8 @@ DENY_BASH = ("git push *", *GIT_REMOTE_DENY, "git clean *", "ssh *", "scp *", "s
 # помощник хаба (А3): вне песочницы и только с разрешением задачи; пуш — только профилю task
 HELPER_PUSH = "wshub push *"
 HELPER_FORGE = "wshub forge *"
+HELPER_GATE = "wshub gate *"  # гейты проекта (ТЗ WSH-3.5, Г2): профиль task, фаза исполнения
+BASH_MAX_TIMEOUT_MS = 600000  # потолок таймаута Bash у claude по умолчанию (документация, env-vars)
 ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ", "DOCKER_HOST", "DOCKER_CONFIG")
 # исполняемая часть git: Code её не меняет — иначе git хаба (вне песочницы) запустит его программу
 GIT_PROTECTED = (".git/config", ".git/hooks", ".git/info", ".git/modules")
@@ -94,12 +96,13 @@ def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home:
 
 def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
              data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path, phase: str | None = None,
-             read_extra: list[str] = (), grants: dict | None = None) -> dict:
+             read_extra: list[str] = (), grants: dict | None = None, gates: tuple = ()) -> dict:
     """settings.json задачи. cwd — dir (рабочий каталог Code), task_rel — путь к ТЗ от него; protected — все
     служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук).
     phase="plan" — фаза плана (ТЗ WSH-3, решение 5): отличие от эталона профиля — ровно plan_overrides.
     read_extra — абсолютные пути и шаблоны, проверенные jobs (ТЗ WSH-3.1, п. 2.2): Read вне cwd.
-    grants — разрешения задачи {push, forge} (ТЗ WSH-3.4, А3.5): помощник в allow и excludedCommands — только с ними."""
+    grants — разрешения задачи {push, forge} (ТЗ WSH-3.4, А3.5): помощник в allow и excludedCommands — только с ними.
+    gates — гейты, доступные звену (ТЗ WSH-3.5, Г2): wshub gate в allow и excludedCommands и потолок таймаута Bash."""
     if RULE_UNSAFE.search(task_rel):
         raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
     allow = ["Read(./**)", *_read_extra_rules(read_extra), f"Edit(./{task_rel})",
@@ -111,7 +114,8 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
         allow += ["Edit(./.agents/**)", SUBAGENT_TOOL]
     elif profile != "recon":
         raise CliError(f"неизвестный профиль {profile}")
-    helper = helper_commands(profile, grants)
+    gates = gates if profile == "task" and phase != "plan" else ()
+    helper = helper_commands(profile, grants, bool(gates))
     allow += [f"Bash({c})" for c in helper]
     deny = [*(f"Bash({c})" for c in DENY_BASH), "Read(**/.env*)", "WebFetch", "WebSearch",
             *(f"Edit({m})" for m in proj.deny_edit),
@@ -152,6 +156,10 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     }
     if proj.claude_md_excludes:
         data["claudeMdExcludes"] = list(proj.claude_md_excludes)
+    if gates:
+        # гейт дольше потолка Bash ушёл бы в фон (Г2.4): потолок — наибольший timeout_s плюс минута
+        data["env"] = {"BASH_MAX_TIMEOUT_MS": str(max(BASH_MAX_TIMEOUT_MS,
+                                                      (max(g.timeout_s for g in gates) + 60) * 1000))}
     if phase == "plan":
         plan_overrides(data, read_extra)
     elif phase is not None:
@@ -171,11 +179,13 @@ def plan_overrides(data: dict, read_extra: list[str] = ()) -> None:
     data["sandbox"]["excludedCommands"] = []
 
 
-def helper_commands(profile: str, grants: dict | None) -> list[str]:
-    """Правила помощника хаба по разрешениям задачи: пуш — только профилю task, API хостинга — любому."""
+def helper_commands(profile: str, grants: dict | None, gates: bool = False) -> list[str]:
+    """Правила помощника хаба по разрешениям задачи: пуш — только профилю task, API хостинга — любому; гейты — только
+    профилю task, если у звена они есть (ТЗ WSH-3.5, Г2.1)."""
     g = grants or {}
     return [*([HELPER_PUSH] if g.get("push") and profile == "task" else []),
-            *([HELPER_FORGE] if g.get("forge") else [])]
+            *([HELPER_FORGE] if g.get("forge") else []),
+            *([HELPER_GATE] if gates and profile == "task" else [])]
 
 
 def _read_extra_rules(read_extra: list[str]) -> list[str]:

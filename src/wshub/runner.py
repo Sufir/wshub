@@ -33,6 +33,7 @@ from .jobs import (
     config_keys,
     git_meta,
     head_state,
+    kill_gate,
     meta_changes,
 )
 from .runtime import atomic_write_text, proc_start, read_json
@@ -543,6 +544,7 @@ class Supervisor:
                 self._save(state="cancelling", reason=self.stop or ("timeout" if over else "cancel"))
                 escalated = self._escalate(proc)
         proc.wait()
+        kill_gate(self.jdir)  # claude вышел, а гейт, ушедший в фон, ещё идёт — не переживёт звено (ТЗ WSH-3.5)
         events.close()
         stderr.close()
         self._watch(stream)  # хвост потока: claude мог выйти раньше очередного опроса
@@ -591,7 +593,14 @@ class Supervisor:
             return False
 
     def _escalate(self, proc) -> bool:
-        """SIGINT процессу Code → пауза → SIGTERM его группе → пауза → SIGKILL группе (п. 2.5.4)."""
+        """SIGINT процессу Code → пауза → SIGTERM его группе → пауза → SIGKILL группе (п. 2.5.4). Затем — группа
+        гейта из gate.pid (ТЗ WSH-3.5, Г3.5): гейт идёт в своём сеансе, и помощник мог умереть, не погасив его."""
+        try:
+            return self._escalate_code(proc)
+        finally:
+            kill_gate(self.jdir)
+
+    def _escalate_code(self, proc) -> bool:
         pid, pgid = proc.pid, self.d["pgid"]
         t_term, t_kill = cancel_timers()
         steps = ((signal.SIGINT, False, t_term), (signal.SIGTERM, True, t_kill), (signal.SIGKILL, True, 0))

@@ -263,6 +263,15 @@ function renderEnd(end) {
   if (ex.push_count || ex.forge_count) {
     rows.push(el("div", null, "внешние действия: пуш " + (ex.push_count || 0) + ", вызовов API " + (ex.forge_count || 0)));
   }
+  if (ex.gate_count) {
+    rows.push(el("div", ex.gate_failed ? "danger" : null, "гейты: " + ex.gate_count + ", упало " + (ex.gate_failed || 0)));
+    for (const g of ex.gate || []) {
+      const args = g.args || [];
+      const d = el("div", g.exit ? "mono danger" : "mono");
+      d.textContent = (args[0] || "?") + " · код " + g.exit + " · " + (g.duration_s ?? "?") + " с" + (g.timeout ? " · таймаут" : "");
+      rows.push(d);
+    }
+  }
   for (const link of ex.links || []) {
     const d = el("div", "mono");
     d.textContent = link;

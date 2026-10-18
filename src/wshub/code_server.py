@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import secrets
+import shlex
 import time
 from importlib import resources
 
@@ -124,6 +125,9 @@ def build_code_server(hub) -> FastMCP:
                         "push": proj.push, "push_protect": list(proj.push_protect), "forge": proj.forge,
                         "forge_access": proj.forge_access, "forge_write": proj.forge_write,
                         "forge_url": forge_url(proj), "forge_token": proj.forge_token,
+                        # гейты проекта (ТЗ WSH-3.5, Г1): wshub gate <имя> задачи профиля task
+                        "gates": [{"name": g.name, "cmd": shlex.join(g.cmd), "timeout_s": g.timeout_s}
+                                  for g in proj.gates],
                         # действующая политика: строки проекта, глобальные, встроенные — от сильной к слабой
                         "policy": code_policy.effective(reg.code.glob, proj),
                         # последний снимок лимитов подписки — общий для хаба (ТЗ WSH-4.1, п. 2.7)
@@ -208,7 +212,7 @@ def build_code_server(hub) -> FastMCP:
     def code_result(job: str) -> str:
         """Итог задачи: состояние, выбор модели и его источник, ходы и действия, звенья цепочки и их стоимость,
         итоговый текст Code, снимок git, блок «Вне кода» (HEAD и ветка, коммиты, до 10 docker-команд и их число,
-        правки .git/hooks и .git/config — по всем звеньям), «Внешние действия» (пуш, API хостинга), команда,
+        правки .git/hooks и .git/config — по всем звеньям), «Внешние действия» (пуш, API хостинга, гейты), команда,
         чтобы открыть сессию в терминале, и пути к существующим файлам. Правка .git/hooks или .git/config —
         предупреждение первой строкой."""
         try:
@@ -457,7 +461,8 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
                       "outside": {"commits_count": oc.get("commits_count", 0),
                                   "docker_count": oc.get("docker_count", 0), "head_moved": oc.get("head_moved") or []},
                       "external": {"push_count": ex.get("push_count", 0), "forge_count": ex.get("forge_count", 0),
-                                   "links": ex.get("links") or []},
+                                   "gate_count": ex.get("gate_count", 0), "gate_failed": ex.get("gate_failed", 0),
+                                   "gate": ex.get("gate") or [], "links": ex.get("links") or []},
                       "result_head": "\n".join(text.strip().splitlines()[:RESULT_HEAD_LINES])}
     return out
 

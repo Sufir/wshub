@@ -1,21 +1,27 @@
-"""Помощник хаба для задач Claude Code: `wshub push` и `wshub forge` (ТЗ WSH-3.4, А3).
+"""Помощник хаба для задач Claude Code: `wshub push` и `wshub forge` (ТЗ WSH-3.4, А3), `wshub gate` (ТЗ WSH-3.5, Г3).
 
 Code вызывает его из Bash; помощник идёт вне песочницы (sandbox.excludedCommands) и для git и API хостинга —
 единственный путь в сеть. Форму команды держит хук (одно звено, без обёрток), регламент и разрешение задачи —
 здесь: задача жива, рабочий каталог помощника — внутри её каталога, разрешение есть в job.json и регламент
 проекта в реестре его не закрыл. Токен хостинга читается из файла и не попадает ни в argv, ни в окружение,
-ни в вывод, ни в файлы. Каждый вызов — строка в <каталог задачи>/external.jsonl и в журнале хаба.
+ни в вывод, ни в файлы. Гейт — проверка проекта из реестра: argv из реестра без оболочки, окружение — белый список
+задачи (env.json) без WSHUB_*, таймаут, полный лог. Каждый вызов — строка в <каталог задачи>/external.jsonl и в
+журнале хаба.
 """
 from __future__ import annotations
 
+import contextlib
 import fnmatch
 import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,8 +29,9 @@ from datetime import datetime
 from pathlib import Path
 
 from . import gitsafe
-from .jobs import SANDBOX_MOUNTS
+from .jobs import GATE_PID, SANDBOX_MOUNTS, gate_group_alive, stop_gate_group
 from .registry import forge_url
+from .runtime import atomic_write_text, proc_start, read_json
 
 EXTERNAL = "external.jsonl"  # внешние действия звена, в каталоге задачи
 SSH_SOCK = "ssh_auth_sock"  # SSH_AUTH_SOCK хаба на старте задачи — только для git push помощника
@@ -43,7 +50,15 @@ SECRET_RE = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
 LINK_RE = re.compile(r"https?://[^\s'\"<>]+/(?:merge_requests|pull|pulls)/(?:new\b[^\s'\"<>]*|\d+)")
 JOB_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z2-7]{6}$")
 USAGE = {"push": "wshub push <remote> <ветка> [-o ключ=значение]…",
-         "forge": "wshub forge <GET|POST|PUT|PATCH> <путь> [--data <json-файл>] [--out <файл>]"}
+         "forge": "wshub forge <GET|POST|PUT|PATCH> <путь> [--data <json-файл>] [--out <файл>]",
+         "gate": "wshub gate <имя> [--out <файл>]"}
+# гейт (ТЗ WSH-3.5, Г3.6): полный лог и --out — не больше GATE_LOG_MAX байт; в stdout — хвост GATE_TAIL символов.
+# Claude показывает модели около 10000 символов вывода неуспешной команды и около 30000 успешной: хвост с итогом
+# виден целиком в обоих случаях
+GATE_LOG_MAX = 50 * 1024 * 1024
+GATE_TAIL = 8000
+GATE_JOIN = 5  # с: ждать чтения вывода после конца гейта (потомок мог унести канал с собой)
+GATE_SIGNALS = (signal.SIGTERM, signal.SIGINT, signal.SIGHUP)
 
 
 class HelperError(Exception):
@@ -120,7 +135,8 @@ def context(hub, environ: dict, cwd: str) -> Ctx:
 
 
 def check(ctx: Ctx, cwd: str, kind: str) -> None:
-    """Задача идёт, cwd внутри её каталога, разрешение kind (push | forge) есть и регламент его не закрыл."""
+    """Задача идёт, cwd внутри её каталога, разрешение kind (push | forge) есть и регламент его не закрыл; gate —
+    профиль task в фазе исполнения (гейты проекта — из перечитанного реестра, ctx.proj)."""
     from .jobs import JobError
     state = ctx.jobs.effective_state(ctx.d)
     if state != "running":
@@ -138,7 +154,11 @@ def check(ctx: Ctx, cwd: str, kind: str) -> None:
         raise HelperError(str(e)) from None
     grants = ctx.d.get("grants") or {}
     name = ctx.d["project"]
-    if kind == "push":
+    if kind == "gate":
+        if ctx.d.get("profile") != "task" or ctx.d.get("phase") == "plan":
+            raise HelperError("гейт — только задаче профиля task в фазе исполнения: он запускает код рабочего "
+                              "каталога вне песочницы")
+    elif kind == "push":
         if ctx.proj.push == "no":
             raise HelperError(f"в проекте {name} пуш закрыт реестром (push = no)")
         if ctx.d.get("profile") != "task" or ctx.d.get("phase") == "plan":
@@ -499,6 +519,217 @@ def _clip(text: str) -> str:
     return text if len(b) <= OUT_MAX else b[:OUT_MAX].decode("utf-8", "ignore") + "…"
 
 
+# ---------- wshub gate ----------
+
+def _parse_gate(args: list[str]) -> tuple[str, str | None]:
+    if not args or args[0].startswith("-"):
+        raise HelperError(f"нужно: {USAGE['gate']}")
+    rest = args[1:]
+    if not rest:
+        return args[0], None
+    if len(rest) == 1 and rest[0].startswith("--out="):
+        return args[0], rest[0].split("=", 1)[1]
+    if len(rest) == 2 and rest[0] == "--out":
+        return args[0], rest[1]
+    raise HelperError(f"после имени гейта — только --out <файл>; нужно: {USAGE['gate']}")
+
+
+def _gate_env(ctx: Ctx) -> dict:
+    """Окружение гейта (Г3.3) — белый список, который хаб дал claude (env.json звена), без WSHUB_*. Окружение самого
+    помощника не берём: claude мог добавить в него своё."""
+    try:
+        env = json.loads((ctx.jobs.job_dir(ctx.jid) / "env.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise HelperError(f"окружение задачи (env.json) не читается: {e}") from None
+    if not isinstance(env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env.items()):
+        raise HelperError("окружение задачи (env.json) — не объект строк")
+    return {k: v for k, v in env.items() if not k.startswith("WSHUB_")}
+
+
+def _gate_argv(ctx: Ctx, g, env: dict) -> list[str]:
+    """argv из реестра (Г1): cmd[0] абсолютный — как есть, относительный с / — от рабочего каталога задачи (.. реестр
+    не пропускает), голое имя — из PATH окружения гейта."""
+    c0 = g.cmd[0]
+    if os.path.isabs(c0):
+        exe = c0
+    elif "/" in c0:
+        exe = os.path.join(os.path.normpath(str(ctx.dir)), c0)
+    else:
+        exe = shutil.which(c0, path=env.get("PATH") or "")
+        if not exe:
+            raise HelperError(f"гейт {g.name}: {c0} нет в PATH окружения задачи")
+    return [exe, *g.cmd[1:]]
+
+
+def _gate_lock(ctx: Ctx, name: str) -> int:
+    """Один гейт на проект за раз (Г3.2): неблокирующий flock в каталоге состояния хаба; кто держит — в файле рядом."""
+    import fcntl
+    d = ctx.hub.state_dir / "code" / "gates"
+    proj = ctx.d["project"]
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+        fd = os.open(d / f"{proj}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as e:
+        raise HelperError(f"лок гейтов проекта не открывается: {e}") from None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        h = read_json(d / f"{proj}.holder")
+        raise HelperError(f"у проекта уже идёт гейт {h.get('gate', '?')} задачи {h.get('job', '?')}") from None
+    try:
+        atomic_write_text(d / f"{proj}.holder", json.dumps({"job": ctx.jid, "gate": name, "pid": os.getpid()}))
+    except OSError:
+        pass  # держатель — для текста отказа второму гейту; лок уже наш
+    return fd
+
+
+def _gate_log(jdir: Path, name: str) -> tuple[int, str]:
+    """Полный лог гейта: <каталог звена>/gates/<NN>-<имя>.log, NN — номер вызова в звене."""
+    d = jdir / "gates"
+    d.mkdir(exist_ok=True)
+    n = sum(1 for p in d.iterdir() if p.suffix == ".log") + 1
+    while True:
+        rel = f"gates/{n:02d}-{name}.log"
+        try:
+            return os.open(jdir / rel, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), rel
+        except FileExistsError:
+            n += 1
+
+
+class _GateSink:
+    """Вывод гейта (Г3.6): в лог и --out — не больше GATE_LOG_MAX байт, дальше только счёт обрезанного; хвост — для
+    stdout помощника."""
+
+    def __init__(self, fds: list[int]):
+        self.all = list(fds)
+        self.fds = list(fds)  # ещё пишутся
+        self.written = 0
+        self.dropped = 0
+        self.tail = bytearray()
+
+    def pump(self, stream) -> None:
+        for chunk in iter(lambda: stream.read1(65536), b""):
+            room = max(GATE_LOG_MAX - self.written, 0)
+            part = chunk[:room]
+            if part:
+                self._write(part)
+                self.written += len(part)
+            self.dropped += len(chunk) - len(part)
+            self.tail += chunk
+            del self.tail[:-4 * GATE_TAIL]  # до 4 байт UTF-8 на символ
+
+    def _write(self, data: bytes) -> None:
+        for fd in list(self.fds):
+            view = memoryview(data)
+            try:
+                while view:
+                    view = view[os.write(fd, view):]
+            except OSError:
+                self.fds.remove(fd)  # диск полон и т. п.: гейт идёт дальше, файл остаётся как есть
+
+    def close(self) -> None:
+        if self.dropped:
+            self._write(f"\n… обрезано: {self.dropped} байт\n".encode())
+        for fd in self.all:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        self.all = self.fds = []
+
+    def tail_text(self) -> str:
+        return self.tail.decode("utf-8", "replace")[-GATE_TAIL:]
+
+
+def gate(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
+    """wshub gate <имя> [--out <файл>] (ТЗ WSH-3.5, Г3): гейт проекта из перечитанного реестра — вне песочницы, без
+    оболочки, в рабочем каталоге задачи, со своим сеансом, таймаутом, полным логом и строкой учёта."""
+    shown = list(args[:3])
+    try:
+        name, out_arg = _parse_gate(args)
+        shown = [name, *(["--out", out_arg] if out_arg is not None else [])]
+        check(ctx, cwd, "gate")
+        g = next((x for x in ctx.proj.gates if x.name == name), None)
+        if g is None:
+            have = ", ".join(x.name for x in ctx.proj.gates) or "—"
+            raise HelperError(f"гейта {name} нет в реестре проекта (есть: {have})")
+        out_path = _work_file(ctx, cwd, out_arg, "--out") if out_arg is not None else None
+        env = _gate_env(ctx)
+        argv = _gate_argv(ctx, g, env)
+        lock = _gate_lock(ctx, name)
+    except HelperError as e:
+        return _refuse(ctx, "gate", shown, str(e))
+    try:
+        return _run_gate(ctx, g, argv, env, out_path, out_arg, shown)
+    finally:
+        os.close(lock)
+
+
+def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, out_arg: str | None,
+              shown: list[str]) -> int:
+    jdir = ctx.jobs.job_dir(ctx.jid)
+    fds: list[int] = []
+    try:
+        log_fd, log_rel = _gate_log(jdir, g.name)
+        fds.append(log_fd)
+        if out_path is not None:
+            fds.append(open_out(ctx.dir, os.path.relpath(out_path, os.path.normpath(str(ctx.dir)))))
+    except OSError as e:
+        for fd in fds:
+            os.close(fd)
+        what = f"--out {out_arg}" if fds else "лог гейта"
+        return _refuse(ctx, "gate", shown, f"{what}: не открывается ({e.strerror or e})")
+    stop: list[int] = []
+    old = {s: signal.signal(s, lambda signum, _frame: stop.append(signum)) for s in GATE_SIGNALS}
+    sink = _GateSink(fds)
+    pidfile = jdir / GATE_PID
+    t0 = time.monotonic()
+    try:
+        try:
+            proc = subprocess.Popen(argv, cwd=os.path.normpath(str(ctx.dir)), env=env, stdin=subprocess.DEVNULL,
+                                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        except OSError as e:
+            sink.close()
+            return _refuse(ctx, "gate", shown, f"гейт {g.name} не запустился: {e}")
+        pgid = proc.pid  # свой сеанс: группа — по pid лидера
+        atomic_write_text(pidfile, json.dumps({"pid": proc.pid, "pgid": pgid, "proc_start": proc_start(proc.pid)}))
+        reader = threading.Thread(target=sink.pump, args=(proc.stdout,), daemon=True)
+        reader.start()
+        deadline = t0 + g.timeout_s
+        timed_out = False
+        while True:
+            try:
+                proc.wait(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if stop or time.monotonic() >= deadline:
+                timed_out = not stop
+                stop_gate_group(pgid, lambda: proc.poll() is None or gate_group_alive(pgid))
+                proc.wait()
+                break
+        if gate_group_alive(pgid):  # лидер вышел, а его фоновые потомки ещё идут — не переживут гейт
+            stop_gate_group(pgid)
+        reader.join(GATE_JOIN)
+        sink.close()
+    finally:
+        for s, h in old.items():
+            signal.signal(s, h)
+        with contextlib.suppress(OSError):
+            pidfile.unlink()
+    duration = round(time.monotonic() - t0)
+    rc = proc.returncode
+    code = 130 if stop else 124 if timed_out else (128 - rc if rc < 0 else rc)
+    why = f"прерван: timeout_s = {g.timeout_s}" if timed_out else "прерван сигналом" if stop else None
+    tail = sink.tail_text()
+    sys.stdout.write(tail + ("" if not tail or tail.endswith("\n") else "\n"))
+    print(f"wshub gate {g.name}: код {code}" + (f" · {why}" if why else "") + f" · {duration} с · полный вывод: "
+          + (out_arg if out_arg is not None else "--out <файл>"))
+    sys.stdout.flush()
+    ctx.record("gate", shown, code, None, None if code == 0 else why or f"гейт вернул {code}",
+               {"duration_s": duration, "timeout": timed_out, "log": log_rel})
+    return code
+
+
 def _refuse(ctx: Ctx, cmd: str, shown: list[str], reason: str) -> int:
     print(f"wshub {cmd}: отказ: {reason}", file=sys.stderr)
     ctx.record(cmd, shown, 1, None, reason)
@@ -509,7 +740,7 @@ def _refuse(ctx: Ctx, cmd: str, shown: list[str], reason: str) -> int:
 
 def main(cmd: str, args: list[str], config: Path, state: Path, environ: dict | None = None,
          cwd: str | None = None) -> int:
-    """wshub push|forge …: 0 — сделано, иначе отказ или код git (причина — в stderr)."""
+    """wshub push|forge|gate …: 0 — сделано, иначе отказ, код git или код гейта (причина — в stderr)."""
     from .core import Hub
     environ = dict(os.environ) if environ is None else environ
     cwd = cwd or os.getcwd()
@@ -523,4 +754,4 @@ def main(cmd: str, args: list[str], config: Path, state: Path, environ: dict | N
         print(f"wshub {cmd}: отказ: {e}", file=sys.stderr)
         hub._audit_code(f"wshub_{cmd}", None, environ.get("WSHUB_JOB") or None, status="error", error=str(e))
         return 1
-    return (push if cmd == "push" else forge)(ctx, args, environ, cwd)
+    return {"push": push, "forge": forge, "gate": gate}[cmd](ctx, args, environ, cwd)

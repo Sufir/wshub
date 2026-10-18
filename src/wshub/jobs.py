@@ -58,6 +58,10 @@ SANDBOX_MOUNTS = (".bash_profile", ".bashrc", ".gitconfig", ".gitmodules", ".ide
                   ".claude/settings.local.json", ".claude/skills", ".claude/workflows")
 EXCLUDE_BEGIN = "# >>> wshub-code: точки монтирования песочницы (блок пишет хаб, не править)"
 EXCLUDE_END = "# <<< wshub-code"
+GATES_PYTHON_M = "гейты недоступны: хаб запущен как python -m wshub"
+# гейт (ТЗ WSH-3.5, Г3): pid, pgid и proc_start идущего гейта — в каталоге звена; SIGTERM группе → пауза → SIGKILL
+GATE_PID = "gate.pid"
+GATE_KILL_AFTER = 10
 META_WARNING = ("ВНИМАНИЕ: задача изменила .git/hooks или .git/config. Эти правки не видны в диффе и выполнятся "
                 "твоим git — проверь их перед git-командами в этом репозитории")
 
@@ -104,6 +108,7 @@ class Plan:
     budget_total: float = 0.0  # бюджет всей задачи (цепочки); budget_usd — этого звена
     max_turns_total: int = 0
     grants: dict | None = None  # разрешения задачи {push, forge, reason} (ТЗ WSH-3.4, А2)
+    gates: tuple = ()  # гейты задачи профиля task; звену плана правила не даются (ТЗ WSH-3.5, Г2)
 
     @property
     def permission_mode(self) -> str:
@@ -315,10 +320,11 @@ class Jobs:
         # промпт — только из шаблона (п. 2.3, 8): имя из override (resume) или из шапки, литерального текста нет
         prompt_name = prompt_override or header.get("prompt") or profile
         prompt, warnings = self._render(root, proj, prompt_name, header["ticket"], task_rel, note)
+        gates = link_gates(proj, profile, warnings)
         out = Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, choice.model, choice.effort,
                    max_turns, budget_usd, prompt, warnings + gwarn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
-                   budget_total=budget_usd, max_turns_total=max_turns, grants=grants)
+                   budget_total=budget_usd, max_turns_total=max_turns, grants=grants, gates=gates)
         if choice.plan != "no":
             # шаблон исполнения проверяем на старте, а не после оплаченной фазы плана (2.6.3)
             self._render(root, proj, proj.execute_prompt, header["ticket"], task_rel,
@@ -480,7 +486,8 @@ class Jobs:
             raise JobError(problem)
         flags = claude_cli.detect_flags(claude, self.hub.state_dir, env)
         grants = plan.grants or {}
-        if grants.get("push") or grants.get("forge"):
+        gates = plan.gates if plan.phase != "plan" else ()  # гейты — только фазе исполнения (Г1)
+        if grants.get("push") or grants.get("forge") or gates:
             env = helper_env(env, plan.dir)
         if grants.get("forge"):  # файл токена — при старте задачи с доступом к API (А1.2)
             from .helper import HelperError, read_token
@@ -534,7 +541,7 @@ class Jobs:
             settings = claude_cli.settings(plan.profile, plan.task_rel, glob, plan.proj, protected,
                                            self.hub.protected_data, hook_cmd, Path.home(), plan.dir,
                                            phase="plan" if plan.phase == "plan" else None, read_extra=read_extra,
-                                           grants=grants)
+                                           grants=grants, gates=gates)
             claude_cli.write_job_files(jdir, settings, plan.prompt)
             # помощнику — задача и хаб (не секреты); агент ssh — только в каталог задачи, Code туда не видит (А3)
             env = {**env, "WSHUB_JOB": jid, "WSHUB_CONFIG": str(self.hub.registry.path),
@@ -749,7 +756,14 @@ class Jobs:
         return d
 
     def _kill_group(self, d: dict) -> None:
-        """SIGINT процессу Code → SIGTERM группе → SIGKILL группе; proc_start защищает от повторного pid."""
+        """SIGINT процессу Code → SIGTERM группе → SIGKILL группе; proc_start защищает от повторного pid. Затем —
+        группа гейта из gate.pid (ТЗ WSH-3.5, Г3.5): гейт идёт в своём сеансе, сигнал группе Code его не задевает."""
+        try:
+            self._kill_code_group(d)
+        finally:
+            kill_gate(self.job_dir(d["id"]))
+
+    def _kill_code_group(self, d: dict) -> None:
         pgid, pid = d.get("pgid"), d.get("pid")
         if not pgid or not _alive(pid, d.get("proc_start")):
             return
@@ -843,13 +857,14 @@ class Jobs:
         if turns < 1:
             raise JobError(f"ходы задачи исчерпаны: из {d.get('max_turns_total')} не осталось")
         prompt, warnings = self._render(root, proj, template, d.get("ticket") or "", d["task_rel"], note)
+        gates = link_gates(proj, d["profile"], warnings)
         # разрешения — у звеньев цепочки те же (А2.2), регламент проекта перепроверяется на старте звена
         grants, gwarn = task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants"))
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
                     effort, turns, budget, prompt, warnings + gwarn, proj, ticket=d.get("ticket") or "",
                     size=d.get("size"), risk=d.get("risk"), choice=choice, phase=phase,
                     plan_mode=d.get("plan_mode") or "no", budget_total=float(d["budget_total"]),
-                    max_turns_total=int(d["max_turns_total"]), grants=grants)
+                    max_turns_total=int(d["max_turns_total"]), grants=grants, gates=gates)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
         """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk, модель исполнения,
@@ -925,7 +940,8 @@ class Jobs:
 
     def external_view(self, links: list[dict]) -> dict:
         """Блок «Внешние действия» (ТЗ WSH-3.4, А3.4): вызовы помощника по external.jsonl звеньев — пуши целиком
-        (их мало), вызовы API числом и последние EXTERNAL_MAX, ссылки на MR/PR."""
+        (их мало), вызовы API числом и последние EXTERNAL_MAX, ссылки на MR/PR; гейты (ТЗ WSH-3.5, Г4) — последние
+        EXTERNAL_MAX (имя, код, длительность, таймаут), число и сколько упало."""
         rows: list[dict] = []
         for x in links:
             try:
@@ -941,13 +957,17 @@ class Jobs:
                     rows.append(r)
         pushes = [r for r in rows if r.get("cmd") == "push"]
         calls = [r for r in rows if r.get("cmd") == "forge"]
+        gates = [r for r in rows if r.get("cmd") == "gate"]
 
         def row(r: dict) -> dict:
-            return {k: r[k] for k in ("ts", "args", "exit", "status", "link", "error") if r.get(k) is not None}
+            return {k: r[k] for k in ("ts", "args", "exit", "status", "link", "error", "duration_s", "timeout")
+                    if r.get(k) is not None}
 
         return {"push": [row(r) for r in pushes[-EXTERNAL_MAX:]], "push_count": len(pushes),
                 "forge": [row(r) for r in calls[-EXTERNAL_MAX:]], "forge_count": len(calls),
                 "forge_errors": sum(1 for r in calls if r.get("exit")),
+                "gate": [row(r) for r in gates[-EXTERNAL_MAX:]], "gate_count": len(gates),
+                "gate_failed": sum(1 for r in gates if r.get("exit")),
                 "links": list(dict.fromkeys(r["link"] for r in rows if r.get("link")))}
 
     # ---------- статистика (2.4.5) ----------
@@ -1051,6 +1071,71 @@ def helper_env(env: dict, workdir: Path) -> dict:
             continue
         keep.append(d)
     return {**env, "PATH": os.pathsep.join([home, *keep])}
+
+
+def link_gates(proj: ProjectCode, profile: str, warnings: list[str]) -> tuple:
+    """Гейты задачи (ТЗ WSH-3.5, Г1–Г2): только профилю task. Хаб запущен как python -m wshub — правило
+    Bash(wshub gate *) выпустило бы из песочницы первый wshub из PATH: гейтов нет, задача стартует с предупреждением."""
+    if profile != "task" or not proj.gates:
+        return ()
+    if not claude_cli.wshub_exe():
+        warnings.append(GATES_PYTHON_M)
+        return ()
+    return proj.gates
+
+
+def gate_group_alive(pgid: int, proc: Path = Path("/proc")) -> bool:
+    """Есть ли в группе процессы, кроме зомби (их снимает родитель, сигнал им не нужен)."""
+    if proc.is_dir():
+        for p in proc.iterdir():
+            if not p.name.isdigit():
+                continue
+            try:
+                fields = (p / "stat").read_text().rsplit(")", 1)[-1].split()
+            except OSError:
+                continue
+            if len(fields) > 2 and fields[2] == str(pgid) and fields[0] != "Z":
+                return True
+        return False
+    try:  # без /proc (macOS)
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def stop_gate_group(pgid: int, alive=None) -> None:
+    """SIGTERM группе гейта → до GATE_KILL_AFTER с → SIGKILL группе (ТЗ WSH-3.5, Г3.5). alive() — идёт ли ещё
+    группа (помощник заодно снимает зомби лидера); по умолчанию — есть ли в группе процессы."""
+    alive = alive or (lambda: gate_group_alive(pgid))
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGTERM)
+    deadline = time.time() + GATE_KILL_AFTER
+    while time.time() < deadline and alive():
+        time.sleep(0.1)
+    if alive():
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(pgid, signal.SIGKILL)
+
+
+def kill_gate(jdir: Path) -> None:
+    """Погасить гейт звена по gate.pid (ТЗ WSH-3.5, Г3.5) — при остановке задачи и в code-kill: помощник мог умереть
+    по SIGKILL, не погасив гейт. Защита proc_start, как у _kill_group: pid лидера жив с другим временем старта —
+    переиспользован, группу не трогаем. Лидер уже вышел, а в группе остались его потомки — гасим их: номер группы не
+    выдаётся новому процессу, пока в ней кто-то есть."""
+    p = jdir / GATE_PID
+    info = read_json(p)
+    if not info:
+        return
+    pid, pgid, started = info.get("pid"), info.get("pgid"), info.get("proc_start")
+    if isinstance(pid, int) and isinstance(pgid, int) and pgid > 1 and pgid != os.getpgrp():
+        now = proc_start(pid)
+        if not (now is not None and started is not None and now != started) and gate_group_alive(pgid):
+            stop_gate_group(pgid)
+    with contextlib.suppress(OSError):
+        p.unlink()
 
 
 def write_exclude(repo: Path) -> None:

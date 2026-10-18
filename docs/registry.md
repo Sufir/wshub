@@ -76,7 +76,15 @@ dirs = ["org"]                    # где можно запускать; стр
 prompts = ".agents/templates/code-prompts"
 profiles = ["recon", "task", "review"]
 model_max = "opus"                # потолки модели, effort, ходов и бюджета
+
+[workspace.team-service.code.gates]  # гейты: проверки вне песочницы командой wshub gate <имя> (только task)
+test-docker = ".venv/bin/python -m pytest -m docker"       # строка — одна команда без оболочки
+check = { cmd = ["scripts/check.sh"], timeout_s = 1500 }   # cmd строкой или списком; timeout_s 1…3600, по умолчанию 600
 ```
+
+`gates` — имя (`^[a-z0-9][a-z0-9_-]{0,39}$`) → команда. В строковой форме операторы оболочки, `$` и обратная
+кавычка — ошибка секции проекта; нужна цепочка — скрипт в репозитории или `cmd` списком. Подробно — раздел
+«Гейты» в [docs/code.md](code.md).
 
 ## Состояние `~/.local/state/wshub`
 
@@ -89,3 +97,4 @@ model_max = "opus"                # потолки модели, effort, ход�
 | `registry-history/` | прежние версии реестра после правок |
 | `outbox-cleanup.json`, `desktop-setup.json` | последняя очистка перевалки; что `setup` создал в конфиге Desktop |
 | `jobs/<id>/`, `claude-flags.json` | задачи Claude Code (метаданные, события, итог); флаги установленного `claude` по версии |
+| `code/gates/<проект>.lock`, `.holder` | один гейт на проект за раз; кто держит |

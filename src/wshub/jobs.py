@@ -58,7 +58,13 @@ SANDBOX_MOUNTS = (".bash_profile", ".bashrc", ".gitconfig", ".gitmodules", ".ide
                   ".claude/settings.local.json", ".claude/skills", ".claude/workflows")
 EXCLUDE_BEGIN = "# >>> wshub-code: точки монтирования песочницы (блок пишет хаб, не править)"
 EXCLUDE_END = "# <<< wshub-code"
-GATES_PYTHON_M = "гейты недоступны: хаб запущен как python -m wshub"
+# блок «От хаба» в конце промпта (ТЗ WSH-3.5, П1–П2)
+HUB_BLOCK_MAX = 2048  # байт на весь блок
+HUB_BLOCK_GATES = 10
+HUB_BLOCK_HIDDEN = 20
+HUB_BLOCK_CMD = 100  # символов команды гейта в строке блока
+HIDDEN_JOB_MAX = 200  # путей sandbox_hidden в job.json
+GATES_PYTHON_M ="гейты недоступны: хаб запущен как python -m wshub"
 # гейт (ТЗ WSH-3.5, Г3): pid, pgid и proc_start идущего гейта — в каталоге звена; SIGTERM группе → пауза → SIGKILL
 GATE_PID = "gate.pid"
 GATE_KILL_AFTER = 10
@@ -109,6 +115,7 @@ class Plan:
     max_turns_total: int = 0
     grants: dict | None = None  # разрешения задачи {push, forge, reason} (ТЗ WSH-3.4, А2)
     gates: tuple = ()  # гейты задачи профиля task; звену плана правила не даются (ТЗ WSH-3.5, Г2)
+    sandbox_hidden: list[str] | None = None  # отслеживаемые файлы, скрытые песочницей (ТЗ WSH-3.5, П2)
 
     @property
     def permission_mode(self) -> str:
@@ -319,12 +326,15 @@ class Jobs:
 
         # промпт — только из шаблона (п. 2.3, 8): имя из override (resume) или из шапки, литерального текста нет
         prompt_name = prompt_override or header.get("prompt") or profile
-        prompt, warnings = self._render(root, proj, prompt_name, header["ticket"], task_rel, note)
+        prompt, warnings, note_left = self._render(root, proj, prompt_name, header["ticket"], task_rel, note)
         gates = link_gates(proj, profile, warnings)
+        hidden = self._hidden(dir_abs, glob, proj, warnings)
+        prompt += hub_block(note_left, gates, "plan" if choice.plan != "no" else None, hidden, prompt)
         out = Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, choice.model, choice.effort,
                    max_turns, budget_usd, prompt, warnings + gwarn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
-                   budget_total=budget_usd, max_turns_total=max_turns, grants=grants, gates=gates)
+                   budget_total=budget_usd, max_turns_total=max_turns, grants=grants, gates=gates,
+                   sandbox_hidden=hidden)
         if choice.plan != "no":
             # шаблон исполнения проверяем на старте, а не после оплаченной фазы плана (2.6.3)
             self._render(root, proj, proj.execute_prompt, header["ticket"], task_rel,
@@ -347,13 +357,23 @@ class Jobs:
             raise JobError(f"в шаблоне {proj.prompts}/{REPLAN_PROMPT}.md нет {{note}} — замечание к плану обязательно")
 
     def _render(self, root: Path, proj: ProjectCode, name: str, ticket: str, task_rel: str, note,
-                what: str = "") -> tuple[str, list[str]]:
+                what: str = "") -> tuple[str, list[str], str | None]:
+        """(промпт, предупреждения, note для блока «От хаба» — если в шаблоне нет {note}; ТЗ WSH-3.5, П3)."""
         if not taskfile.NAME_RE.match(name):
             raise JobError(f"имя шаблона промпта недопустимо: {name}")
         template_path = (root / proj.prompts / f"{name}.md").resolve()
         if not template_path.is_file():
             raise JobError(f"шаблон промпта{' ' + what if what else ''} не найден: {proj.prompts}/{name}.md")
-        return taskfile.render(template_path.read_text(encoding="utf-8"), ticket=ticket, task=task_rel, note=note)
+        template = template_path.read_text(encoding="utf-8")
+        prompt, warnings = taskfile.render(template, ticket=ticket, task=task_rel, note=note)
+        return prompt, warnings, None if taskfile.uses_note(template) else taskfile.check_note(note)
+
+    def _hidden(self, workdir: Path, glob, proj: ProjectCode, warnings: list[str]) -> list[str]:
+        """Скрытые песочницей отслеживаемые файлы (ТЗ WSH-3.5, П2); сбой git — предупреждение, списка нет."""
+        hidden, problem = sandbox_hidden(workdir, [*glob.deny_read, *proj.deny_read], dict(os.environ))
+        if problem:
+            warnings.append(problem)
+        return hidden
 
     def _choose(self, glob, proj, header, profile, model, effort, plan, chosen_by, reason,
                 channel) -> code_policy.Choice:
@@ -529,6 +549,7 @@ class Jobs:
                 "phase": plan.phase, "plan_mode": plan.plan_mode, "budget_total": plan.budget_total,
                 "max_turns_total": plan.max_turns_total, "chain_root": chain_root or jid,
                 "session_name": plan.session_name(), "grants": grants,
+                "sandbox_hidden": (plan.sandbox_hidden or [])[:HIDDEN_JOB_MAX],
                 # режим notify — на момент старта корня; звенья и resume берут его у корня (ТЗ WSH-3.4, В3.1)
                 "notify": self._root_notify(chain_root) or glob.notify,
             }
@@ -813,11 +834,14 @@ class Jobs:
 
     # ---------- фазы плана и исполнения (ТЗ WSH-3, 2.3) ----------
 
-    def _plan_ready(self, jid: str) -> dict:
+    def _plan_ready(self, jid: str, action: str = "approve", auto: bool = False) -> dict:
         d = self.read(jid)
+        root = d.get("chain_root") or jid
         if d.get("phase") and d.get("chain_root") == jid:
             d = self.chain(jid)[-1]  # по корню цепочки — активное звено, как code_cancel и code_plan
             jid = d["id"]
+        if not auto:  # автопереход надзирателя идёт как раз в окне перехода — отказы П4 только чату
+            self._auto_plan_refusal(root, d, action)
         if d.get("phase") != "plan":
             raise JobError(f"{jid} — не фаза плана (утвердить или переделать можно только план)")
         state = self.effective_state(d)
@@ -825,6 +849,29 @@ class Jobs:
             raise JobError(f"план {jid} в состоянии {state}" + (f", уже продолжен задачей {d['next']}"
                                                                  if d.get("next") else "") + " — нужен plan_ready")
         return d
+
+    def _auto_plan_refusal(self, root: str, d: dict, action: str) -> None:
+        """plan = auto у корня цепочки (ТЗ WSH-3.5, П4): план утверждает хаб, и code_approve/code_replan из чата
+        получают понятный отказ — план уже утверждён или утверждается сейчас. Автопереход не удался (chain_error,
+        надзиратель мёртв) — утверждение работает, как раньше."""
+        try:
+            rd = d if d.get("id") == root else self.read(root)
+        except JobError:
+            return
+        if rd.get("plan_mode") != "auto":
+            return
+        done = next((x for x in reversed(self.chain(root)) if x.get("phase") == "plan" and x.get("reason") == "auto"
+                     and x.get("next")), None)
+        waiting = d.get("phase") == "plan" and self.effective_state(d) == "plan_ready" and not d.get("next") \
+            and not d.get("chain_error") and _alive(d.get("sup_pid"), d.get("sup_start"))
+        if action == "replan" and (done or waiting):
+            raise JobError("при plan = auto исполнение стартует само, переделать план нельзя; нужен разбор плана — "
+                           "запускай с plan = review")
+        if done:
+            raise JobError(f"план утверждён автоматически (plan = auto), исполнение — задача {done['next']}; "
+                           f"code_approve не нужен — жди итог: code_wait({root})")
+        if waiting:
+            raise JobError("план утверждается автоматически (plan = auto) — code_approve не нужен")
 
     def _remaining(self, d: dict) -> tuple[float, int]:
         """Остаток бюджета и ходов задачи после всех звеньев цепочки (стоимость звена — разностью)."""
@@ -836,7 +883,7 @@ class Jobs:
 
     def _link_plan(self, d: dict, phase: str, note, template: str | None = None) -> Plan:
         """Звено цепочки из job.json фазы плана: те же проект, dir, ТЗ, профиль и выбор; бюджет — остаток."""
-        ws, proj, _glob = self._project(d["project"])
+        ws, proj, glob = self._project(d["project"])
         root = ws.path.resolve()
         dir_abs = Path(d["dir"])
         if dir_abs not in self._dirs(root, proj):
@@ -856,20 +903,22 @@ class Jobs:
             raise JobError(f"бюджет задачи исчерпан: остаток {budget:g} из {d.get('budget_total')}")
         if turns < 1:
             raise JobError(f"ходы задачи исчерпаны: из {d.get('max_turns_total')} не осталось")
-        prompt, warnings = self._render(root, proj, template, d.get("ticket") or "", d["task_rel"], note)
+        prompt, warnings, note_left = self._render(root, proj, template, d.get("ticket") or "", d["task_rel"], note)
         gates = link_gates(proj, d["profile"], warnings)
+        hidden = self._hidden(dir_abs, glob, proj, warnings)
+        prompt += hub_block(note_left, gates, phase, hidden, prompt)
         # разрешения — у звеньев цепочки те же (А2.2), регламент проекта перепроверяется на старте звена
         grants, gwarn = task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants"))
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
                     effort, turns, budget, prompt, warnings + gwarn, proj, ticket=d.get("ticket") or "",
                     size=d.get("size"), risk=d.get("risk"), choice=choice, phase=phase,
                     plan_mode=d.get("plan_mode") or "no", budget_total=float(d["budget_total"]),
-                    max_turns_total=int(d["max_turns_total"]), grants=grants, gates=gates)
+                    max_turns_total=int(d["max_turns_total"]), grants=grants, gates=gates, sandbox_hidden=hidden)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
         """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk, модель исполнения,
         остаток бюджета. auto=True — переход сам, из надзирателя фазы плана (plan = auto)."""
-        d = self._plan_ready(jid)
+        d = self._plan_ready(jid, auto=auto)
         plan = self._link_plan(d, "execute", note)
         return self.start(plan, parent=d["id"], resume=d["session_id"], chain_root=d.get("chain_root") or d["id"],
                           link=(d["id"], "auto" if auto else "approved"))
@@ -878,7 +927,7 @@ class Jobs:
         """Новая фаза плана в той же сессии: --permission-mode plan, шаблон replan с {note}."""
         if not (taskfile.check_note(note) or "").strip():
             raise JobError("note обязателен: что исправить в плане (одна строка, ≤ 300 символов)")
-        d = self._plan_ready(jid)
+        d = self._plan_ready(jid, "replan")
         ws, proj, _glob = self._project(d["project"])
         self._replan_template(ws.path.resolve(), proj)
         plan = self._link_plan(d, "plan", note, REPLAN_PROMPT)
@@ -1082,6 +1131,80 @@ def link_gates(proj: ProjectCode, profile: str, warnings: list[str]) -> tuple:
         warnings.append(GATES_PYTHON_M)
         return ()
     return proj.gates
+
+
+def deny_read_hit(masks, rel: str, real: str) -> bool:
+    """Маски deny_read: абсолютные и ~ — по реальному пути, относительные — от рабочего каталога. Одна функция для
+    помощника (--data) и списка скрытых песочницей файлов (ТЗ WSH-3.5, П2)."""
+    for m in masks:
+        if m == "~" or m.startswith("~/") or os.path.isabs(m):
+            base = os.path.normpath(os.path.expanduser(m))
+            if real == base or real.startswith(base.rstrip("/") + "/") or fnmatch.fnmatchcase(real, base):
+                return True
+        else:
+            m = os.path.normpath(m)
+            if rel == m or rel.startswith(m + "/") or fnmatch.fnmatchcase(rel, m):
+                return True
+    return False
+
+
+def sandbox_hidden(workdir: Path, masks: list[str], environ: dict) -> tuple[list[str], str | None]:
+    """Отслеживаемые файлы, которые песочница скрывает от Bash (ТЗ WSH-3.5, П2): git ls-files через gitsafe, затем те
+    же маски, что получает песочница, — имя .env* (Read(**/.env*)) и deny_read [code] и проекта. В git status задачи
+    такие файлы выглядят изменёнными. Ответ — (пути, None) или ([], причина сбоя git)."""
+    git = shutil.which("git") or "git"
+    why = "скрытые песочницей файлы не посчитаны"
+    try:
+        r = gitsafe.run(git, workdir, ["ls-files", "-z"], environ, 30)
+    except gitsafe.GitUnsafe as e:
+        return [], f"{why}: {e.reason}: {e}"[:500]
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:  # ValueError — имя не в UTF-8
+        return [], f"{why}: {e}"[:500]
+    if r.returncode != 0:
+        return [], f"{why}: git ls-files вернул {r.returncode}: {r.stderr.strip()[:300]}"
+    base = os.path.realpath(workdir)
+    return [rel for rel in r.stdout.split("\0") if rel and (rel.rsplit("/", 1)[-1].startswith(".env")
+                                                          or deny_read_hit(masks, rel, os.path.join(base, rel)))], None
+
+
+def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[str] | None, prompt: str = "") -> str:
+    """Блок «От хаба» в конце промпта (ТЗ WSH-3.5, П1): замечание оператора, если шаблон его не подставил; гейты
+    (у фазы плана — какие будут в исполнении); скрытые песочницей файлы. Только непустые строки, весь блок ≤ 2 КБ:
+    лишнее — «и ещё N». Ответ — текст, который дописать к промпту (prompt — чтобы начать с новой строки), или ""."""
+    hidden = hidden or []
+
+    def build(ng: int, nh: int) -> str:
+        lines = []
+        if note:
+            lines.append(f"- Замечание оператора: {note}")
+        if gates:
+            items = [f"{g.name} (timeout {(g.timeout_s + 60) * 1000} мс) — {_clip(shlex.join(g.cmd), HUB_BLOCK_CMD)}"
+                     for g in gates[:ng]]
+            listed = "; ".join(items) + (f"; и ещё {len(gates) - ng}" if len(gates) > ng else "")
+            lines.append(f"- Гейты будут в фазе исполнения: {listed}." if phase == "plan" else
+                         "- Гейты — проверки вне песочницы, только командой `wshub gate <имя>` целиком, Bash с timeout "
+                         f"не меньше указанного: {listed}. Полный вывод — `--out <файл>`.")
+        if hidden:
+            shown = ", ".join(hidden[:nh]) + (f" (и ещё {len(hidden) - nh})" if len(hidden) > nh else "")
+            lines.append(f"- Песочница скрывает отслеживаемые файлы: {shown}. В `git status` задачи они выглядят "
+                         "изменёнными — это не правка задачи: не восстанавливай их и не добавляй в коммит.")
+        if not lines:
+            return ""
+        return ("" if not prompt or prompt.endswith("\n") else "\n") + \
+            "\n---\nОт хаба wshub (добавлено к шаблону):\n" + "\n".join(lines) + "\n"
+
+    ng, nh = min(len(gates), HUB_BLOCK_GATES), min(len(hidden), HUB_BLOCK_HIDDEN)
+    text = build(ng, nh)
+    while len(text.encode("utf-8")) > HUB_BLOCK_MAX and (nh > 1 or ng > 1):
+        nh, ng = (nh - 1, ng) if nh > 1 else (nh, ng - 1)
+        text = build(ng, nh)
+    if len(text.encode("utf-8")) > HUB_BLOCK_MAX:  # длинные пути — последний предохранитель
+        text = text.encode("utf-8")[:HUB_BLOCK_MAX - 4].decode("utf-8", "ignore") + "…\n"
+    return text
+
+
+def _clip(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
 
 
 def gate_group_alive(pgid: int, proc: Path = Path("/proc")) -> bool:

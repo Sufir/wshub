@@ -109,9 +109,15 @@ def check_note(note: str | None) -> str | None:
     return note
 
 
+def uses_note(template: str) -> bool:
+    """В шаблоне есть подстановка {note}."""
+    return "note" in _PLACEHOLDER_RE.findall(template)
+
+
 def render(template: str, ticket: str, task: str, note: str | None) -> tuple[str, list[str]]:
-    """Подстановка {ticket}, {task}, {note}. Другие {…} — отказ; {note} без значения — отказ.
-    Возвращает (промпт, предупреждения)."""
+    """Подстановка {ticket}, {task}, {note}. Другие {…} — отказ; {note} без значения — отказ. note без {note} в
+    шаблоне не пропадает: его дописывает блок «От хаба» (ТЗ WSH-3.5, П3, uses_note). Возвращает (промпт,
+    предупреждения)."""
     names = _PLACEHOLDER_RE.findall(template)
     unknown = sorted({n for n in names if n not in ("ticket", "task", "note")})
     if unknown:
@@ -120,7 +126,5 @@ def render(template: str, ticket: str, task: str, note: str | None) -> tuple[str
     warnings = []
     if "note" in names and note is None:
         raise TaskError("шаблон ждёт {note} — передай note (строка оператора, ≤ 300 символов)")
-    if note is not None and "note" not in names:
-        warnings.append("note передан, но в шаблоне нет {note} — не использован")
     values = {"ticket": ticket, "task": task, "note": note or ""}
     return _PLACEHOLDER_RE.sub(lambda m: values[m.group(1)], template), warnings

@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import gitsafe
-from .jobs import GATE_PID, SANDBOX_MOUNTS, gate_group_alive, stop_gate_group
+from .jobs import GATE_PID, SANDBOX_MOUNTS, deny_read_hit, gate_group_alive, stop_gate_group
 from .registry import forge_url
 from .runtime import atomic_write_text, proc_start, read_json
 
@@ -205,18 +205,10 @@ def _work_file(ctx: Ctx, cwd: str, val: str, what: str) -> Path:
 
 
 def _deny_read_hit(ctx: Ctx, rel: str, real: str) -> bool:
-    """Маски deny_read проекта и [code]: абсолютные и ~ — по реальному пути, относительные — от рабочего каталога."""
+    """Маски deny_read проекта и [code]: абсолютные и ~ — по реальному пути, относительные — от рабочего каталога.
+    Сопоставление — jobs.deny_read_hit, та же функция, что считает скрытые песочницей файлы (ТЗ WSH-3.5, П2)."""
     masks = [*(ctx.glob.deny_read if ctx.glob else ()), *(ctx.proj.deny_read if ctx.proj else ())]
-    for m in masks:
-        if m == "~" or m.startswith("~/") or os.path.isabs(m):
-            base = os.path.normpath(os.path.expanduser(m))
-            if real == base or real.startswith(base.rstrip("/") + "/") or fnmatch.fnmatchcase(real, base):
-                return True
-        else:
-            m = os.path.normpath(m)
-            if rel == m or rel.startswith(m + "/") or fnmatch.fnmatchcase(rel, m):
-                return True
-    return False
+    return deny_read_hit(masks, rel, real)
 
 
 def open_out(top: Path, rel: str) -> int:

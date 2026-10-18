@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import re
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -14,7 +15,7 @@ else:  # pragma: no cover
 MODES = ("ro", "rw")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")  # имя идёт в путь резервных копий
 DEFAULT_KEYS = {"deny", "max_read_kb", "ttl_hours"}
-WS_KEYS = {"path", "mode", "description", "brief", "deny", "code"}
+WS_KEYS = {"path", "mode", "description", "brief", "deny", "code", "api"}
 # [limits]: ключ → (значение по умолчанию, подпись для панели и doctor)
 LIMITS = {
     "journal_max_mb": (5, "размер файла журнала, МБ"),
@@ -59,6 +60,10 @@ SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
 # переменные, меняющие источник оплаты Claude Code (ТЗ WSH-4.1, факт 8): префиксами — новые имена тех же семейств
 # ловятся сами. В задачу не идут (claude_cli.environment), в .claude/settings*.json проекта — отказ до старта
 BILLING_ENV_RE = re.compile(r"^(ANTHROPIC_|CLAUDE_CODE_USE_|CLAUDE_CODE_OAUTH_)|^AWS_BEARER_TOKEN_BEDROCK$")
+# [api], [api.providers.<имя>] и [workspace.<имя>.api] — доступ хаба к моделям по ключу (ТЗ WSH-4.2, п. 2.4)
+API_KEYS = {"enabled", "max_usd_per_call", "daily_usd", "providers"}
+API_PROVIDER_KEYS = {"included_usd", "credits_until", "models", "strong_requires_choice"}
+WS_API_KEYS = {"enabled"}
 
 
 def billing_env(name: str) -> bool:
@@ -177,6 +182,28 @@ class Code:
 
 
 @dataclass(frozen=True)
+class ApiProvider:
+    included_usd: float = 0.0  # включённые кредиты до credits_until
+    credits_until: date | None = None
+    models: dict[str, str] = field(default_factory=dict)  # переопределение уровней cheap / standard / strong
+    strong_requires_choice: bool = True  # уровень strong — только явным выбором оператора
+
+
+@dataclass(frozen=True)
+class Api:
+    """[api] и [workspace.<имя>.api]. Ошибка в них не ломает реестр: отказывает только API хаба
+    (error — для всех проектов, project_errors — для одного)."""
+    present: bool = False
+    enabled: bool = False
+    max_usd_per_call: float = 1.0
+    daily_usd: float = 10.0
+    providers: dict[str, ApiProvider] = field(default_factory=dict)
+    error: str | None = None
+    projects: dict[str, bool] = field(default_factory=dict)  # [workspace.<имя>.api] enabled
+    project_errors: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Registry:
     workspaces: dict[str, Workspace]
     max_read_kb: int
@@ -186,6 +213,7 @@ class Registry:
     # неизвестные разделы и ключи: сервер их пропускает, doctor и «Обзор» показывают
     warnings: tuple[str, ...] = ()
     code: Code = field(default_factory=Code)
+    api: Api = field(default_factory=Api)
 
 
 def is_limit(v) -> bool:
@@ -215,7 +243,7 @@ def parse(text: str) -> Registry:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as e:
         raise RegistryError(f"синтаксис TOML: {e}") from None
-    warnings = [unknown_key(k) for k in data if k not in ("defaults", "workspace", "limits", "outbox", "code")]
+    warnings = [unknown_key(k) for k in data if k not in ("defaults", "workspace", "limits", "outbox", "code", "api")]
 
     d = _table(data.get("defaults", {}), "[defaults]")
     warnings += [unknown_key(f"defaults.{k}") for k in d if k not in DEFAULT_KEYS]
@@ -239,6 +267,8 @@ def parse(text: str) -> Registry:
     wss: dict[str, Workspace] = {}
     code_projects: dict[str, ProjectCode] = {}
     code_errors: dict[str, str] = {}
+    api_projects: dict[str, bool] = {}
+    api_errors: dict[str, str] = {}
     for name, w in _table(data.get("workspace", {}), "[workspace]").items():
         where = f"[workspace.{name}]"
         if not NAME_RE.match(name):
@@ -265,13 +295,25 @@ def parse(text: str) -> Registry:
                 code_projects[name] = _ws_code(name, w["code"], warnings)
             except RegistryError as e:
                 code_errors[name] = str(e)
+        if "api" in w:
+            try:
+                api_projects[name] = _ws_api(name, w["api"], warnings)
+            except RegistryError as e:
+                api_errors[name] = str(e)
     code_glob, code_error = CodeGlobal(), None
     try:
         code_glob = _code(data.get("code", {}), warnings)
     except RegistryError as e:
         code_error = str(e)
     code = Code("code" in data, code_glob, code_error, code_projects, code_errors)
-    return Registry(wss, max_kb, float(ttl), limits, outbox, tuple(warnings), code)
+    api = Api()
+    if "api" in data:
+        try:
+            api = _api(data["api"], warnings)
+        except RegistryError as e:
+            api = Api(present=True, error=str(e))
+    api = replace(api, projects=api_projects, project_errors=api_errors)
+    return Registry(wss, max_kb, float(ttl), limits, outbox, tuple(warnings), code, api)
 
 
 def _number(v, where: str, integer: bool = False):
@@ -480,6 +522,74 @@ def forge_url(proj: ProjectCode) -> str | None:
     if proj.forge_url:
         return proj.forge_url
     return PRESETS[proj.forge].default_url if proj.forge in PRESETS else None
+
+
+def _date(v, where: str) -> date:
+    if isinstance(v, date) and not isinstance(v, datetime):
+        return v
+    try:
+        if isinstance(v, str):
+            return date.fromisoformat(v)
+    except ValueError:
+        pass
+    raise RegistryError(f"{where}: дата \"ГГГГ-ММ-ДД\"")
+
+
+def _api(t, warnings: list[str]) -> Api:
+    """[api]: общий выключатель, потолки трат и секции провайдеров. Провайдер — только из словаря в коде."""
+    from .llm.providers import PROVIDERS
+    from .llm.types import TIERS
+    t = _table(t, "[api]")
+    warnings += [unknown_key(f"api.{k}") for k in t if k not in API_KEYS]
+    vals: dict = {}
+    if "enabled" in t:
+        if not isinstance(t["enabled"], bool):
+            raise RegistryError("api.enabled: true или false")
+        vals["enabled"] = t["enabled"]
+    for k in ("max_usd_per_call", "daily_usd"):
+        if k in t:
+            vals[k] = float(_number(t[k], f"api.{k}"))
+    provs: dict[str, ApiProvider] = {}
+    for name, p in _table(t.get("providers", {}), "[api.providers]").items():
+        where = f"[api.providers.{name}]"
+        if name not in PROVIDERS:
+            warnings.append(f"{where}: неизвестный провайдер — пропущен (есть: {', '.join(PROVIDERS)})")
+            continue
+        p = _table(p, where)
+        warnings += [unknown_key(f"api.providers.{name}.{k}") for k in p if k not in API_PROVIDER_KEYS]
+        pv: dict = {}
+        if "included_usd" in p:
+            v = p["included_usd"]
+            if not isinstance(v, (int, float)) or isinstance(v, bool) or v < 0:
+                raise RegistryError(f"{where} included_usd: число ≥ 0")
+            pv["included_usd"] = float(v)
+        if "credits_until" in p:
+            pv["credits_until"] = _date(p["credits_until"], f"{where} credits_until")
+        if "models" in p:
+            m = _table(p["models"], f"{where} models")
+            bad = [k for k in m if k not in TIERS]
+            if bad or not all(isinstance(v, str) and v.strip() for v in m.values()):
+                raise RegistryError(f"{where} models: ключи — {', '.join(TIERS)}, значения — непустые id моделей")
+            pv["models"] = dict(m)
+        if "strong_requires_choice" in p:
+            if not isinstance(p["strong_requires_choice"], bool):
+                raise RegistryError(f"{where} strong_requires_choice: true или false")
+            pv["strong_requires_choice"] = p["strong_requires_choice"]
+        if pv.get("included_usd", 0) > 0 and "credits_until" not in pv:
+            raise RegistryError(f"{where}: при included_usd > 0 нужен credits_until = \"ГГГГ-ММ-ДД\"")
+        provs[name] = ApiProvider(**pv)
+    return Api(present=True, providers=provs, **vals)
+
+
+def _ws_api(name: str, t, warnings: list[str]) -> bool:
+    """[workspace.<имя>.api]: можно ли отправлять файлы проекта в API; по умолчанию — нет."""
+    where = f"[workspace.{name}.api]"
+    t = _table(t, where)
+    warnings += [unknown_key(f"workspace.{name}.api.{k}") for k in t if k not in WS_API_KEYS]
+    v = t.get("enabled", False)
+    if not isinstance(v, bool):
+        raise RegistryError(f"{where} enabled: true или false")
+    return v
 
 
 def _outbox(t, warnings: list[str]) -> Outbox:

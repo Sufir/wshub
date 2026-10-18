@@ -221,6 +221,9 @@ wshub code result <job>   — итог задачи
 wshub code stop <job>|--all     — остановить задачу
 wshub push <remote> <ветка>      — помощник задачи Claude Code: пуш по регламенту проекта (только внутри задачи)
 wshub forge <метод> <путь>       — помощник задачи Claude Code: API хостинга по регламенту (только внутри задачи)
+wshub api key set|check <провайдер>  — ключ API хаба (скрытый ввод, файл 0600) / проверка прав
+wshub api run …           — один запрос к модели через провайдера; --estimate — оценка без запроса
+wshub api stats           — траты API за цикл (оценка); credits / allow — остаток и разрешение купленной зоны
 wshub code-run <job>      — служебная: надзиратель задачи (запускает хаб, вручную не вызывается)
 wshub code-hook <кат>…    — служебная: PreToolUse-хук Bash (ставится в settings.json как python -m wshub.hook)
 wshub --version           — версия и коммит"""
@@ -256,6 +259,9 @@ def main(argv: list[str] | None = None) -> None:
     if cmd in ("code", "code-run", "code-hook", "code-kill"):
         from .code_cli import code_main
         sys.exit(code_main(cmd, rest, config, state))
+    if cmd == "api":  # доступ хаба к моделям по ключу (ТЗ WSH-4.2)
+        from .llm.cli import api_main
+        sys.exit(api_main(rest, config, state))
     print(USAGE, file=sys.stderr)
     sys.exit(2)
 

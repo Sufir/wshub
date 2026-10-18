@@ -101,6 +101,7 @@ uv tool uninstall wshub     # удалить программу
 | [docs/tools.md](docs/tools.md) | инструменты, `publish`, панель, CLI |
 | [docs/registry.md](docs/registry.md) | формат реестра, перевалка, файлы состояния |
 | [docs/code.md](docs/code.md) | запуск Claude Code из чата: реестр `[code]`, шапка, шаблоны, профили, модель безопасности, состояния, CLI |
+| [docs/api.md](docs/api.md) | API хаба по ключу: провайдеры, ключи, зоны кредитов и журнал трат, реестр `[api]`, CLI `wshub api` |
 | [docs/development.md](docs/development.md) | разработка; тесты и CI — только в Docker (`scripts/check.sh`) |
 
 ## Лицензия

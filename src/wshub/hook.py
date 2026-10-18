@@ -20,10 +20,11 @@ sandbox_exclude, которые идут вне песочницы. Отказ, 
    (push, login, save/export), docker build (контекст сборки читает хост), удаление томов (down -v,
    volume rm/prune, system prune), compose-файл с чужим именем (-f), переменные окружения перед docker.
    Сама команда docker — вне песочницы (sandbox_exclude), поэтому этот пол — единственная её граница;
-6. wshub — кроме помощника хаба (ТЗ WSH-3.4, А3): wshub push и wshub forge идут вне песочницы, поэтому
-   разрешены только командой целиком — одно звено, без обёрток, присваиваний, $, обратных кавычек и
-   перенаправлений; wshub push — только в профиле task; --out у помощника — по тем же правилам, что --output
-   у git. Разрешение задачи и регламент проекта проверяет сам помощник, хук держит форму команды.
+6. wshub — кроме помощника хаба (ТЗ WSH-3.4, А3; WSH-3.5): wshub push, wshub forge и wshub gate идут вне
+   песочницы, поэтому разрешены только командой целиком — одно звено, без обёрток, присваиваний, $, обратных
+   кавычек и перенаправлений; wshub push и wshub gate — только в профиле task; у wshub gate — ровно имя гейта
+   и, может быть, --out; --out у помощника — по тем же правилам, что --output у git. Разрешение задачи,
+   регламент и гейты проекта проверяет сам помощник, хук держит форму команды.
 
 Профиль задачи приходит аргументом --profile (task, review, recon, plan). Без него — как у читающего профиля.
 
@@ -124,9 +125,10 @@ GIT_REMOTE_READ_FLAGS = {"-v", "--verbose"}
 GIT_REMOTE_GETURL_FLAGS = {"--push", "--all"}
 # профили, которым можно писать файлы (Edit): task — рабочий каталог, review — только .agents/
 WRITE_PROFILES = {"task", "review"}
-# помощник хаба (ТЗ WSH-3.4, А3): вне песочницы, поэтому только командой целиком
+# помощник хаба (ТЗ WSH-3.4, А3; WSH-3.5 — гейты): вне песочницы, поэтому только командой целиком
 HELPER = "wshub"
-HELPER_SUBS = {"push", "forge"}
+HELPER_SUBS = {"push", "forge", "gate"}
+GATE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")  # имя гейта — как ключ в реестре (WSH-3.5)
 
 CODE_DENY = re.compile(
     r"\bgit\b[^\n;|&]{0,200}?\b(" + "|".join(sorted(GIT_DENY | {"config"})) + r")\b"
@@ -219,8 +221,9 @@ def _check_segment(tokens: list[str], ctx: _Ctx, depth: int) -> None:
         n = _base(tokens[j])
         if n == HELPER:
             if not (ctx.helper and depth == 0 and j == 0):
-                raise _Deny("wshub в задаче — только помощник хаба (wshub push, wshub forge) и только командой "
-                            "целиком: одно звено, без обёрток, присваиваний, $, обратных кавычек и перенаправлений")
+                raise _Deny("wshub в задаче — только помощник хаба (wshub push, wshub forge, wshub gate) и только "
+                            "командой целиком: одно звено, без обёрток, присваиваний, $, обратных кавычек и "
+                            "перенаправлений")
             _check_helper(tokens, ctx)
             return
         if n in NET_TOOLS:
@@ -239,7 +242,7 @@ def _check_segment(tokens: list[str], ctx: _Ctx, depth: int) -> None:
 
 
 def _helper_call(command: str) -> bool:
-    """Вся команда — один вызов помощника хаба: wshub push|forge … Одно звено без обёрток и присваиваний, без $,
+    """Вся команда — один вызов помощника хаба: wshub push|forge|gate … Одно звено без обёрток и присваиваний, без $,
     обратных кавычек, переводов строки, перенаправлений и фона. Помощник идёт вне песочницы (sandbox_exclude), и
     рядом с ним в той же команде не должно быть ничего."""
     if any(c in command for c in "$`\n\r"):
@@ -254,14 +257,37 @@ def _helper_call(command: str) -> bool:
 
 
 def _check_helper(tokens: list[str], ctx: _Ctx) -> None:
-    """Помощник хаба, уже проверенный по форме (_helper_call): профиль для push и путь --out."""
+    """Помощник хаба, уже проверенный по форме (_helper_call): профиль для push и gate, аргументы gate, путь --out."""
     sub = tokens[1]
     if sub == "push" and ctx.profile != "task":
         raise _Deny("wshub push — только в профиле task: пушит задача, которая пишет код")
+    if sub == "gate":
+        _check_gate(tokens[2:], ctx)
+        return
     for idx, t in enumerate(tokens[2:], 2):
         if t == "--out" or t.startswith("--out="):
             val = t.split("=", 1)[1] if "=" in t else (tokens[idx + 1] if idx + 1 < len(tokens) else "")
             _check_write_path(f"wshub {sub} --out", val, ctx)
+
+
+def _check_gate(args: list[str], ctx: _Ctx) -> None:
+    """wshub gate <имя> [--out <файл>] (ТЗ WSH-3.5): гейт запускает код рабочего каталога вне песочницы — только
+    профилю task; ровно имя гейта и, может быть, --out. Есть ли такой гейт в реестре, решает помощник."""
+    if ctx.profile != "task":
+        raise _Deny("wshub gate — только в профиле task: гейт запускает код рабочего каталога вне песочницы")
+    if not args or not GATE_NAME_RE.match(args[0]):
+        raise _Deny("wshub gate <имя> [--out <файл>]: имя гейта — строчная латиница, цифры, «-» и «_», "
+                    "до 40 символов")
+    rest = args[1:]
+    if not rest:
+        return
+    if len(rest) == 1 and rest[0].startswith("--out="):
+        _check_write_path("wshub gate --out", rest[0].split("=", 1)[1], ctx)
+        return
+    if len(rest) == 2 and rest[0] == "--out":
+        _check_write_path("wshub gate --out", rest[1], ctx)
+        return
+    raise _Deny("wshub gate: после имени гейта — только --out <файл>")
 
 
 def _check_write_path(label: str, val: str, ctx: _Ctx) -> None:

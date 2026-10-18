@@ -366,6 +366,14 @@ HELPER_ALLOW = [
     "wshub forge GET projects/1/pipelines --out=out/p.json",
     "wshub forge POST repos/o/r/pulls --data .agents/pr.json",
     f"wshub forge GET x --out {CWD}/p.json",
+    # гейты (ТЗ WSH-3.5): имя и, может быть, --out
+    "wshub gate test-docker",
+    "wshub gate check_py310",
+    "wshub gate 0",
+    "wshub gate check --out .agents/gate.log",
+    "wshub gate check --out=out/gate.log",
+    f"wshub gate check --out {CWD}/gate.log",
+    "/home/u/.local/bin/wshub gate check",
 ]
 
 HELPER_DENY = [
@@ -401,6 +409,39 @@ HELPER_DENY = [
     "wshub forge GET x --out .git/hooks/pre-commit",
     "wshub forge GET x --out ~/p.json",
     "wshub forge GET x --out",
+    # wshub gate: имя гейта, ничего лишнего, форма команды — как у push
+    "wshub gate",
+    "wshub gate Test",
+    "wshub gate -x",
+    "wshub gate --out g.log",
+    "wshub gate ../x",
+    "wshub gate x/y",
+    "wshub gate 'x y'",
+    "wshub gate " + "a" * 41,
+    "wshub gate x y",
+    "wshub gate x -- y",
+    "wshub gate x --data d.json",
+    "wshub gate x --out",
+    "wshub gate x --out=",
+    "wshub gate x --out g.log extra",
+    "wshub gate x --out a.log --out b.log",
+    "wshub gate x --out /tmp/g.log",
+    "wshub gate x --out ../g.log",
+    "wshub gate x --out .git/g.log",
+    "wshub gate x --out ~/g.log",
+    "wshub gate x --out 'g*.log'",
+    "wshub gate x && git status",
+    "git status; wshub gate x",
+    "wshub gate x | tail -50",
+    "wshub gate x 2>&1",
+    "wshub gate x > g.log",
+    "wshub gate x &",
+    "wshub gate $G",
+    "timeout 600 wshub gate x",
+    "env FOO=1 wshub gate x",
+    "FOO=1 wshub gate x",
+    "sh -c 'wshub gate x'",
+    "bash -lc 'wshub gate x'",
 ]
 
 
@@ -419,6 +460,37 @@ def test_helper_deny(cmd):
 def test_helper_push_only_task(profile):
     assert hook.check("wshub push origin feat-x", CWD, DATA, profile) is not None
     assert hook.check("wshub forge GET projects/1", CWD, DATA, profile) is None
+
+
+@pytest.mark.parametrize("profile", ["review", "recon", "plan", None])
+def test_helper_gate_only_task(profile):
+    for cmd in ("wshub gate check", "wshub gate check --out .agents/gate.log"):
+        reason = hook.check(cmd, CWD, DATA, profile)
+        assert reason is not None and "только в профиле task" in reason, (cmd, profile, reason)
+
+
+def test_helper_gate_reasons():
+    assert "имя гейта" in hook.check("wshub gate Test", CWD, DATA, "task")
+    assert "только --out" in hook.check("wshub gate x y", CWD, DATA, "task")
+    assert "внутри рабочего каталога" in hook.check("wshub gate x --out /tmp/g.log", CWD, DATA, "task")
+    assert "wshub gate" in hook.check("wshub code jobs", CWD, DATA, "task")
+
+
+def test_helper_gate_out_symlink_outside(tmp_path):
+    work, out = tmp_path / "work", tmp_path / "out"
+    work.mkdir()
+    out.mkdir()
+    (work / "link").symlink_to(out)
+    assert hook.check("wshub gate x --out link/g.log", str(work), [], "task") is not None
+    assert hook.check("wshub gate x --out g.log", str(work), [], "task") is None
+
+
+def test_main_gate_by_profile():
+    event = {"tool_name": "Bash", "tool_input": {"command": "wshub gate test-docker"}, "cwd": CWD}
+    assert _run(event, argv=["--profile", "task", *map(str, DATA)])[0] == 0
+    assert _run(event, argv=["--profile", "plan", *map(str, DATA)])[0] == 2
+    assert _run(event, argv=["--profile", "review", *map(str, DATA)])[0] == 2
+    assert _run(event)[0] == 2
 
 
 def test_helper_out_by_profile():

@@ -660,8 +660,9 @@ def test_gate_pid_write_failure_kills_gate(code, capsys, monkeypatch):
     assert rc == 1 and "gate.pid не записан" in out.err and "гейт погашен" in out.err and time.time() - t0 < 15
     row = _external(code, jid)[-1]
     assert row["exit"] == 1 and "gate.pid не записан" in row["error"]
-    if marker.exists():
-        pid = int(marker.read_text())
+    text = marker.read_text().strip() if marker.exists() else ""  # sh мог не успеть записать pid до гашения
+    if text:
+        pid = int(text)
         assert _wait(lambda: not os.path.exists(f"/proc/{pid}") or
                      Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[-1].split()[0] == "Z")
 

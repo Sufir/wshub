@@ -610,6 +610,27 @@ def test_gate_record_before_output(code, monkeypatch):
     assert row["args"] == ["fail"] and row["exit"] == 3 and row["log"] == "gates/01-fail.log"
 
 
+def test_gate_record_written_before_output(code, monkeypatch):
+    """Р2: к моменту первой записи в stdout строка учёта гейта уже в external.jsonl (порядок, а не только защита
+    вывода от закрытого канала)."""
+    _gates(code, ok=json.dumps(["sh", "-c", "echo hi"]))
+    jid = _gate_job(code)
+    seen: list[bool] = []
+
+    class Spy:
+        def write(self, s):
+            seen.append(any(r["cmd"] == "gate" and r["args"] == ["ok"] for r in _external(code, jid)))
+            return len(s)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stdout", Spy())
+    rc = helper.main("gate", ["ok"], code.cfg, code.state, environ={**os.environ, "WSHUB_JOB": jid},
+                     cwd=str(code.root))
+    assert rc == 0 and seen and all(seen)
+
+
 def test_gate_closed_stdout_exit_code_kept(code):
     """Р2: отдельный процесс с закрытым stdout — код гейта, а не 120 от сброса буфера при выходе."""
     _gates(code, fail=json.dumps(["sh", "-c", "echo boom; exit 3"]))

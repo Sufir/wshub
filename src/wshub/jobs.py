@@ -1194,7 +1194,8 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
                 (f" (и ещё {len(hidden) - nh})" if len(hidden) > nh else "") if nh else \
                 f"скрыто файлов: {len(hidden)}, список — `sandbox_hidden` в job.json"
             lines.append(f"- Песочница скрывает отслеживаемые файлы: {shown}. В `git status` задачи они выглядят "
-                         "изменёнными — это не правка задачи: не восстанавливай их и не добавляй в коммит.")
+                         "изменёнными — это не правка задачи: не восстанавливай их и не добавляй в коммит. "
+                         "`git add -A` и `git add .` на них падают — добавляй файлы в индекс явными путями.")
         if not lines:
             return ""
         return ("" if not prompt or prompt.endswith("\n") else "\n") + \

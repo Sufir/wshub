@@ -49,7 +49,7 @@ status_regex = '\*\*Статус:\*\*\s*(\S+)'   # как найти стату�
 bash_allow = ["docker compose run --rm migrations"]   # добавка к allow профиля task
 sandbox_exclude = ["docker compose run --rm migrations"]   # команды вне песочницы
 network = []                      # добавка к [code].network
-deny_read = ["~/.config/team-service"] # добавка к [code].deny_read
+deny_read = ["~/.config/team-service"] # добавка к [code].deny_read; относительная маска — от рабочего каталога задачи
 allow_read = []                   # sandbox.filesystem.allowRead сверх рабочего каталога и настроек git
 deny_edit = ["docker-compose*.yml", "Dockerfile*", ".gitlab-ci.yml"]
 claude_md_excludes = []           # claudeMdExcludes
@@ -194,7 +194,7 @@ header. У источника `policy` канала нет. **`choice_fields`** 
 От хаба wshub (добавлено к шаблону):
 - Замечание оператора: <note>
 - Гейты — проверки вне песочницы, только командой `wshub gate <имя>` целиком, Bash с timeout не меньше указанного: test-docker (timeout 660000 мс) — .venv/bin/python -m pytest -m docker. Полный вывод — `--out <файл>`.
-- Песочница скрывает отслеживаемые файлы: .env.example, cfg/.env.local (и ещё 3). В `git status` задачи они выглядят изменёнными — это не правка задачи: не восстанавливай их и не добавляй в коммит.
+- Песочница скрывает отслеживаемые файлы: .env.example, cfg/.env.local (и ещё 3). В `git status` задачи они выглядят изменёнными — это не правка задачи: не восстанавливай их и не добавляй в коммит. `git add -A` и `git add .` на них падают — добавляй файлы в индекс явными путями.
 ```
 
 - замечание — `note`, если в шаблоне нет `{note}` (с `{note}` оно подставляется и в блоке не повторяется);
@@ -272,9 +272,12 @@ header. У источника `policy` канала нет. **`choice_fields`** 
 
 1. **Правила permissions.** Файловые инструменты — только с путём от рабочего каталога (`Read(./**)` и
    нужный `Edit(...)`); голых правил без пути нет. Для каждого пути из `deny_read` и каждого служебного
-   каталога wshub — deny `Read` и `Edit`. deny всех профилей: `git push`, `git clean`, `git remote` с
-   `add`, `set-url`, `remove`, `rm`, `rename`, `prune`, `update`, `set-head`, `set-branches`, `show`, `ssh`, `scp`,
-   `sudo`, `curl`, `wget`, `Read(**/.env*)`, `WebFetch`, `WebSearch`, маски `deny_edit`.
+   каталога wshub — deny `Read` и `Edit`. Относительная маска `deny_read` (`[code]` и проекта) считается от
+   рабочего каталога задачи и идёт абсолютным путём — и в эти правила, и в `denyRead` песочницы: сырую
+   относительную строку песочница не применяет (стенд WSH-3.5). `..` в относительной маске — ошибка реестра.
+   deny всех профилей: `git push`, `git clean`, `git remote` с `add`, `set-url`, `remove`, `rm`, `rename`,
+   `prune`, `update`, `set-head`, `set-branches`, `show`, `ssh`, `scp`, `sudo`, `curl`, `wget`, `Read(**/.env*)`,
+   `WebFetch`, `WebSearch`, маски `deny_edit`.
 2. **Песочница** (`sandbox`, нужны bwrap и socat). Включена, `failIfUnavailable: true`,
    `allowUnsandboxedCommands: false`, `autoAllowBashIfSandboxed: false` — Bash идёт только по allow-правилам.
    Сеть — только `network`. Чтение сужено: `denyRead` включает `~/` и `/mnt/`, `allowRead` открывает рабочий
@@ -522,8 +525,9 @@ wshub forge <GET|POST|PUT|PATCH> <путь> [--data <json-файл>] [--out <ф�
   песочницы и повторяет её запреты сам. Файл открывается по цепочке каталогов от рабочего каталога задачи
   (`O_DIRECTORY | O_NOFOLLOW` на каждом, файл — `O_NOFOLLOW`): каталог, подменённый на симлинк после
   проверки, — отказ. Файл `--out` — только обычный: FIFO, устройство — отказ «не обычный файл» (открытие с
-  `O_NONBLOCK` и проверка `fstat`, FIFO без читателя помощника не повесит). `--data` — JSON-файл до 1 МБ, тоже внутри рабочего каталога, по правилам чтения
-  песочницы: не `.env*` и не по маскам `deny_read` проекта и `[code]` (относительные — от рабочего каталога).
+  `O_NONBLOCK` и проверка `fstat`, FIFO без читателя помощника не повесит). Файл открывается до HTTP-запроса:
+  отказ по `--out` не приходит после выполненной записи в API. `--data` — JSON-файл до 1 МБ, тоже внутри
+  рабочего каталога, по правилам чтения песочницы: не `.env*` и не по маскам `deny_read` проекта и `[code]` (относительные — от рабочего каталога).
   Ответ 4xx/5xx — код и тело в stderr, код выхода 1;
 - `urllib` из стандартной библиотеки, без прокси из окружения, таймаут 30 с.
 

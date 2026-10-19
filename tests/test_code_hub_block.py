@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 from test_code import git, make_code, wait_terminal
@@ -164,7 +165,7 @@ def test_hidden_tracked_files(code):
     assert _block(p.prompt) == (
         "- Песочница скрывает отслеживаемые файлы: .env.example, a/.env.local, cfg/x.ini, secret/key.txt. В `git "
         "status` задачи они выглядят изменёнными — это не правка задачи: не восстанавливай их и не добавляй в "
-        "коммит.\n")
+        "коммит. `git add -A` и `git add .` на них падают — добавляй файлы в индекс явными путями.\n")
     d = code.jobs.start(p)
     assert d["sandbox_hidden"] == p.sandbox_hidden and code.jobs.read(d["id"])["sandbox_hidden"] == p.sandbox_hidden
     wait_terminal(code.jobs, d["id"])
@@ -277,7 +278,8 @@ def test_block_drops_paths_before_cutting_tail():
     assert len(block.encode("utf-8")) <= jobs_mod.HUB_BLOCK_MAX
     assert "скрыто файлов: 1, список — `sandbox_hidden` в job.json" in block
     assert "\N{GRINNING FACE}" not in block and not block.endswith("…\n")
-    assert block.endswith("не восстанавливай их и не добавляй в коммит.\n")
+    assert block.endswith("не добавляй в коммит. `git add -A` и `git add .` на них падают — добавляй файлы в "
+                          "индекс явными путями.\n")
     assert "- Замечание оператора: " + "н" * 300 in block and "g" * 40 in block
 
 
@@ -286,7 +288,8 @@ def test_block_long_path_clipped():
     block = jobs_mod.hub_block(None, (), None, ["d/" + "z" * 5000], "p\n")
     path = block.split("файлы: ", 1)[1].split(". В `git", 1)[0]
     assert len(path) == jobs_mod.HUB_BLOCK_PATH and path.endswith("…")
-    assert block.endswith("не восстанавливай их и не добавляй в коммит.\n")
+    assert block.endswith("не добавляй в коммит. `git add -A` и `git add .` на них падают — добавляй файлы в "
+                          "индекс явными путями.\n")
 
 
 def test_block_whitespace_note_no_line(code):
@@ -302,6 +305,46 @@ def test_hidden_tilde_mask_inside_workdir(code, monkeypatch):
     monkeypatch.setenv("HOME", str(code.root.parent))
     p = code.jobs.plan("proj", code.taskfile())
     assert p.sandbox_hidden == ["conf/key.txt"]
+
+
+def _settings(glob_deny=(), proj_deny=()):
+    from wshub.registry import CodeGlobal, ProjectCode
+    return claude_cli.settings("task", "T.md", CodeGlobal(deny_read=glob_deny), ProjectCode(deny_read=proj_deny), [],
+                               [], ["/w"], Path("/home/u"), Path("/d"))
+
+
+def test_relative_deny_read_absolute_in_settings():
+    """Р19: относительная маска [code] и проекта — абсолютным путём от рабочего каталога и в denyRead песочницы, и в
+    правилах Read/Edit; сырой строки нет (стенд С6: сырую относительную песочница не применяет)."""
+    s = _settings(("secret",), ("cfg/*.key", "./a/b/../c"))
+    deny_read, deny = s["sandbox"]["filesystem"]["denyRead"], s["permissions"]["deny"]
+    for raw, ab in (("secret", "/d/secret"), ("cfg/*.key", "/d/cfg/*.key"), ("./a/b/../c", "/d/a/c")):
+        assert ab in deny_read and raw not in deny_read
+        for r in (f"Read(/{ab})", f"Edit(/{ab})", f"Read(/{ab}/**)", f"Edit(/{ab}/**)"):
+            assert r in deny
+
+
+def test_tilde_and_absolute_deny_read_unchanged():
+    """Р19: маски ~/ и абсолютные — как раньше: в denyRead как записаны, в правилах — с раскрытым ~."""
+    s = _settings(("~/.ssh",), ("/srv/keys",))
+    deny_read, deny = s["sandbox"]["filesystem"]["denyRead"], s["permissions"]["deny"]
+    assert "~/.ssh" in deny_read and "/srv/keys" in deny_read
+    assert "Read(//home/u/.ssh/**)" in deny and "Edit(//srv/keys)" in deny
+
+
+@pytest.mark.parametrize("where", ["code", "proj"])
+@pytest.mark.parametrize("mask", ["../x", "a/../../x", "a/.."])
+def test_relative_deny_read_dotdot_refused(code, where, mask):
+    """Р19: относительная маска с «..» — ошибка секции; у проекта отказывает только он."""
+    from wshub.registry import parse
+    text = code.cfg.read_text()
+    if where == "code":
+        text = text.replace("[code]\n", f'[code]\ndeny_read = ["{mask}"]\n')
+        assert "code.deny_read" in parse(text).code.error and "«..» в ней нельзя" in parse(text).code.error
+    else:
+        text += f'deny_read = ["{mask}"]\n'
+        c = parse(text).code
+        assert "proj" not in c.projects and "«..» в ней нельзя" in c.project_errors["proj"]
 
 
 # ---------- П4. plan = auto ----------

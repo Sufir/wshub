@@ -246,6 +246,16 @@ def _str_list(v, where: str) -> tuple[str, ...]:
     return tuple(v)
 
 
+def _deny_read(v, where: str) -> tuple[str, ...]:
+    """deny_read: относительная маска считается от рабочего каталога задачи — без «..» (ТЗ WSH-3.5, Р19)."""
+    out = _str_list(v, where)
+    for m in out:
+        if not (m == "~" or m.startswith(("~/", "/"))) and ".." in m.split("/"):
+            raise RegistryError(f"{where}: {m!r} — относительная маска считается от рабочего каталога задачи, "
+                                "«..» в ней нельзя")
+    return out
+
+
 def unknown_key(name: str) -> str:
     return f"неизвестный ключ {name} — пропущен"
 
@@ -369,7 +379,7 @@ def _code(t, warnings: list[str]) -> CodeGlobal:
         vals["notify"] = t["notify"]
     for k in ("network", "deny_read"):
         if k in t:
-            vals[k] = _str_list(t[k], f"code.{k}")
+            vals[k] = (_deny_read if k == "deny_read" else _str_list)(t[k], f"code.{k}")
     if "pass_env" in t:
         names = _str_list(t["pass_env"], "code.pass_env")
         for n in names:
@@ -462,7 +472,7 @@ def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
         vals["status_regex"] = rx
     for k in WS_CODE_LISTS:
         if k in t:
-            vals[k] = _str_list(t[k], f"{where} {k}")
+            vals[k] = (_deny_read if k == "deny_read" else _str_list)(t[k], f"{where} {k}")
     for e in vals.get("read_extra", ()):
         _rel_path(e, f"{where} read_extra")
         if ".." in Path(e).parts or READ_EXTRA_BAD.search(e):

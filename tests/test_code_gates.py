@@ -824,6 +824,27 @@ def test_out_fifo_refused(code, capsys):
     assert (code.root / "f.log").read_text() == ""
 
 
+
+def test_out_fstat_refuses_fifo_swapped_after_stat(code, monkeypatch):
+    """Мелочь 1 круга 3: файл подменён на FIFO с читателем после предварительного stat — отказ даёт fstat. Подмена
+    stat прячет FIFO от предварительной проверки: мутация «убрать только fstat» краснит."""
+    fifo = code.root / "o.fifo"
+    os.mkfifo(fifo)
+    real = os.stat
+
+    def stat_before_swap(path, *a, **kw):
+        if path == "o.fifo" and kw.get("dir_fd") is not None:
+            raise FileNotFoundError(2, "ещё нет")  # предварительная проверка видела «нового» файла
+        return real(path, *a, **kw)
+
+    monkeypatch.setattr(os, "stat", stat_before_swap)
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+    try:
+        with pytest.raises(OSError, match="не обычный файл"):
+            helper.open_out(code.root, "o.fifo")
+    finally:
+        os.close(reader)
+
 def test_refuse_records_before_closed_stderr(code, monkeypatch):
     """Р15: отказ — сначала строка учёта, потом stderr; закрытый stderr не теряет учёт и не меняет код."""
     _gates(code, ok='"true"')
@@ -835,6 +856,52 @@ def test_refuse_records_before_closed_stderr(code, monkeypatch):
     row = _external(code, jid)[-1]
     assert row["args"] == ["nope"] and row["exit"] == 1 and "нет в реестре" in row["error"]
 
+
+
+def test_refuse_record_written_before_stderr(code, monkeypatch):
+    """Находка 7 круга 3: к первой записи в stderr отказа строка учёта уже в external.jsonl — порядок, а не только
+    защита вывода."""
+    _gates(code, ok='"true"')
+    jid = _gate_job(code)
+    seen: list[bool] = []
+
+    class Spy:
+        def write(self, s):
+            seen.append(any(r["cmd"] == "gate" and r["args"] == ["nope"] for r in _external(code, jid)))
+            return len(s)
+
+        def flush(self):
+            pass
+
+    monkeypatch.setattr(sys, "stderr", Spy())
+    rc = helper.main("gate", ["nope"], code.cfg, code.state, environ={**os.environ, "WSHUB_JOB": jid},
+                     cwd=str(code.root))
+    assert rc == 1 and seen and all(seen)
+
+
+def test_gate_exception_after_pidfile_kills_gate(code, monkeypatch):
+    """Находка 8 круга 3: исключение после записи gate.pid и .holder (здесь — из _job_running) гасит группу гейта,
+    gate.pid удалён."""
+    _gates(code, slow='{ cmd = ["sh", "-c", "sleep 100 & sleep 100"], timeout_s = 60 }')
+    jid = _gate_job(code)
+    pidf = code.jobs.job_dir(jid) / jobs_mod.GATE_PID
+    groups: list[int] = []
+
+    def broken(_ctx):
+        groups.append(json.loads(pidf.read_text())["pgid"])
+        assert read_json(_holder(code))["pgid"] == groups[0]
+        raise RuntimeError("сбой чтения job.json")
+
+    monkeypatch.setattr(helper, "_job_running", broken)
+    try:
+        with pytest.raises(RuntimeError, match="сбой чтения job.json"):
+            helper.main("gate", ["slow"], code.cfg, code.state, environ={**os.environ, "WSHUB_JOB": jid},
+                        cwd=str(code.root))
+        assert len(groups) == 1 and _wait(lambda: not _group_live(groups[0]))
+        assert not pidf.exists()
+    finally:
+        if groups and _group_live(groups[0]):
+            os.killpg(groups[0], signal.SIGKILL)
 
 def test_gate_signal_when_gate_already_exited(code, capsys, monkeypatch):
     """Р18: гейт вышел между ожиданием и проверкой сигнала, а сигнал уже пришёл — итог — код гейта, а не 130.

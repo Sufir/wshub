@@ -409,6 +409,7 @@ def forge(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
     from .forges import PRESETS
     shown = list(args)
     token = None
+    out_fd = None
     try:
         check(ctx, cwd, "forge")
         method, raw, data_arg, out_arg = _parse_forge(args)
@@ -457,21 +458,29 @@ def forge(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
         req = urllib.request.Request(base + url_path, data=body, method=method,
                                      headers={**preset.headers(token), "User-Agent": "wshub-forge",
                                               **({"Content-Type": "application/json"} if body is not None else {})})
+        if out_path is not None:  # файл — до запроса: отказ по --out не должен прийти после выполненной записи в API
+            try:
+                out_fd = open_out(ctx.dir, os.path.relpath(out_path, os.path.normpath(str(ctx.dir))))
+            except OSError as e:
+                raise HelperError(f"--out {out_arg}: не записан ({e.strerror})") from None
         status, payload = _send(req)
     except HelperError as e:
+        if out_fd is not None:
+            os.close(out_fd)
         return _refuse(ctx, "forge", shown, redact(str(e), token))
     text = redact(payload.decode("utf-8", "replace"), token)
     data = text.encode("utf-8")
     link = _link(text) if method in WRITE_METHODS else None
     extra = {"status": status}
     if status >= 400:
+        if out_fd is not None:
+            os.close(out_fd)
         sys.stderr.write(f"wshub forge: HTTP {status}\n{_clip(text)}\n")
         ctx.record("forge", shown, 1, None, f"HTTP {status}", extra)
         return 1
-    if out_path is not None:
+    if out_fd is not None:
         try:
-            fd = open_out(ctx.dir, os.path.relpath(out_path, os.path.normpath(str(ctx.dir))))
-            with os.fdopen(fd, "wb") as fh:
+            with os.fdopen(out_fd, "wb") as fh:
                 fh.write(data)
         except OSError as e:
             return _refuse(ctx, "forge", shown, f"--out {out_arg}: не записан ({e.strerror})")

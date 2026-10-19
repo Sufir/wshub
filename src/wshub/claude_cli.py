@@ -77,14 +77,21 @@ def _abs_rule(p: str) -> str:
     return "/" + p if p.startswith("/") else p  # «//путь» — абсолютный путь в правилах Claude Code
 
 
-def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home: Path) -> list[str]:
-    """Абсолютные пути, закрытые для встроенных файловых инструментов: deny_read (с раскрытым ~) и служебные
-    каталоги wshub. Симлинк даёт два пути: как записан и куда ведёт."""
+def deny_read_abs(mask: str, cwd: Path) -> str:
+    """Относительная маска deny_read — абсолютным путём от рабочего каталога задачи: сырую относительную строку
+    песочница не применяет (стенд ТЗ WSH-3.5, С6). ~ и абсолютные — как есть."""
+    if mask == "~" or mask.startswith("~/") or os.path.isabs(mask):
+        return mask
+    return os.path.normpath(os.path.join(cwd, mask))
+
+
+def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home: Path, cwd: Path) -> list[str]:
+    """Абсолютные пути, закрытые для встроенных файловых инструментов: deny_read (с раскрытым ~, относительные — от
+    рабочего каталога) и служебные каталоги wshub. Симлинк даёт два пути: как записан и куда ведёт."""
     out: list[str] = []
     for raw in (*glob.deny_read, *proj.deny_read):
+        raw = deny_read_abs(raw, cwd)
         p = Path(str(home) + raw[1:]) if raw == "~" or raw.startswith("~/") else Path(raw)
-        if not p.is_absolute():
-            continue  # относительные deny_read — только для песочницы (Bash)
         for q in (Path(os.path.normpath(p)), p.resolve()):
             if str(q) not in out:
                 out.append(str(q))
@@ -121,7 +128,7 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
             *(f"Edit({m})" for m in proj.deny_edit),
             *(f"Edit(./{g}{'' if g.endswith('config') else '/**'})" for g in GIT_PROTECTED),
             *(f"Edit(./{s})" for s in CLAUDE_SETTINGS)]
-    for p in deny_paths(glob, proj, protected, home):
+    for p in deny_paths(glob, proj, protected, home, cwd):
         r = _abs_rule(p)
         deny += [f"Read({r})", f"Edit({r})", f"Read({r}/**)", f"Edit({r}/**)"]
     data: dict = {
@@ -138,7 +145,8 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
             "filesystem": {
                 # служебные каталоги wshub — абсолютными путями тоже: при нестандартном WSHUB_STATE/CONFIG
                 # вне ~ и /mnt их бы не закрыли ни ~/, ни /mnt/ (чтение через Bash в песочнице)
-                "denyRead": list(dict.fromkeys([*glob.deny_read, *proj.deny_read, *SANDBOX_DENY_READ,
+                "denyRead": list(dict.fromkeys([*(deny_read_abs(m, cwd) for m in (*glob.deny_read, *proj.deny_read)),
+                                                *SANDBOX_DENY_READ,
                                                 *(str(p) for p in protected)])),
                 "allowRead": list(dict.fromkeys([str(cwd), *SANDBOX_ALLOW_READ, *proj.allow_read])),
                 # у всех профилей — только исполняемая часть git (ТЗ WSH-3.1): весь cwd в denyWrite не даёт bwrap

@@ -877,6 +877,17 @@ def test_forge_out_parent_symlink_race(code, tmp_path, api, capsys, monkeypatch)
     assert rc == 1 and "не записан" in out.err and not (outside / "x.json").exists()
 
 
+
+def test_forge_out_checked_before_request(code, tmp_path, api, capsys):
+    """Мелочь 2 круга 3: --out открывается до HTTP-запроса — POST с --out в FIFO отказывает, а запрос не уходит."""
+    jid = _forge_code(code, tmp_path, api, "github")
+    (code.root / "body.json").write_text('{"title": "t"}')
+    os.mkfifo(code.root / "o.fifo")
+    rc, out = _helper(code, "forge", ["POST", "/repos/o/r/pulls", "--data", "body.json", "--out", "o.fifo"], jid,
+                      capsys=capsys)
+    assert rc == 1 and "не обычный файл" in out.err and api.requests == []
+    assert _external(code, jid)[-1]["exit"] == 1
+
 def test_open_out_chain(tmp_path):
     top = tmp_path / "w"
     (top / "a" / "b").mkdir(parents=True)

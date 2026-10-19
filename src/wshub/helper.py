@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import gitsafe
-from .jobs import GATE_PID, SANDBOX_MOUNTS, deny_read_hit, gate_group_alive, stop_gate_group
+from .jobs import GATE_PID, SANDBOX_MOUNTS, deny_read_hit, gate_group_alive, kill_gate_group, stop_gate_group
 from .registry import forge_url
 from .runtime import atomic_write_text, proc_start, read_json
 
@@ -553,11 +553,15 @@ def _gate_argv(ctx: Ctx, g, env: dict) -> list[str]:
     return [exe, *g.cmd[1:]]
 
 
-def _gate_lock(ctx: Ctx, name: str) -> int:
-    """Один гейт на проект за раз (Г3.2): неблокирующий flock в каталоге состояния хаба; кто держит — в файле рядом."""
+def _gate_lock(ctx: Ctx, name: str) -> tuple[int, Path, dict | None]:
+    """Один гейт на проект за раз (Г3.2): неблокирующий flock в каталоге состояния хаба; кто держит — в файле рядом
+    (.holder: задача, гейт, помощник и группа гейта). Лок взят, а в .holder — живая группа гейта (защита proc_start):
+    прежний помощник умер, не погасив гейт, — у сироты нет ни таймаута, ни учёта, её гасим (круг 2, Р1). Ответ —
+    (fd лока, путь .holder, {job, gate} погашенной сироты или None)."""
     import fcntl
     d = ctx.hub.state_dir / "code" / "gates"
     proj = ctx.d["project"]
+    holder = d / f"{proj}.holder"
     try:
         d.mkdir(parents=True, exist_ok=True)
         fd = os.open(d / f"{proj}.lock", os.O_RDWR | os.O_CREAT, 0o600)
@@ -567,13 +571,19 @@ def _gate_lock(ctx: Ctx, name: str) -> int:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         os.close(fd)
-        h = read_json(d / f"{proj}.holder")
+        h = read_json(holder)
         raise HelperError(f"у проекта уже идёт гейт {h.get('gate', '?')} задачи {h.get('job', '?')}") from None
+    old = read_json(holder)
+    orphan = {"job": old.get("job"), "gate": old.get("gate")} if old and kill_gate_group(old) else None
+    _write_holder(holder, {"job": ctx.jid, "gate": name, "helper": os.getpid()})
+    return fd, holder, orphan
+
+
+def _write_holder(holder: Path, data: dict) -> None:
     try:
-        atomic_write_text(d / f"{proj}.holder", json.dumps({"job": ctx.jid, "gate": name, "pid": os.getpid()}))
+        atomic_write_text(holder, json.dumps(data))
     except OSError:
-        pass  # держатель — для текста отказа второму гейту; лок уже наш
-    return fd
+        pass  # держатель — для текста отказа второму гейту и поиска сироты; лок уже наш
 
 
 def _gate_log(jdir: Path, name: str) -> tuple[int, str]:
@@ -591,7 +601,9 @@ def _gate_log(jdir: Path, name: str) -> tuple[int, str]:
 
 class _GateSink:
     """Вывод гейта (Г3.6): в лог и --out — не больше GATE_LOG_MAX байт, дальше только счёт обрезанного; хвост — для
-    stdout помощника."""
+    stdout помощника. Запись и close — под одним локом: потомок в своём сеансе может держать канал дольше GATE_JOIN,
+    и после close читатель только дочитывает канал — иначе он писал бы в номер fd, уже отданный другому файлу
+    (круг 2, Р4)."""
 
     def __init__(self, fds: list[int]):
         self.all = list(fds)
@@ -599,17 +611,22 @@ class _GateSink:
         self.written = 0
         self.dropped = 0
         self.tail = bytearray()
+        self.lock = threading.Lock()
+        self.closed = False
 
     def pump(self, stream) -> None:
         for chunk in iter(lambda: stream.read1(65536), b""):
-            room = max(GATE_LOG_MAX - self.written, 0)
-            part = chunk[:room]
-            if part:
-                self._write(part)
-                self.written += len(part)
-            self.dropped += len(chunk) - len(part)
-            self.tail += chunk
-            del self.tail[:-4 * GATE_TAIL]  # до 4 байт UTF-8 на символ
+            with self.lock:
+                if self.closed:
+                    continue
+                room = max(GATE_LOG_MAX - self.written, 0)
+                part = chunk[:room]
+                if part:
+                    self._write(part)
+                    self.written += len(part)
+                self.dropped += len(chunk) - len(part)
+                self.tail += chunk
+                del self.tail[:-4 * GATE_TAIL]  # до 4 байт UTF-8 на символ
 
     def _write(self, data: bytes) -> None:
         for fd in list(self.fds):
@@ -621,15 +638,20 @@ class _GateSink:
                 self.fds.remove(fd)  # диск полон и т. п.: гейт идёт дальше, файл остаётся как есть
 
     def close(self) -> None:
-        if self.dropped:
-            self._write(f"\n… обрезано: {self.dropped} байт\n".encode())
-        for fd in self.all:
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        self.all = self.fds = []
+        with self.lock:
+            if self.closed:
+                return
+            self.closed = True
+            if self.dropped:
+                self._write(f"\n… обрезано: {self.dropped} байт\n".encode())
+            for fd in self.all:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
+            self.all = self.fds = []
 
     def tail_text(self) -> str:
-        return self.tail.decode("utf-8", "replace")[-GATE_TAIL:]
+        with self.lock:
+            return self.tail.decode("utf-8", "replace")[-GATE_TAIL:]
 
 
 def gate(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
@@ -647,18 +669,43 @@ def gate(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
         out_path = _work_file(ctx, cwd, out_arg, "--out") if out_arg is not None else None
         env = _gate_env(ctx)
         argv = _gate_argv(ctx, g, env)
-        lock = _gate_lock(ctx, name)
+        lock, holder, orphan = _gate_lock(ctx, name)
     except HelperError as e:
         return _refuse(ctx, "gate", shown, str(e))
     try:
-        return _run_gate(ctx, g, argv, env, out_path, out_arg, shown)
+        if orphan:
+            _say(f"погашен осиротевший гейт {orphan['gate']} задачи {orphan['job']}\n")
+        return _run_gate(ctx, g, argv, env, out_path, out_arg, shown, holder, orphan)
     finally:
+        _write_holder(holder, {"job": ctx.jid, "gate": name, "helper": os.getpid()})  # гейт кончился — группы нет
         os.close(lock)
 
 
+def _say(text: str) -> None:
+    """stdout помощника: канал закрыт (claude вышел, задачу остановили) — не ошибка, код гейта важнее (круг 2, Р2).
+    Закрытый stdout подменяем /dev/null: иначе сброс буфера при выходе сменил бы код процесса на 120."""
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except OSError:
+        with contextlib.suppress(OSError, ValueError, AttributeError):
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+            os.close(devnull)
+
+
+def _job_running(ctx: Ctx) -> bool:
+    from .jobs import JobError
+    try:
+        return ctx.jobs.effective_state(ctx.jobs.read(ctx.jid)) == "running"
+    except JobError:
+        return False
+
+
 def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, out_arg: str | None,
-              shown: list[str]) -> int:
+              shown: list[str], holder: Path, orphan: dict | None) -> int:
     jdir = ctx.jobs.job_dir(ctx.jid)
+    base = {"orphan_killed": orphan} if orphan else {}
     fds: list[int] = []
     try:
         log_fd, log_rel = _gate_log(jdir, g.name)
@@ -669,7 +716,7 @@ def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, ou
         for fd in fds:
             os.close(fd)
         what = f"--out {out_arg}" if fds else "лог гейта"
-        return _refuse(ctx, "gate", shown, f"{what}: не открывается ({e.strerror or e})")
+        return _refuse(ctx, "gate", shown, f"{what}: не открывается ({e.strerror or e})", base)
     stop: list[int] = []
     old = {s: signal.signal(s, lambda signum, _frame: stop.append(signum)) for s in GATE_SIGNALS}
     sink = _GateSink(fds)
@@ -681,50 +728,66 @@ def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, ou
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
         except OSError as e:
             sink.close()
-            return _refuse(ctx, "gate", shown, f"гейт {g.name} не запустился: {e}")
+            return _refuse(ctx, "gate", shown, f"гейт {g.name} не запустился: {e}", base)
         pgid = proc.pid  # свой сеанс: группа — по pid лидера
-        atomic_write_text(pidfile, json.dumps({"pid": proc.pid, "pgid": pgid, "proc_start": proc_start(proc.pid)}))
+        group = {"pid": proc.pid, "pgid": pgid, "proc_start": proc_start(proc.pid)}
         reader = threading.Thread(target=sink.pump, args=(proc.stdout,), daemon=True)
         reader.start()
+
+        def alive() -> bool:
+            return proc.poll() is None or gate_group_alive(pgid)
+
+        try:
+            atomic_write_text(pidfile, json.dumps(group))
+        except OSError as e:  # без gate.pid остановка задачи гейт не найдёт — гасим и отказываем (круг 2, Р6)
+            stop_gate_group(pgid, alive)
+            proc.wait()
+            reader.join(GATE_JOIN)
+            sink.close()
+            return _refuse(ctx, "gate", shown, f"gate.pid не записан ({e.strerror or e}) — гейт погашен", base)
+        _write_holder(holder, {"job": ctx.jid, "gate": g.name, "helper": os.getpid(), **group})  # для сироты (Р1)
+        # отмена пришла между check() и запуском: надзиратель уже искал gate.pid и не нашёл (Р6) — как сигнал
+        interrupted = None if _job_running(ctx) else "signal"
         deadline = t0 + g.timeout_s
-        timed_out = False
-        while True:
+        while interrupted is None:
             try:
                 proc.wait(timeout=0.2)
                 break
             except subprocess.TimeoutExpired:
                 pass
-            if stop or time.monotonic() >= deadline:
-                timed_out = not stop
-                stop_gate_group(pgid, lambda: proc.poll() is None or gate_group_alive(pgid))
-                proc.wait()
-                break
+            if stop:
+                interrupted = "signal"
+            elif time.monotonic() >= deadline:
+                interrupted = "timeout"
+        if interrupted:
+            stop_gate_group(pgid, alive)  # сигнал во время лестницы итог не меняет; после выхода гейта — тоже (Р10)
+            proc.wait()
         if gate_group_alive(pgid):  # лидер вышел, а его фоновые потомки ещё идут — не переживут гейт
             stop_gate_group(pgid)
         reader.join(GATE_JOIN)
         sink.close()
+        duration = round(time.monotonic() - t0)
+        rc = proc.returncode
+        code = 130 if interrupted == "signal" else 124 if interrupted == "timeout" else (128 - rc if rc < 0 else rc)
+        why = {"timeout": f"прерван: timeout_s = {g.timeout_s}", "signal": "прерван сигналом"}.get(interrupted)
+        # учёт — до вывода: после отмены канал stdout бывает закрыт; обработчики сигналов — до конца записи (Р2)
+        ctx.record("gate", shown, code, None, None if code == 0 else why or f"гейт вернул {code}",
+                   {"duration_s": duration, "timeout": interrupted == "timeout", "log": log_rel, **base})
     finally:
         for s, h in old.items():
             signal.signal(s, h)
         with contextlib.suppress(OSError):
             pidfile.unlink()
-    duration = round(time.monotonic() - t0)
-    rc = proc.returncode
-    code = 130 if stop else 124 if timed_out else (128 - rc if rc < 0 else rc)
-    why = f"прерван: timeout_s = {g.timeout_s}" if timed_out else "прерван сигналом" if stop else None
     tail = sink.tail_text()
-    sys.stdout.write(tail + ("" if not tail or tail.endswith("\n") else "\n"))
-    print(f"wshub gate {g.name}: код {code}" + (f" · {why}" if why else "") + f" · {duration} с · полный вывод: "
-          + (out_arg if out_arg is not None else "--out <файл>"))
-    sys.stdout.flush()
-    ctx.record("gate", shown, code, None, None if code == 0 else why or f"гейт вернул {code}",
-               {"duration_s": duration, "timeout": timed_out, "log": log_rel})
+    _say(tail + ("" if not tail or tail.endswith("\n") else "\n") + f"wshub gate {g.name}: код {code}"
+         + (f" · {why}" if why else "") + f" · {duration} с · полный вывод: "
+         + (out_arg if out_arg is not None else "--out <файл>") + "\n")
     return code
 
 
-def _refuse(ctx: Ctx, cmd: str, shown: list[str], reason: str) -> int:
+def _refuse(ctx: Ctx, cmd: str, shown: list[str], reason: str, extra: dict | None = None) -> int:
     print(f"wshub {cmd}: отказ: {reason}", file=sys.stderr)
-    ctx.record(cmd, shown, 1, None, reason)
+    ctx.record(cmd, shown, 1, None, reason, extra)
     return 1
 
 

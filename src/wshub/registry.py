@@ -57,6 +57,7 @@ GATE_TIMEOUT = 600
 GATE_TIMEOUT_MAX = 3600
 GATE_SHELL = ("гейт — одна команда без оболочки: конвейеры, перенаправления и подстановки не работают; нужна цепочка — "
               "скрипт в репозитории или cmd списком")
+GATE_TILDE = "cmd[0]: ~ и $ не раскрываются — гейт идёт без оболочки; укажи абсолютный путь"
 # регламент пуша и API хостинга (ТЗ WSH-3.4, А1): no — закрыто, task — по разрешению задачи, always — всем
 GRANT_MODES = ("no", "task", "always")
 FORGE_URL_RE = re.compile(r"^(https://[^/\s?#@]+|http://(127\.0\.0\.1|localhost|\[::1\])(:\d+)?)(/[^\s?#]*)?$")
@@ -566,6 +567,8 @@ def _gates(name: str, t, warnings: list[str]) -> tuple[Gate, ...]:
                 ops = [x for x in lex if x and all(c in "();<>|&" for c in x)]
             except ValueError as e:
                 raise RegistryError(f"{w} cmd: строка не разбирается ({e})") from None
+            if cmd and (cmd[0].startswith("~") or "$" in cmd[0]):
+                raise RegistryError(f"{w} cmd: {GATE_TILDE}")
             if ops or any(c in x for x in cmd for c in "$`"):
                 raise RegistryError(f"{w} cmd: {GATE_SHELL}")
         elif isinstance(v, list) and all(isinstance(x, str) and x and "\x00" not in x for x in v):
@@ -574,6 +577,8 @@ def _gates(name: str, t, warnings: list[str]) -> tuple[Gate, ...]:
             raise RegistryError(f"{w} cmd: строка или список непустых строк без NUL")
         if not cmd or not cmd[0]:
             raise RegistryError(f"{w} cmd: пустая команда")
+        if cmd[0].startswith("~") or "$" in cmd[0]:  # иначе «~/x» — путь от рабочего каталога задачи (круг 2, Р5)
+            raise RegistryError(f"{w} cmd: {GATE_TILDE}")
         if not cmd[0].startswith("/") and "/" in cmd[0] and ".." in cmd[0].split("/"):
             raise RegistryError(f"{w} cmd: {cmd[0]!r} — относительный путь от рабочего каталога задачи без «..»")
         out.append(Gate(g, tuple(cmd), timeout))

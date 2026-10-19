@@ -37,11 +37,19 @@ def code_main(cmd: str, rest: list[str], config: Path, state: Path) -> int:
         from .runner import run_job
         return run_job(Hub(config, state), rest[0])
     if cmd == "code-kill":  # служебная: гашение группы Code осиротевшей задачи (из code_cancel)
-        if len(rest) != 1:
-            print("wshub code-kill <job> — служебная команда", file=sys.stderr)
+        if len(rest) not in (1, 2) or rest[1:] not in ([], ["--gate"]):
+            print("wshub code-kill <job> [--gate] — служебная команда", file=sys.stderr)
             return 2
-        from .jobs import Jobs
-        Jobs(Hub(config, state)).kill_orphaned(rest[0])
+        from .helper import JOB_RE
+        from .jobs import Jobs, kill_gate
+        jobs = Jobs(Hub(config, state))
+        if rest[1:] == ["--gate"]:  # только гейт конечного звена, состояние не меняется (ТЗ WSH-3.5, круг 2, Р7)
+            if not JOB_RE.match(rest[0]):
+                print(f"wshub code-kill: {rest[0][:40]!r} — не id задачи", file=sys.stderr)
+                return 2
+            kill_gate(jobs.job_dir(rest[0]))
+        else:
+            jobs.kill_orphaned(rest[0])
         return 0
     # cmd == "code"
     if not rest:

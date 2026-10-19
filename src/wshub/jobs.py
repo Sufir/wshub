@@ -63,6 +63,7 @@ HUB_BLOCK_MAX = 2048  # байт на весь блок
 HUB_BLOCK_GATES = 10
 HUB_BLOCK_HIDDEN = 20
 HUB_BLOCK_CMD = 100  # символов команды гейта в строке блока
+HUB_BLOCK_PATH = 200  # символов пути в строке блока (круг 2, Р8)
 HIDDEN_JOB_MAX = 200  # путей sandbox_hidden в job.json
 GATES_PYTHON_M ="гейты недоступны: хаб запущен как python -m wshub"
 # гейт (ТЗ WSH-3.5, Г3): pid, pgid и proc_start идущего гейта — в каталоге звена; SIGTERM группе → пауза → SIGKILL
@@ -749,6 +750,9 @@ class Jobs:
                     self.write(tid, t)
             return self.snapshot(jid)
         if state in TERMINAL:
+            if (self.job_dir(tid) / GATE_PID).exists():
+                # звено конечное (в том числе lost), а гейт ещё идёт: гасим в фоне, состояние не трогаем (круг 2, Р7)
+                self._spawn_killer(tid, gate_only=True)
             return self.snapshot(jid)
         atomic_write_text(self.job_dir(tid) / "cancel", "1")
         if state == "orphaned":
@@ -756,12 +760,13 @@ class Jobs:
             self._spawn_killer(tid)
         return self.snapshot(jid)
 
-    def _spawn_killer(self, jid: str) -> None:
+    def _spawn_killer(self, jid: str, gate_only: bool = False) -> None:
         """Гасим группу Code отдельным процессом `wshub code-kill`, а не os.fork: в MCP-сервере (многопоточный
-        async) fork копирует удерживаемый flock-fd и заклинил бы лок. close_fds (по умолчанию) этого не даёт."""
-        subprocess.Popen([*claude_cli.wshub_cmd(), "code-kill", jid], stdin=subprocess.DEVNULL,
-                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                         env={**os.environ}, cwd=self.job_dir(jid))
+        async) fork копирует удерживаемый flock-fd и заклинил бы лок. close_fds (по умолчанию) этого не даёт.
+        gate_only — только гейт звена (`code-kill <job> --gate`), состояние звена не меняется."""
+        subprocess.Popen([*claude_cli.wshub_cmd(), "code-kill", jid, *(["--gate"] if gate_only else [])],
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True, env={**os.environ}, cwd=self.job_dir(jid))
 
     def kill_orphaned(self, jid: str) -> dict:
         """Погасить группу Code осиротевшей задачи и записать cancelled (вызывается процессом `code-kill`)."""
@@ -1175,7 +1180,7 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
 
     def build(ng: int, nh: int) -> str:
         lines = []
-        if note:
+        if note and note.strip():  # замечание из одних пробелов — строки нет (круг 2, Р11)
             lines.append(f"- Замечание оператора: {note}")
         if gates:
             items = [f"{g.name} (timeout {(g.timeout_s + 60) * 1000} мс) — {_clip(shlex.join(g.cmd), HUB_BLOCK_CMD)}"
@@ -1185,7 +1190,8 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
                          "- Гейты — проверки вне песочницы, только командой `wshub gate <имя>` целиком, Bash с timeout "
                          f"не меньше указанного: {listed}. Полный вывод — `--out <файл>`.")
         if hidden:
-            shown = ", ".join(hidden[:nh]) + (f" (и ещё {len(hidden) - nh})" if len(hidden) > nh else "")
+            shown = ", ".join(_shown_path(h) for h in hidden[:nh]) + \
+                (f" (и ещё {len(hidden) - nh})" if len(hidden) > nh else "")
             lines.append(f"- Песочница скрывает отслеживаемые файлы: {shown}. В `git status` задачи они выглядят "
                          "изменёнными — это не правка задачи: не восстанавливай их и не добавляй в коммит.")
         if not lines:
@@ -1205,6 +1211,20 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
 
 def _clip(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
+_QUOTE = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}
+
+
+def _shown_path(p: str) -> str:
+    """Путь в строке блока (круг 2, Р3 и Р8): не длиннее HUB_BLOCK_PATH; с управляющими символами (\\x00–\\x1f, \\x7f,
+    U+0085, U+2028, U+2029) — в двойных кавычках с экранированием, как git core.quotePath: перевод строки в имени
+    файла не подделает строку блока."""
+    if not any(ord(c) < 0x20 or c in "\x7f\x85  " for c in p):
+        return _clip(p, HUB_BLOCK_PATH)
+    out = "".join(_QUOTE.get(c) or (f"\\x{ord(c):02x}" if ord(c) < 0x20 or c == "\x7f" else
+                                    f"\\u{ord(c):04x}" if c in "\x85  " else c) for c in p)
+    return '"' + _clip(out, HUB_BLOCK_PATH) + '"'
 
 
 def gate_group_alive(pgid: int, proc: Path = Path("/proc")) -> bool:
@@ -1252,13 +1272,22 @@ def kill_gate(jdir: Path) -> None:
     info = read_json(p)
     if not info:
         return
-    pid, pgid, started = info.get("pid"), info.get("pgid"), info.get("proc_start")
-    if isinstance(pid, int) and isinstance(pgid, int) and pgid > 1 and pgid != os.getpgrp():
-        now = proc_start(pid)
-        if not (now is not None and started is not None and now != started) and gate_group_alive(pgid):
-            stop_gate_group(pgid)
+    kill_gate_group(info)
     with contextlib.suppress(OSError):
         p.unlink()
+
+
+def kill_gate_group(info: dict) -> bool:
+    """Погасить группу гейта по записи {pid, pgid, proc_start} (gate.pid звена или .holder лока проекта) с защитой
+    proc_start. True — группа шла и погашена."""
+    pid, pgid, started = info.get("pid"), info.get("pgid"), info.get("proc_start")
+    if not (isinstance(pid, int) and isinstance(pgid, int) and pgid > 1 and pgid != os.getpgrp()):
+        return False
+    now = proc_start(pid)
+    if (now is not None and started is not None and now != started) or not gate_group_alive(pgid):
+        return False
+    stop_gate_group(pgid)
+    return True
 
 
 def write_exclude(repo: Path) -> None:

@@ -214,7 +214,11 @@ def _deny_read_hit(ctx: Ctx, rel: str, real: str) -> bool:
 def open_out(top: Path, rel: str) -> int:
     """--out без гонки с симлинком в родителе (ревью WSH-3.4, круг 1): каталоги от рабочего каталога задачи —
     по одному, O_DIRECTORY | O_NOFOLLOW относительно предыдущего; файл — O_NOFOLLOW относительно последнего.
-    Подменённый на симлинк каталог — OSError."""
+    Подменённый на симлинк каталог — OSError. Файл — только обычный (ТЗ WSH-3.5, круг 3, Р14): открытие с
+    O_NONBLOCK (FIFO без читателя не повесит помощника), затем fstat; FIFO, устройство — OSError «не обычный файл».
+    После проверки O_NONBLOCK снимается."""
+    import errno
+    import fcntl
     parts = rel.split("/")
     fd = os.open(os.path.realpath(top), os.O_RDONLY | os.O_DIRECTORY)
     try:
@@ -222,9 +226,24 @@ def open_out(top: Path, rel: str) -> int:
             nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
             os.close(fd)
             fd = nfd
-        return os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o644, dir_fd=fd)
+        try:  # тип — заранее, ради понятного отказа; от подмены после проверки защищает fstat ниже
+            st = os.stat(parts[-1], dir_fd=fd, follow_symlinks=False)
+            if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):  # симлинк — отказ O_NOFOLLOW
+                raise OSError(errno.EINVAL, "не обычный файл")
+        except FileNotFoundError:
+            pass
+        out = os.open(parts[-1], os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o644, dir_fd=fd)
     finally:
         os.close(fd)
+    try:
+        if not stat.S_ISREG(os.fstat(out).st_mode):
+            raise OSError(errno.EINVAL, "не обычный файл")
+        fcntl.fcntl(out, fcntl.F_SETFL, fcntl.fcntl(out, fcntl.F_GETFL) & ~os.O_NONBLOCK)
+        os.ftruncate(out, 0)  # O_TRUNC — только после проверки: FIFO и устройство не трогаем
+    except OSError:
+        os.close(out)
+        raise
+    return out
 
 
 # ---------- wshub push ----------
@@ -681,16 +700,18 @@ def gate(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
         os.close(lock)
 
 
-def _say(text: str) -> None:
-    """stdout помощника: канал закрыт (claude вышел, задачу остановили) — не ошибка, код гейта важнее (круг 2, Р2).
-    Закрытый stdout подменяем /dev/null: иначе сброс буфера при выходе сменил бы код процесса на 120."""
+def _say(text: str, err: bool = False) -> None:
+    """stdout (err — stderr) помощника: канал закрыт (claude вышел, задачу остановили) — не ошибка, код важнее
+    (круг 2, Р2; круг 3, Р15). Закрытый поток подменяем /dev/null: иначе сброс буфера при выходе сменил бы код
+    процесса на 120."""
+    stream = sys.stderr if err else sys.stdout
     try:
-        sys.stdout.write(text)
-        sys.stdout.flush()
+        stream.write(text)
+        stream.flush()
     except OSError:
         with contextlib.suppress(OSError, ValueError, AttributeError):
             devnull = os.open(os.devnull, os.O_WRONLY)
-            os.dup2(devnull, sys.stdout.fileno())
+            os.dup2(devnull, stream.fileno())
             os.close(devnull)
 
 
@@ -730,49 +751,56 @@ def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, ou
             sink.close()
             return _refuse(ctx, "gate", shown, f"гейт {g.name} не запустился: {e}", base)
         pgid = proc.pid  # свой сеанс: группа — по pid лидера
-        group = {"pid": proc.pid, "pgid": pgid, "proc_start": proc_start(proc.pid)}
-        reader = threading.Thread(target=sink.pump, args=(proc.stdout,), daemon=True)
-        reader.start()
 
         def alive() -> bool:
             return proc.poll() is None or gate_group_alive(pgid)
 
         try:
-            atomic_write_text(pidfile, json.dumps(group))
-        except OSError as e:  # без gate.pid остановка задачи гейт не найдёт — гасим и отказываем (круг 2, Р6)
-            stop_gate_group(pgid, alive)
-            proc.wait()
+            group = {"pid": proc.pid, "pgid": pgid, "proc_start": proc_start(proc.pid)}
+            reader = threading.Thread(target=sink.pump, args=(proc.stdout,), daemon=True)
+            reader.start()
+            try:
+                atomic_write_text(pidfile, json.dumps(group))
+            except OSError as e:  # без gate.pid остановка задачи гейт не найдёт — гасим и отказываем (круг 2, Р6)
+                stop_gate_group(pgid, alive)
+                proc.wait()
+                reader.join(GATE_JOIN)
+                sink.close()
+                return _refuse(ctx, "gate", shown, f"gate.pid не записан ({e.strerror or e}) — гейт погашен", base)
+            _write_holder(holder, {"job": ctx.jid, "gate": g.name, "helper": os.getpid(), **group})  # для сироты (Р1)
+            # отмена пришла между check() и запуском: надзиратель уже искал gate.pid и не нашёл (Р6) — как сигнал
+            interrupted = None if _job_running(ctx) else "signal"
+            deadline = t0 + g.timeout_s
+            while interrupted is None:
+                try:
+                    proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+                if stop and proc.poll() is None:  # гейт уже вышел — сигнал итог не меняет (круг 3, Р18)
+                    interrupted = "signal"
+                elif time.monotonic() >= deadline:
+                    interrupted = "timeout"
+            if interrupted:
+                stop_gate_group(pgid, alive)  # сигнал во время лестницы итог не меняет; после выхода гейта — тоже (Р10)
+                proc.wait()
+            if gate_group_alive(pgid):  # лидер вышел, а его фоновые потомки ещё идут — не переживут гейт
+                stop_gate_group(pgid)
             reader.join(GATE_JOIN)
             sink.close()
-            return _refuse(ctx, "gate", shown, f"gate.pid не записан ({e.strerror or e}) — гейт погашен", base)
-        _write_holder(holder, {"job": ctx.jid, "gate": g.name, "helper": os.getpid(), **group})  # для сироты (Р1)
-        # отмена пришла между check() и запуском: надзиратель уже искал gate.pid и не нашёл (Р6) — как сигнал
-        interrupted = None if _job_running(ctx) else "signal"
-        deadline = t0 + g.timeout_s
-        while interrupted is None:
-            try:
-                proc.wait(timeout=0.2)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            if stop:
-                interrupted = "signal"
-            elif time.monotonic() >= deadline:
-                interrupted = "timeout"
-        if interrupted:
-            stop_gate_group(pgid, alive)  # сигнал во время лестницы итог не меняет; после выхода гейта — тоже (Р10)
-            proc.wait()
-        if gate_group_alive(pgid):  # лидер вышел, а его фоновые потомки ещё идут — не переживут гейт
-            stop_gate_group(pgid)
-        reader.join(GATE_JOIN)
-        sink.close()
-        duration = round(time.monotonic() - t0)
-        rc = proc.returncode
-        code = 130 if interrupted == "signal" else 124 if interrupted == "timeout" else (128 - rc if rc < 0 else rc)
-        why = {"timeout": f"прерван: timeout_s = {g.timeout_s}", "signal": "прерван сигналом"}.get(interrupted)
-        # учёт — до вывода: после отмены канал stdout бывает закрыт; обработчики сигналов — до конца записи (Р2)
-        ctx.record("gate", shown, code, None, None if code == 0 else why or f"гейт вернул {code}",
-                   {"duration_s": duration, "timeout": interrupted == "timeout", "log": log_rel, **base})
+            duration = round(time.monotonic() - t0)
+            rc = proc.returncode
+            code = 130 if interrupted == "signal" else 124 if interrupted == "timeout" else \
+                (128 - rc if rc < 0 else rc)
+            why = {"timeout": f"прерван: timeout_s = {g.timeout_s}", "signal": "прерван сигналом"}.get(interrupted)
+            # учёт — до вывода: после отмены канал stdout бывает закрыт; обработчики сигналов — до конца записи (Р2)
+            ctx.record("gate", shown, code, None, None if code == 0 else why or f"гейт вернул {code}",
+                       {"duration_s": duration, "timeout": interrupted == "timeout", "log": log_rel, **base})
+        except BaseException:
+            # любое необработанное исключение после запуска (например, сбой чтения /proc) — гасим гейт, иначе finally
+            # удалит gate.pid, а .holder перепишется без группы у живого гейта (круг 3, Р12)
+            stop_gate_group(pgid, alive)
+            raise
     finally:
         for s, h in old.items():
             signal.signal(s, h)
@@ -786,8 +814,9 @@ def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, ou
 
 
 def _refuse(ctx: Ctx, cmd: str, shown: list[str], reason: str, extra: dict | None = None) -> int:
-    print(f"wshub {cmd}: отказ: {reason}", file=sys.stderr)
+    # учёт — до вывода: канал stderr бывает закрыт после отмены или выхода claude (круг 3, Р15)
     ctx.record(cmd, shown, 1, None, reason, extra)
+    _say(f"wshub {cmd}: отказ: {reason}\n", err=True)
     return 1
 
 

@@ -79,22 +79,24 @@ def code_head(repo: Path | None) -> str | None:
 
 
 def proc_start(pid: int, proc: Path = Path("/proc")) -> str | None:
-    """Время старта процесса из /proc/<pid>/stat (поле 22): отличает живой pid от переиспользованного."""
+    """Время старта процесса из /proc/<pid>/stat (поле 22): отличает живой pid от переиспользованного. Читается
+    байтами: comm, обрезанный ядром посреди многобайтового символа, — не UTF-8 (ТЗ WSH-3.5, круг 3, Р13)."""
     try:
-        stat = (proc / str(pid) / "stat").read_text()
+        stat = (proc / str(pid) / "stat").read_bytes()
     except OSError:
         return None
-    return stat.rsplit(")", 1)[-1].split()[19]
+    fields = stat.rsplit(b")", 1)[-1].split()
+    return fields[19].decode("ascii") if len(fields) > 19 else None
 
 
 def _zombie(pid: int, proc: Path) -> bool:
     """Процесс — зомби (завершился, но родитель его не снял): по инструментам считается мёртвым."""
     try:
-        stat = (proc / str(pid) / "stat").read_text()
+        stat = (proc / str(pid) / "stat").read_bytes()
     except OSError:
         return False
-    fields = stat.rsplit(")", 1)[-1].split()
-    return bool(fields) and fields[0] == "Z"
+    fields = stat.rsplit(b")", 1)[-1].split()
+    return bool(fields) and fields[0] == b"Z"
 
 
 def pid_alive(pid: int, started: str | None, proc: Path = Path("/proc")) -> bool:

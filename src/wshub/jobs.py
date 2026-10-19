@@ -65,7 +65,7 @@ HUB_BLOCK_HIDDEN = 20
 HUB_BLOCK_CMD = 100  # символов команды гейта в строке блока
 HUB_BLOCK_PATH = 200  # символов пути в строке блока (круг 2, Р8)
 HIDDEN_JOB_MAX = 200  # путей sandbox_hidden в job.json
-GATES_PYTHON_M ="гейты недоступны: хаб запущен как python -m wshub"
+GATES_PYTHON_M = "гейты недоступны: хаб запущен как python -m wshub"
 # гейт (ТЗ WSH-3.5, Г3): pid, pgid и proc_start идущего гейта — в каталоге звена; SIGTERM группе → пауза → SIGKILL
 GATE_PID = "gate.pid"
 GATE_KILL_AFTER = 10
@@ -1183,7 +1183,7 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
         if note and note.strip():  # замечание из одних пробелов — строки нет (круг 2, Р11)
             lines.append(f"- Замечание оператора: {note}")
         if gates:
-            items = [f"{g.name} (timeout {(g.timeout_s + 60) * 1000} мс) — {_clip(shlex.join(g.cmd), HUB_BLOCK_CMD)}"
+            items = [f"{g.name} (timeout {(g.timeout_s + 60) * 1000} мс) — {_shown(shlex.join(g.cmd), HUB_BLOCK_CMD)}"
                      for g in gates[:ng]]
             listed = "; ".join(items) + (f"; и ещё {len(gates) - ng}" if len(gates) > ng else "")
             lines.append(f"- Гейты будут в фазе исполнения: {listed}." if phase == "plan" else
@@ -1191,7 +1191,8 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
                          f"не меньше указанного: {listed}. Полный вывод — `--out <файл>`.")
         if hidden:
             shown = ", ".join(_shown_path(h) for h in hidden[:nh]) + \
-                (f" (и ещё {len(hidden) - nh})" if len(hidden) > nh else "")
+                (f" (и ещё {len(hidden) - nh})" if len(hidden) > nh else "") if nh else \
+                f"скрыто файлов: {len(hidden)}, список — `sandbox_hidden` в job.json"
             lines.append(f"- Песочница скрывает отслеживаемые файлы: {shown}. В `git status` задачи они выглядят "
                          "изменёнными — это не правка задачи: не восстанавливай их и не добавляй в коммит.")
         if not lines:
@@ -1201,10 +1202,12 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
 
     ng, nh = min(len(gates), HUB_BLOCK_GATES), min(len(hidden), HUB_BLOCK_HIDDEN)
     text = build(ng, nh)
-    while len(text.encode("utf-8")) > HUB_BLOCK_MAX and (nh > 1 or ng > 1):
-        nh, ng = (nh - 1, ng) if nh > 1 else (nh, ng - 1)
+    # сокращаем списки: пути до одного, гейты до одного, затем пути до нуля — строка «скрыто файлов: N» без путей
+    # (круг 3, Р17): тогда хвост инструкции не срезает предохранитель по байтам
+    while len(text.encode("utf-8")) > HUB_BLOCK_MAX and (nh > 0 or ng > 1):
+        nh, ng = (nh - 1, ng) if nh > 1 or (nh == 1 and ng <= 1) else (nh, ng - 1)
         text = build(ng, nh)
-    if len(text.encode("utf-8")) > HUB_BLOCK_MAX:  # длинные пути — последний предохранитель
+    if len(text.encode("utf-8")) > HUB_BLOCK_MAX:  # последний предохранитель (note из 4-байтовых символов)
         text = text.encode("utf-8")[:HUB_BLOCK_MAX - 4].decode("utf-8", "ignore") + "…\n"
     return text
 
@@ -1214,30 +1217,38 @@ def _clip(text: str, limit: int) -> str:
 
 
 _QUOTE = {"\\": "\\\\", '"': '\\"', "\n": "\\n", "\t": "\\t", "\r": "\\r"}
+_LINE_SEPS = "\x85\N{LINE SEPARATOR}\N{PARAGRAPH SEPARATOR}"  # U+0085, U+2028, U+2029
 
 
 def _shown_path(p: str) -> str:
-    """Путь в строке блока (круг 2, Р3 и Р8): не длиннее HUB_BLOCK_PATH; с управляющими символами (\\x00–\\x1f, \\x7f,
-    U+0085, U+2028, U+2029) — в двойных кавычках с экранированием, как git core.quotePath: перевод строки в имени
-    файла не подделает строку блока."""
-    if not any(ord(c) < 0x20 or c in "\x7f\x85  " for c in p):
-        return _clip(p, HUB_BLOCK_PATH)
+    """Путь в строке блока (круг 2, Р3 и Р8): не длиннее HUB_BLOCK_PATH, экранирование — _shown."""
+    return _shown(p, HUB_BLOCK_PATH)
+
+
+def _shown(text: str, limit: int) -> str:
+    """Текст в строке блока — путь или команда гейта (круг 2, Р3; круг 3, Р16): не длиннее limit; с управляющими
+    символами (\\x00–\\x1f, \\x7f, U+0085, U+2028, U+2029) — в двойных кавычках с экранированием, как git
+    core.quotePath: перевод строки в имени файла или в команде не подделает строку блока."""
+    if not any(ord(c) < 0x20 or c in "\x7f" + _LINE_SEPS for c in text):
+        return _clip(text, limit)
     out = "".join(_QUOTE.get(c) or (f"\\x{ord(c):02x}" if ord(c) < 0x20 or c == "\x7f" else
-                                    f"\\u{ord(c):04x}" if c in "\x85  " else c) for c in p)
-    return '"' + _clip(out, HUB_BLOCK_PATH) + '"'
+                                    f"\\u{ord(c):04x}" if c in _LINE_SEPS else c) for c in text)
+    return '"' + _clip(out, limit) + '"'
 
 
 def gate_group_alive(pgid: int, proc: Path = Path("/proc")) -> bool:
-    """Есть ли в группе процессы, кроме зомби (их снимает родитель, сигнал им не нужен)."""
+    """Есть ли в группе процессы, кроме зомби (их снимает родитель, сигнал им не нужен). /proc/<pid>/stat — байтами:
+    comm, обрезанный посреди многобайтового символа, не UTF-8 (круг 3, Р13)."""
     if proc.is_dir():
+        group = str(pgid).encode()
         for p in proc.iterdir():
             if not p.name.isdigit():
                 continue
             try:
-                fields = (p / "stat").read_text().rsplit(")", 1)[-1].split()
+                fields = (p / "stat").read_bytes().rsplit(b")", 1)[-1].split()
             except OSError:
                 continue
-            if len(fields) > 2 and fields[2] == str(pgid) and fields[0] != "Z":
+            if len(fields) > 2 and fields[2] == group and fields[0] != b"Z":
                 return True
         return False
     try:  # без /proc (macOS)
@@ -1279,12 +1290,14 @@ def kill_gate(jdir: Path) -> None:
 
 def kill_gate_group(info: dict) -> bool:
     """Погасить группу гейта по записи {pid, pgid, proc_start} (gate.pid звена или .holder лока проекта) с защитой
-    proc_start. True — группа шла и погашена."""
+    proc_start. Нет времени старта в записи — переиспользование pid не проверить, группу не трогаем (круг 3, Т9).
+    True — группа шла и погашена."""
     pid, pgid, started = info.get("pid"), info.get("pgid"), info.get("proc_start")
-    if not (isinstance(pid, int) and isinstance(pgid, int) and pgid > 1 and pgid != os.getpgrp()):
+    if not (isinstance(pid, int) and isinstance(pgid, int) and pgid > 1 and pgid != os.getpgrp()
+            and isinstance(started, str)):
         return False
     now = proc_start(pid)
-    if (now is not None and started is not None and now != started) or not gate_group_alive(pgid):
+    if (now is not None and now != started) or not gate_group_alive(pgid):
         return False
     stop_gate_group(pgid)
     return True

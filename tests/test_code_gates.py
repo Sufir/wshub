@@ -568,6 +568,26 @@ def test_gate_holder_foreign_pid_untouched(code, capsys):
         other.wait()
 
 
+@pytest.mark.parametrize("fmt", ["old", "null_start"])
+def test_gate_holder_old_format_or_no_start(code, capsys, fmt):
+    """Т9: .holder старого формата (pid помощника, без pgid) и с proc_start: null — сироты нет, гейт запускается,
+    живая группа с этим pid не тронута."""
+    _gates(code, ok='"true"')
+    jid = _gate_job(code)
+    other = _spawn_group("sleep 100")
+    try:
+        _holder(code).parent.mkdir(parents=True, exist_ok=True)
+        rec = {"job": "j", "gate": "g", "pid": other.pid} if fmt == "old" else \
+            {"job": "j", "gate": "g", "pid": other.pid, "pgid": other.pid, "proc_start": None}
+        _holder(code).write_text(json.dumps(rec))
+        rc, out = _helper(code, "gate", ["ok"], jid, capsys=capsys)
+        assert rc == 0 and "осиротевший" not in out.out and "orphan_killed" not in _external(code, jid)[-1]
+        assert other.poll() is None
+    finally:
+        os.killpg(other.pid, signal.SIGKILL)
+        other.wait()
+
+
 def test_gate_holder_has_group_while_running(code):
     """Р1: пока гейт идёт, в .holder — группа гейта (её и найдёт следующий помощник, если этот умрёт)."""
     _gates(code, slow='{ cmd = ["sleep", "30"], timeout_s = 60 }')
@@ -664,14 +684,16 @@ def test_gate_sink_no_write_after_close(tmp_path):
 
 
 def test_gate_pid_write_failure_kills_gate(code, capsys, monkeypatch):
-    """Р6: gate.pid не записался — гейт погашен, отказ со строкой учёта."""
-    marker = code.root / "gate.pid.of"
-    _gates(code, slow=f'{{ cmd = {json.dumps(["sh", "-c", f"echo $$ > {marker}; sleep 100"])}, timeout_s = 60 }}')
+    """Р6: gate.pid не записался — гейт погашен, отказ со строкой учёта. Группа гейта — из текста, который получила
+    подменённая запись gate.pid (круг 3, Т6): проверка смерти гейта обязательна."""
+    _gates(code, slow='{ cmd = ["sh", "-c", "sleep 100 & sleep 100"], timeout_s = 60 }')
     jid = _gate_job(code)
     real = helper.atomic_write_text
+    groups: list[int] = []
 
     def write(path, text):
         if Path(path).name == jobs_mod.GATE_PID:
+            groups.append(json.loads(text)["pgid"])
             raise OSError(28, "No space left on device")
         return real(path, text)
 
@@ -681,11 +703,7 @@ def test_gate_pid_write_failure_kills_gate(code, capsys, monkeypatch):
     assert rc == 1 and "gate.pid не записан" in out.err and "гейт погашен" in out.err and time.time() - t0 < 15
     row = _external(code, jid)[-1]
     assert row["exit"] == 1 and "gate.pid не записан" in row["error"]
-    text = marker.read_text().strip() if marker.exists() else ""  # sh мог не успеть записать pid до гашения
-    if text:
-        pid = int(text)
-        assert _wait(lambda: not os.path.exists(f"/proc/{pid}") or
-                     Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[-1].split()[0] == "Z")
+    assert len(groups) == 1 and _wait(lambda: not _group_live(groups[0]))
 
 
 def test_gate_cancel_before_start_kills_gate(code, capsys, monkeypatch):
@@ -739,6 +757,104 @@ def test_gate_signal_after_exit_keeps_code(code, capsys, monkeypatch):
     monkeypatch.setattr(helper, "gate_group_alive", alive)
     rc, out = _helper(code, "gate", ["fail"], jid, capsys=capsys)
     assert rc == 3 and "прерван" not in out.out
+    assert _external(code, jid)[-1]["exit"] == 3
+
+
+# ---------- круг 3 ----------
+
+def test_gate_exception_after_start_kills_gate(code, monkeypatch):
+    """Р12: необработанное исключение после запуска гейта (здесь — сбой чтения /proc в proc_start) гасит группу
+    гейта: иначе finally удалил бы gate.pid у живого гейта."""
+    _gates(code, slow='{ cmd = ["sh", "-c", "sleep 100 & sleep 100"], timeout_s = 60 }')
+    jid = _gate_job(code)
+    groups: list[int] = []
+
+    def broken(pid, *_a, **_kw):
+        groups.append(pid)
+        raise RuntimeError("сбой чтения /proc")
+
+    monkeypatch.setattr(helper, "proc_start", broken)
+    try:
+        with pytest.raises(RuntimeError, match="сбой чтения /proc"):
+            helper.main("gate", ["slow"], code.cfg, code.state, environ={**os.environ, "WSHUB_JOB": jid},
+                        cwd=str(code.root))
+        assert len(groups) == 1 and _wait(lambda: not _group_live(groups[0]))
+        assert not (code.jobs.job_dir(jid) / jobs_mod.GATE_PID).exists()
+    finally:
+        if groups and _group_live(groups[0]):
+            os.killpg(groups[0], signal.SIGKILL)
+
+
+def test_proc_stat_invalid_utf8(tmp_path):
+    """Р13: comm, обрезанный посреди многобайтового символа, — не UTF-8; /proc/<pid>/stat читается байтами, и ни
+    proc_start, ни _zombie, ни gate_group_alive не падают."""
+    from wshub.runtime import pid_alive
+    proc = tmp_path / "proc"
+    (proc / "4242").mkdir(parents=True)
+    rest = b" S 1 4242 4242 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 777 0 0"
+    (proc / "4242" / "stat").write_bytes(b"4242 (\xd0\xbf\xd1\x80\xd0) x)" + rest)  # «)» в comm — тоже
+    (proc / "self").mkdir()  # не число — пропускается
+    assert proc_start(4242, proc) == "777"
+    assert pid_alive(4242, "777", proc) and not pid_alive(4242, "778", proc)
+    assert jobs_mod.gate_group_alive(4242, proc) and not jobs_mod.gate_group_alive(1, proc)
+    (proc / "4242" / "stat").write_bytes(b"4242 (\xd0\xbf\xd1\x80\xd0)" + rest.replace(b" S ", b" Z ", 1))
+    assert not jobs_mod.gate_group_alive(4242, proc) and not pid_alive(4242, "777", proc)
+
+
+def test_out_fifo_refused(code, capsys):
+    """Р14: --out — только обычный файл. FIFO без читателя не вешает помощника; с читателем — отказ по fstat. Тот же
+    open_out у wshub forge --out."""
+    _gates(code, ok='"true"')
+    jid = _gate_job(code)
+    fifo = code.root / "o.fifo"
+    os.mkfifo(fifo)
+    t0 = time.time()
+    rc, out = _helper(code, "gate", ["ok", "--out", "o.fifo"], jid, capsys=capsys)
+    assert rc == 1 and "не обычный файл" in out.err and time.time() - t0 < 10
+    assert _external(code, jid)[-1]["exit"] == 1
+    reader = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)  # с читателем открытие на запись прошло бы
+    try:
+        with pytest.raises(OSError, match="не обычный файл"):
+            helper.open_out(code.root, "o.fifo")
+    finally:
+        os.close(reader)
+    (code.root / "f.log").write_text("старое содержимое\n")
+    fd = helper.open_out(code.root, "f.log")  # обычный файл — открыт и обрезан, как раньше
+    os.close(fd)
+    assert (code.root / "f.log").read_text() == ""
+
+
+def test_refuse_records_before_closed_stderr(code, monkeypatch):
+    """Р15: отказ — сначала строка учёта, потом stderr; закрытый stderr не теряет учёт и не меняет код."""
+    _gates(code, ok='"true"')
+    jid = _gate_job(code)
+    monkeypatch.setattr(sys, "stderr", _ClosedStdout())
+    rc = helper.main("gate", ["nope"], code.cfg, code.state, environ={**os.environ, "WSHUB_JOB": jid},
+                     cwd=str(code.root))
+    assert rc == 1
+    row = _external(code, jid)[-1]
+    assert row["args"] == ["nope"] and row["exit"] == 1 and "нет в реестре" in row["error"]
+
+
+def test_gate_signal_when_gate_already_exited(code, capsys, monkeypatch):
+    """Р18: гейт вышел между ожиданием и проверкой сигнала, а сигнал уже пришёл — итог — код гейта, а не 130.
+    Первое ожидание с таймаутом дожидается гейта, шлёт сигнал и делает вид, что не дождалось."""
+    _gates(code, fail=json.dumps(["sh", "-c", "exit 3"]))
+    jid = _gate_job(code)
+    real = subprocess.Popen.wait
+    calls: list[int] = []
+
+    def wait(self, timeout=None):
+        if timeout is not None and not calls:
+            calls.append(1)
+            real(self)  # гейт вышел (код 3)
+            os.kill(os.getpid(), signal.SIGTERM)  # обработчик помощника — в stop
+            raise subprocess.TimeoutExpired(self.args, timeout)
+        return real(self, timeout)
+
+    monkeypatch.setattr(subprocess.Popen, "wait", wait)
+    rc, out = _helper(code, "gate", ["fail"], jid, capsys=capsys)
+    assert calls and rc == 3 and "прерван" not in out.out
     assert _external(code, jid)[-1]["exit"] == 3
 
 
@@ -866,7 +982,8 @@ def test_kill_gate_dead_leader_live_children(code):
 @pytest.mark.parametrize("raw_state", ["completed", "running"])  # running без живых процессов — lost
 def test_cancel_terminal_job_kills_gate(code, raw_state):
     """Р7: code_cancel у конечного звена (в том числе lost) с gate.pid гасит гейт в фоне и отвечает сразу;
-    состояние звена не меняется."""
+    состояние звена не меняется. Гейт игнорирует SIGTERM (круг 3, Т7): синхронное гашение заняло бы
+    GATE_KILL_AFTER (10 с) — ответ за 2 с доказывает, что гасит фоновый процесс."""
     jid = _gate_job(code)
     d = code.jobs.read(jid)
     d.update(state=raw_state, sup_pid=None, pid=None, result={"subtype": "success"} if raw_state == "completed"
@@ -874,12 +991,14 @@ def test_cancel_terminal_job_kills_gate(code, raw_state):
     code.jobs.write(jid, d)
     want = "completed" if raw_state == "completed" else "lost"
     assert code.jobs.effective_state(code.jobs.read(jid)) == want
-    g = _spawn_group()
+    g = _spawn_group('trap "" TERM; sleep 100 & sleep 100')  # SIG_IGN наследуют и sleep
     try:
+        assert _wait(lambda: len(_group_live(g.pid)) >= 2)
         _write_gate_pid(code.jobs.job_dir(jid), g)
         t0 = time.time()
         snap = code.jobs.cancel(jid)
         assert time.time() - t0 < 2 and snap["state"] == want  # ответ сразу, гасит процесс code-kill --gate
+        assert jobs_mod.GATE_KILL_AFTER >= 10
         g.wait(timeout=30)
         assert _wait(lambda: not _group_live(g.pid), timeout=30)
         assert code.jobs.read(jid)["state"] == raw_state and code.jobs.effective_state(code.jobs.read(jid)) == want

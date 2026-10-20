@@ -73,7 +73,9 @@ SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
 BILLING_ENV_RE = re.compile(r"^(ANTHROPIC_|CLAUDE_CODE_USE_|CLAUDE_CODE_OAUTH_)|^AWS_BEARER_TOKEN_BEDROCK$")
 # [api], [api.providers.<имя>] и [workspace.<имя>.api] — доступ хаба к моделям по ключу (ТЗ WSH-4.2, п. 2.4)
 API_KEYS = {"enabled", "max_usd_per_call", "daily_usd", "providers"}
-API_PROVIDER_KEYS = {"included_usd", "credits_until", "models", "strong_requires_choice"}
+API_PROVIDER_KEYS = {"included_usd", "credits_until", "models", "strong_requires_choice", "base_url", "timeout_s"}
+# base_url провайдера (ТЗ WSH-4.3, п. 2.1.8): только https; http — лишь для 127.0.0.1 и localhost (тесты)
+API_BASE_URL_RE = re.compile(r"^(https://[^/\s?#@]+|http://(127\.0\.0\.1|localhost)(:\d+)?)(/[^\s?#]*)?$")
 WS_API_KEYS = {"enabled"}
 
 
@@ -208,17 +210,19 @@ class ApiProvider:
     credits_until: date | None = None
     models: dict[str, str] = field(default_factory=dict)  # переопределение уровней cheap / standard / strong
     strong_requires_choice: bool = True  # уровень strong — только явным выбором оператора
-    included_set: bool = False  # included_usd записан: задачи Code на ключе проверяют зоны (ТЗ WSH-4.6, 5.2)
+    included_set: bool = False  # included_usd записан: зоны проверяются (ТЗ WSH-4.6, 5.2; WSH-4.3, п. 2.2.2)
+    base_url: str | None = None  # None — адрес по умолчанию провайдера
+    timeout_s: int | None = None  # таймаут соединения и ответа; None — по умолчанию провайдера
 
 
 @dataclass(frozen=True)
 class Api:
     """[api] и [workspace.<имя>.api]. Ошибка в них не ломает реестр: отказывает только API хаба
-    (error — для всех проектов, project_errors — для одного)."""
+    (error — для всех проектов, project_errors — для одного). Потолки — только если заданы (ТЗ WSH-4.3, п. 2.2.2)."""
     present: bool = False
     enabled: bool = False
-    max_usd_per_call: float = 1.0
-    daily_usd: float = 10.0
+    max_usd_per_call: float | None = None
+    daily_usd: float | None = None
     daily_set: bool = False  # daily_usd записан в реестре: только тогда его проверяют задачи Code (ТЗ WSH-4.6, 5.2)
     providers: dict[str, ApiProvider] = field(default_factory=dict)
     error: str | None = None
@@ -670,6 +674,16 @@ def _api(t, warnings: list[str]) -> Api:
             if not isinstance(p["strong_requires_choice"], bool):
                 raise RegistryError(f"{where} strong_requires_choice: true или false")
             pv["strong_requires_choice"] = p["strong_requires_choice"]
+        if "base_url" in p:
+            if not isinstance(p["base_url"], str) or not API_BASE_URL_RE.match(p["base_url"]):
+                raise RegistryError(f"{where} base_url: https://хост[/путь]; http:// — только для 127.0.0.1 и "
+                                    "localhost")
+            pv["base_url"] = p["base_url"]
+        if "timeout_s" in p:
+            v = p["timeout_s"]
+            if not isinstance(v, int) or isinstance(v, bool) or v < 1:
+                raise RegistryError(f"{where} timeout_s: целое число секунд больше 0")
+            pv["timeout_s"] = v
         if pv.get("included_usd", 0) > 0 and "credits_until" not in pv:
             raise RegistryError(f"{where}: при included_usd > 0 нужен credits_until = \"ГГГГ-ММ-ДД\"")
         provs[name] = ApiProvider(**pv)

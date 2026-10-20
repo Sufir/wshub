@@ -23,7 +23,7 @@ from wshub.core import Hub
 from wshub.jobs import LIMIT_IGNORED, JobError, Jobs, effective_limits
 from wshub.llm import keys, ledger
 from wshub.llm.cli import api_main
-from wshub.llm.core import Api, ApiError
+from wshub.llm.core import Api
 from wshub.llm.providers import PROVIDERS
 from wshub.llm.types import Request
 from wshub.registry import ProjectCode
@@ -52,6 +52,8 @@ def code(tmp_path, monkeypatch):
     c = make_code(tmp_path, monkeypatch)
     _registry(c)
     keys.write(_key_path(c), MARKER)
+    # хаб — исполняемый файл wshub (ТЗ WSH-4.3, п. 2.2.4): иначе задача на ключе не стартует
+    monkeypatch.setattr(claude_cli, "wshub_exe", lambda: str(tmp_path / "bin" / "wshub"))
     return c
 
 
@@ -549,20 +551,27 @@ def test_key_job_sandbox_denies_wshub_config(code, monkeypatch):
 
 # ---------- п. 2.2, 2.8.3: провайдер-заготовка, doctor ----------
 
-def test_anthropic_provider_stub(code):
+def test_anthropic_provider(code):
+    """Провайдер рабочий с WSH-4.3 (запросы — tests/test_api_anthropic.py): caps, уровни, оценка без ключа — грубо."""
     mod = PROVIDERS["anthropic"]
     prov = mod.create(None)
-    assert (prov.name, prov.caps) == ("anthropic", frozenset())
+    assert (prov.name, prov.caps) == ("anthropic", frozenset({"cache", "schema", "count_tokens", "effort"}))
     assert prov.models() == {"cheap": "claude-haiku-5-5", "standard": "claude-sonnet-5-5",
                              "strong": "claude-opus-5-5"}
-    for call in (lambda: prov.price("claude-haiku-5-5", None), lambda: prov.estimate(None),
-                 lambda: prov.run(None, "k")):
-        with pytest.raises(ApiError, match="провайдер anthropic: запросы Claude API — задача WSH-4.3"):
-            call()
     _registry(code, api=API.replace("[api]\n", "[api]\nenabled = true\n") + "[workspace.proj.api]\nenabled = true\n")
     api = Api(code.hub.registry.get(), code.cfg.parent, code.state)
-    with pytest.raises(ApiError, match="задача WSH-4.3"):
-        api.plan(Request("", ({"role": "user", "text": "x"},), "proj", tier="cheap"), "anthropic")
+    _key_path(code).unlink()  # без ключа count_tokens не зовётся: сети нет
+    plan = api.plan(Request("", ({"role": "user", "text": "x"},), "proj", tier="cheap"), "anthropic")
+    assert plan.request.model == "claude-haiku-5-5" and plan.rough and plan.zone == "included"
+
+
+def test_key_job_refused_under_python_m(code, monkeypatch):
+    """ТЗ WSH-4.3, п. 2.2.4: хаб запущен как python -m wshub — задача на ключе не стартует: ни каталога задачи, ни
+    строки в журнале трат; текст — как у пуша."""
+    monkeypatch.setattr(claude_cli, "wshub_exe", lambda: None)
+    with pytest.raises(JobError, match=r"задача на ключе: wshub запущен как «python -m wshub».*uv tool install"):
+        code.jobs.start(_plan(code))
+    assert _job_dirs(code) == 0 and _raw(code) == []
 
 
 def test_api_key_check_anthropic(code, capsys):

@@ -116,8 +116,8 @@ def _api(config: Path, state: Path, now, reg: Registry | None = None) -> Api:
     return Api(reg or RegistryFile(config).get(), config.parent, state, now)
 
 
-def _burn(z: ledger.Zones) -> list[str]:
-    if not z.burn:
+def _burn(z: ledger.Zones | None) -> list[str]:
+    if z is None or not z.burn:
         return []
     return [f"⚠ сгорит: {usd(z.included_left)} включённых кредитов {z.provider} до {ddmm(z.until)} "
             f"(дней осталось: {z.days_left})"]
@@ -194,6 +194,9 @@ def _out_path(state: Path, now: datetime) -> Path:
     return state / "api" / "out" / f"{now:%Y%m%d-%H%M%S}-{secrets.token_hex(3)}.txt"
 
 
+NO_ZONES = "зоны не проверяются: не заданы ни included_usd, ни команда credits"
+
+
 def _cycle(z: ledger.Zones) -> str:
     return f"цикл {usd(z.included_spent)} из ${z.included_total:.2f}, до {ddmm(z.until)}"
 
@@ -226,10 +229,10 @@ def _run(config: Path, state: Path, now, args: list[str]) -> int:
     plan = api.plan(req, o["provider"], o.get("choice"))
     notes = _skipped(plan.skipped)
     if o.get("estimate"):
-        print(f"оценка: {plan.request.model} · вход ≈{plan.estimate.input} · выход до {plan.estimate.output} · "
-              f"{usd(plan.estimate_usd)}")
+        print(f"оценка: {plan.request.model} · вход ≈{plan.estimate.input}{' (грубо)' if plan.rough else ''} · "
+              f"выход до {plan.estimate.output} · {usd(plan.estimate_usd)}")
         print(f"зона: {ZONE_RU[plan.zone]}" if plan.zone else f"запрос был бы отклонён: {plan.refusal}")
-        print(_cycle(plan.zones))
+        print(_cycle(plan.zones) if plan.zones is not None else NO_ZONES)
         for n in notes + _burn(plan.zones):
             print(n)
         return 0
@@ -242,11 +245,11 @@ def _run(config: Path, state: Path, now, args: list[str]) -> int:
         print(f"ответ: {path}")
     else:
         print(body)
-    z = api.zones(o["provider"])
+    z = api.zones(o["provider"]) if plan.zones is not None else None
     u = resp.usage
     line = (f"API: {resp.model} · вход {u.input + u.cache_read + u.cache_write} (из кэша {u.cache_read}) · "
-            f"выход {u.output} · {usd(resp.cost_usd)} · {_cycle(z)}")
-    if plan.zone == "purchased" and z.allow_usd is not None:
+            f"выход {u.output} · {usd(resp.cost_usd)}" + (f" · {_cycle(z)}" if z is not None else ""))
+    if plan.zone == "purchased" and z is not None and z.allow_usd is not None:
         line += f" · купленная зона {usd(z.purchased_spent)} из ${z.allow_usd:.2f}, до {ddmm(z.allow_until)}"
     print(line)
     for n in notes + _burn(z):
@@ -265,17 +268,22 @@ def _stats(config: Path, state: Path, now, args: list[str]) -> int:
     api.check_section()
     led = api.read_ledger()
     t = now()
+    daily = api.reg.api.daily_usd
     out = [f"Траты API хаба (оценка) {f'за {days} дн.' if days else 'за цикл'}; сегодня "
-           f"{usd(ledger.spent_today(led, t))} из ${api.reg.api.daily_usd:.2f} (daily_usd)"]
+           f"{usd(ledger.spent_today(led, t))} " + (f"из ${daily:.2f} (daily_usd)" if daily is not None
+                                                   else "(daily_usd не задан)")]
     if not api.reg.api.providers:
         out.append("провайдеры не настроены: нет секций [api.providers.<имя>] в реестре")
     for name, conf in api.reg.api.providers.items():
         z = ledger.zones(led, name, conf, t.date())
-        out.append(f"{name}: включённые {usd(z.included_spent)} из ${z.included_total:.2f}, "
-                   f"остаток {usd(z.included_left)}, до {ddmm(z.until)}")
-        out.append("  купленные: " + (f"{usd(z.purchased_spent)} из ${z.allow_usd:.2f} по разрешению до "
-                                      f"{ddmm(z.allow_until)}" if z.allow_usd is not None
-                                      else f"нет разрешения (wshub api allow {name} --usd … --until …)"))
+        if not ledger.zones_set(led, name, conf):
+            out.append(f"{name}: {NO_ZONES}")
+        else:
+            out.append(f"{name}: включённые {usd(z.included_spent)} из ${z.included_total:.2f}, "
+                       f"остаток {usd(z.included_left)}, до {ddmm(z.until)}")
+            out.append("  купленные: " + (f"{usd(z.purchased_spent)} из ${z.allow_usd:.2f} по разрешению до "
+                                          f"{ddmm(z.allow_until)}" if z.allow_usd is not None
+                                          else f"нет разрешения (wshub api allow {name} --usd … --until …)"))
         if days:
             since = t - timedelta(days=days)
             rows = [r for r in led.rows if datetime.fromisoformat(r["ts"]) >= since]

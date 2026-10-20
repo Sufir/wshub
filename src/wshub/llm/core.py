@@ -54,8 +54,9 @@ class Plan:
     estimate_usd: float
     zone: str | None  # included | purchased; None — запрос был бы отклонён (refusal)
     refusal: str | None
-    zones: ledger.Zones
+    zones: ledger.Zones | None  # None — зоны не проверяются (оператор их не задал, ledger.zones_set)
     skipped: int  # нечитаемых строк журнала
+    rough: bool = False  # вход оценён грубо (символы / 4): нет ключа или нет count_tokens
 
 
 class Api:
@@ -120,6 +121,12 @@ class Api:
         elif req.model:
             model = req.model
             tier = next((t for t in reversed(TIERS) if tiers.get(t) == model), None)
+            # модель вне уровней (с учётом переопределений) — только явным выбором оператора, как strong
+            # (ревью WSH-4.2, решение 1; ТЗ WSH-4.3, п. 2.2.1)
+            if model not in tiers.values() and choice != "operator":
+                levels = ", ".join(f"{t} — {tiers[t]}" for t in TIERS if tiers.get(t))
+                raise ApiError(f"модель {model} не из уровней провайдера {name} ({levels}); другая модель — только "
+                               "явным выбором оператора: --choice operator")
         else:
             raise ApiError("нужен уровень (--tier) или модель (--model)")
         # сильная — и по уровню, и по модели: strong из реестра или собственная strong провайдера, даже если
@@ -129,28 +136,51 @@ class Api:
             raise ApiError(f"сильная модель ({model}) — только явным выбором оператора: --choice operator "
                            f"(strong_requires_choice в [api.providers.{name}])")
         req = replace(req, model=model, tier=tier)
+        inp, rough = self._estimate(name, prov, req)
         try:
-            est = replace(prov.estimate(req), output=req.max_tokens)
+            est = replace(inp, output=req.max_tokens)
             est_usd = prov.price(model, est)
         except KeyError:
             raise ApiError(f"цена модели {model} у провайдера {name} неизвестна — запрос не отправлен") from None
         led = self.read_ledger()
-        z = ledger.zones(led, name, conf, self.now().date())
+        z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
         zone, refusal = self._zone(name, est_usd, z, led)
-        return Plan(prov, req, est, est_usd, zone, refusal, z, led.skipped)
+        return Plan(prov, req, est, est_usd, zone, refusal, z, led.skipped, rough)
+
+    def _estimate(self, name: str, prov: Provider, req: Request) -> tuple[Usage, bool]:
+        """Оценка входа (ТЗ WSH-4.3, п. 2.1.4): при count_tokens и ключе — точная, ключ передаётся провайдеру;
+        ключа нет (или он с ошибкой — отказ скажет запрос) — грубая. Сбой оценки — отказ без ключа в тексте."""
+        key = None
+        if "count_tokens" in prov.caps:
+            try:
+                key = keys.read(keys.key_path(self.config_dir, name))
+            except keys.KeyProblem:
+                key = None
+        if key is None:
+            return prov.estimate(req), True
+        error = None
+        try:
+            est = prov.estimate(req, key=key)
+        except Exception as e:  # сбой провайдера — понятный отказ, ключ вырезан
+            error = scrub(f"{type(e).__name__}: {e}", key)
+        del key
+        if error is not None:  # вне except: без __context__ с исходным текстом
+            raise ApiError(f"провайдер {name}: оценка входа: {error}")
+        return est, False
 
     def _zone(self, name: str, est: float, z: ledger.Zones | None, led: ledger.Ledger,
               per_call: bool = True, day: bool = True) -> tuple[str | None, str | None]:
         """Потолки, затем зона: включённая, если оценка помещается в остаток; иначе купленная — только по
         действующему разрешению оператора (allow). Для задач Code на ключе (ТЗ WSH-4.6, решения 5.1.5 и 5.2):
         per_call=False — без max_usd_per_call (это потолок одного запроса API); day=False — daily_usd в реестре не
-        записан; z=None — зоны не проверяются (нет included_usd провайдера), строка идёт во включённую зону."""
+        записан; z=None — зоны не проверяются (оператор их не задал), строка идёт во включённую зону. Потолок, не
+        записанный в реестре, не проверяется (ТЗ WSH-4.3, п. 2.2.2)."""
         api = self.reg.api
-        if per_call and est > api.max_usd_per_call:
+        if per_call and api.max_usd_per_call is not None and est > api.max_usd_per_call:
             return None, (f"оценка запроса {usd(est)} выше потолка max_usd_per_call = ${api.max_usd_per_call:.2f}; "
                           "уменьши --max-tokens или вход")
         today = ledger.spent_today(led, self.now())
-        if day and today + est > api.daily_usd:
+        if day and api.daily_usd is not None and today + est > api.daily_usd:
             return None, (f"дневной потолок daily_usd = ${api.daily_usd:.2f}: сегодня уже {usd(today)}, "
                           f"запрос {usd(est)}")
         if z is None:
@@ -176,7 +206,7 @@ class Api:
         with ledger.locked(self.ledger_path):
             _prov, conf = self.provider(name)
             led = self.read_ledger()
-            z = ledger.zones(led, name, conf, self.now().date())
+            z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
             zone, refusal = self._zone(name, plan.estimate_usd, z, led)
             if zone is None:
                 raise ApiError(f"{refusal} — запрос не отправлен")

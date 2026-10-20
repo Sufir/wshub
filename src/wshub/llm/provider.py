@@ -17,8 +17,9 @@ class Provider(Protocol):
     def price(self, model: str, usage: Usage) -> float:
         """Оценка в USD по таблице провайдера; неизвестная модель — KeyError."""
 
-    def estimate(self, request: Request) -> Usage:
-        """Оценка входа: точная при count_tokens, иначе грубая (символы / 4)."""
+    def estimate(self, request: Request, key: str | None = None) -> Usage:
+        """Оценка входа: точная при count_tokens, иначе грубая (символы / 4). Ключ ядро передаёт, только если у
+        провайдера есть count_tokens и ключ есть; без ключа — грубо (ТЗ WSH-4.3, п. 2.1.4)."""
 
     def run(self, request: Request, key: str) -> Response:
         """Один запрос. request.model уже выбран ядром."""

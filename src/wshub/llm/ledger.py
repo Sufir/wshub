@@ -136,6 +136,12 @@ class Zones:
         return self.days_left is not None and 0 <= self.days_left < BURN_DAYS and self.included_left > BURN_USD
 
 
+def zones_set(led: Ledger, provider: str, conf) -> bool:
+    """Проверять ли зоны провайдера: только если их задал оператор — included_usd в реестре или команда credits
+    в журнале (ТЗ WSH-4.3, п. 2.2.2 и решение 5.1). Иначе зон нет, строки идут во включённую."""
+    return conf.included_set or any(r["kind"] == "credits" and r["provider"] == provider for r in led.rows)
+
+
 def zones(led: Ledger, provider: str, conf, today: date) -> Zones:
     """Зоны провайдера. Цикл — от последней команды credits (или от начала журнала) до until. Команда credits
     сильнее реестра. Купленная зона — только при действующем allow; её траты считаются от команды allow."""

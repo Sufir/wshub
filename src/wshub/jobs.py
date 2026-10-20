@@ -724,7 +724,12 @@ class Jobs:
 
     def _check_key(self, plan: Plan) -> None:
         """Задача на ключе (ТЗ WSH-4.6, п. 2.1.4; разрешения проекта нет — упрощение 5.2): ключ anthropic есть и с
-        верными правами. Значение читается только для проверки и сразу отбрасывается; в отказ — текст keys без ключа."""
+        верными правами. Значение читается только для проверки и сразу отбрасывается; в отказ — текст keys без ключа.
+        Хаб запущен как python -m wshub — отказ (ТЗ WSH-4.3, п. 2.2.4): apiKeyHelper выполняется вне песочницы с
+        каталогом проекта в sys.path, и ./wshub/__init__.py, созданный задачей, получил бы ключ."""
+        if not claude_cli.wshub_exe():
+            raise JobError("задача на ключе: wshub запущен как «python -m wshub», а не исполняемым файлом — ключ "
+                           "задаче не выдаётся; поставь wshub как программу (uv tool install) и перезапусти")
         from .llm import keys
         try:
             keys.read(keys.key_path(self.hub.registry.path.parent, KEY_PROVIDER))

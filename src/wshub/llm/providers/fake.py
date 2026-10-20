@@ -42,7 +42,7 @@ class FakeProvider:
         inp, out, cr, cw = self._prices[model]
         return (usage.input * inp + usage.output * out + usage.cache_read * cr + usage.cache_write * cw) / 1e6
 
-    def estimate(self, request: Request) -> Usage:
+    def estimate(self, request: Request, key: str | None = None) -> Usage:
         return Usage(input=rough_tokens(prompt_text(request)))
 
     def run(self, request: Request, key: str) -> Response:

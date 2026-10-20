@@ -242,9 +242,59 @@ def test_strong_choice_not_bypassed_by_tier_override(api, monkeypatch, models, a
 
 
 def test_unknown_model_price_refused(api, monkeypatch):
-    prov = use(monkeypatch, fake.FakeProvider())
-    rc, _, err = api.run("--model", "nope-1", tier=None)
+    prov = use(monkeypatch, fake.FakeProvider())  # модель вне уровней — выбор оператора (WSH-4.3), отказ — по цене
+    rc, _, err = api.run("--model", "nope-1", "--choice", "operator", tier=None)
     assert rc == 1 and "цена модели nope-1" in err and prov.calls == []
+
+
+def test_model_outside_tiers_needs_operator_choice(api, monkeypatch):
+    """WSH-4.3, п. 2.2.1 и 3.5: явная --model вне уровней (с учётом переопределений) — только с --choice operator,
+    независимо от strong_requires_choice; текст называет уровни и их модели."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    set_api(api.env, API + 'models = { cheap = "fake-standard" }\nstrong_requires_choice = false\n')
+    rc, _, err = api.run("--model", "fake-cheap", tier=None)  # своя cheap провайдера убрана переопределением
+    assert rc == 1 and prov.calls == [] and api.rows() == []
+    assert ("модель fake-cheap не из уровней провайдера fake (cheap — fake-standard, standard — fake-standard, "
+            "strong — fake-strong); другая модель — только явным выбором оператора: --choice operator") in err
+    with pytest.raises(api_core.ApiError, match="не из уровней"):  # ядро само, без отсечки CLI
+        api.engine().plan(req(tier=None, model="fake-cheap"), "fake")
+    rc, out, _ = api.run("--model", "fake-cheap", "--choice", "operator", tier=None)
+    assert rc == 0 and "API: fake-cheap" in out and prov.calls[-1].model == "fake-cheap"
+    assert api.run("--model", "fake-standard", tier=None)[0] == 0  # модель уровня — без выбора
+
+
+def test_money_limits_only_when_set(api, monkeypatch):
+    """WSH-4.3, п. 2.2.2 и 3.6: без included_usd, daily_usd и max_usd_per_call — ни зон, ни потолков; запрос
+    проходит, строка журнала пишется (зона — включённая)."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    set_api(api.env, "[api]\nenabled = true\n\n[api.providers.fake]\n")
+    reg = registry.RegistryFile(api.env.cfg).get()
+    assert reg.api.max_usd_per_call is None and reg.api.daily_usd is None
+    assert not reg.api.providers["fake"].included_set
+    api.spend(1000)  # сегодня «потрачено» много — потолка нет
+    rc, out, err = api.run("--max-tokens", "1000000")  # оценка ≈$5 — потолка одного запроса нет
+    assert rc == 0, err
+    assert "цикл" not in out and len(prov.calls) == 1
+    r = api.rows()[-1]
+    assert (r["zone"], r["ok"], r["provider"]) == ("included", True, "fake")
+    rc, out, _ = api.run("--estimate")
+    assert rc == 0 and "зона: включённая" in out and "зоны не проверяются" in out
+    rc, out, _ = api.cli("stats")
+    assert rc == 0 and "сегодня ≈$1000.00 (daily_usd не задан)" in out
+    assert "fake: зоны не проверяются" in out and "по зонам: включённая" in out
+
+
+def test_credits_command_turns_zones_on(api, monkeypatch):
+    """Решение 5.1 (вопрос 2): команда credits — явное действие оператора, она включает зоны и без included_usd."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    set_api(api.env, "[api]\nenabled = true\n\n[api.providers.fake]\n")
+    assert api.cli("credits", "fake", "--left", "0", "--until", "31.10")[0] == 0
+    rc, _, err = api.run()
+    assert rc == 1 and "включённые кредиты исчерпаны" in err and prov.calls == []
+    assert "fake: включённые" in api.cli("stats")[1]
+    api.cli("credits", "fake", "--left", "1", "--until", "31.10")
+    rc, out, _ = api.run()
+    assert rc == 0 and "из $1.00, до 31.10" in out
 
 
 # ---------- ключи (п. 4.4, 2.2) ----------
@@ -606,6 +656,14 @@ def test_api_error_breaks_only_api(api):
     ("[api]\ndaily_usd = inf\n", "daily_usd"),
     ('[api.providers.fake]\nincluded_usd = inf\ncredits_until = "2026-10-31"\n', "included_usd"),
     ('[api.providers.fake]\ncredits_until = "20261031"\n', "credits_until"),
+    ('[api.providers.fake]\nbase_url = "http://api.example.com"\n', "base_url"),  # http — только loopback
+    ('[api.providers.fake]\nbase_url = "http://127.0.0.2:8080"\n', "base_url"),
+    ('[api.providers.fake]\nbase_url = "https://user@api.example.com"\n', "base_url"),
+    ('[api.providers.fake]\nbase_url = "ftp://x"\n', "base_url"),
+    ('[api.providers.fake]\nbase_url = 5\n', "base_url"),
+    ('[api.providers.fake]\ntimeout_s = 0\n', "timeout_s"),
+    ('[api.providers.fake]\ntimeout_s = "30"\n', "timeout_s"),
+    ('[api.providers.fake]\ntimeout_s = true\n', "timeout_s"),
 ])
 def test_api_section_errors(text, err):
     reg = registry.parse(text)
@@ -623,6 +681,11 @@ def test_api_registry_values():
     assert any("[api.providers.nope]: неизвестный провайдер" in w for w in reg.warnings)
     assert "неизвестный ключ api.future — пропущен" in reg.warnings
     assert registry.parse("").api == registry.Api()
+    assert p.base_url is None and p.timeout_s is None
+    for url in ("https://api.anthropic.com", "https://proxy.local/anthropic", "http://127.0.0.1:8123",
+                "http://localhost:9"):
+        p = registry.parse(f'[api.providers.fake]\nbase_url = "{url}"\ntimeout_s = 30\n').api.providers["fake"]
+        assert (p.base_url, p.timeout_s) == (url, 30)
 
 
 def test_broken_provider_import_breaks_only_api(env, monkeypatch):

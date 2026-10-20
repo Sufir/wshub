@@ -28,6 +28,7 @@ class Usage:
     output: int = 0
     cache_read: int = 0
     cache_write: int = 0
+    cache_write_1h: int = 0  # часть cache_write, записанная с TTL 1 ч (для цены по разбивке, ТЗ WSH-4.3, 5.1)
 
     def as_dict(self) -> dict:
         return asdict(self)

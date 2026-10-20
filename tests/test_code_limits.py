@@ -153,9 +153,11 @@ def test_over_time_without_max_hours_never(code):
 
 def test_no_max_hours_job_runs_and_lost_still_detected(code, monkeypatch):
     code.write(**NO_LIMITS)
+    monkeypatch.setenv("FAKE_SLEEP", "3")  # несколько опросов надзирателя (POLL = 1 с): остановки по времени нет
     d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))
     assert code.jobs.read(d["id"])["max_hours"] is None
-    assert wait_terminal(code.jobs, d["id"])["state"] == "completed"
+    snap = wait_terminal(code.jobs, d["id"])
+    assert (snap["state"], snap["reason"]) == ("completed", None)
     monkeypatch.setenv("FAKE_SLEEP", "30")
     d = code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md")))
     _wait_running(code.jobs, d["id"])
@@ -209,6 +211,55 @@ def test_chain_remaining_only_with_limit(code):
     wait_terminal(code.jobs, nxt["id"])
 
 
+def test_replan_without_limits(code):
+    """replan (_link_plan фазы плана) при незаданных лимитах: ни потолка ходов, ни доли бюджета, без TypeError."""
+    code.write(**NO_LIMITS)
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(), plan="review", reason=REASON))["id"]
+    _wait_state(code.jobs, root, ("plan_ready", "failed", "completed"))
+    r = code.jobs.replan(root, "поправь")
+    assert (r["phase"], r["max_turns"], r["budget_usd"]) == ("plan", None, None)
+    assert "--max-turns" not in _argv(code, r["id"]) and "--max-budget-usd" not in _argv(code, r["id"])
+    _wait_state(code.jobs, root, ("plan_ready", "failed", "completed"))
+
+
+def test_plan_limit_alone_does_not_leak_into_execute(code):
+    """Задан только plan_max_turns: фаза плана и replan получают его, а исполнение (approve) — без потолка ходов;
+    потолок фазы плана не становится лимитом всей задачи (остаток ходов цепочки — только при max_turns)."""
+    code.write(**{**NO_LIMITS, "plan_max_turns": "7"})
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(), plan="review", reason=REASON))["id"]
+    _wait_state(code.jobs, root, ("plan_ready", "failed", "completed"))
+    r = code.jobs.replan(root, "поправь")
+    assert (r["max_turns"], r["budget_usd"]) == (7, None)
+    assert _opt(_argv(code, r["id"]), "--max-turns") == "7"
+    _wait_state(code.jobs, root, ("plan_ready", "failed", "completed"))
+    nxt = code.jobs.approve(root)  # фейк потратил 2 хода фазы плана; от «7 − ходы» исполнение остаться не должно
+    assert (nxt["phase"], nxt["max_turns"], nxt["budget_usd"]) == ("execute", None, None)
+    wait_terminal(code.jobs, nxt["id"])
+    assert "--max-turns" not in _argv(code, nxt["id"]) and "--max-budget-usd" not in _argv(code, nxt["id"])
+
+
+def test_daily_budget_without_task_budget(code, monkeypatch):
+    """Дневной бюджет задан, бюджета задачи нет (решение 5.1.3): звено входит в сумму как 0, завершённые звенья
+    сегодня — по их стоимости."""
+    code.write(**{**NO_LIMITS, "daily_budget_usd": "0.6", "max_parallel": "5"})
+    monkeypatch.setenv("FAKE_SLEEP", "10")
+    a = code.jobs.start(code.jobs.plan("proj", code.taskfile("A.md")))
+    _wait_running(code.jobs, a["id"])
+    b = code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md")))  # идущая задача без бюджета — 0, отказа нет
+    for x in (a, b):
+        code.jobs.cancel(x["id"])
+        wait_terminal(code.jobs, x["id"], timeout=60)
+    monkeypatch.setenv("FAKE_SLEEP", "0")
+    code.write(**{**NO_LIMITS, "daily_budget_usd": "0.4", "max_parallel": "5"})
+    c = code.jobs.start(code.jobs.plan("proj", code.taskfile("C.md")))
+    wait_terminal(code.jobs, c["id"])
+    assert code.jobs.read(c["id"])["result"]["total_cost_usd"] == pytest.approx(0.5)
+    with pytest.raises(JobError, match="дневной бюджет"):  # завершённое звено 0.5 + 0 > 0.4
+        code.jobs.start(code.jobs.plan("proj", code.taskfile("D.md")))
+    code.write(**{**NO_LIMITS, "daily_budget_usd": "0.6", "max_parallel": "5"})
+    wait_terminal(code.jobs, code.jobs.start(code.jobs.plan("proj", code.taskfile("E.md")))["id"])  # 0.5 ≤ 0.6
+
+
 def test_resume_inherited_limit_silent_explicit_warns(code):
     """Лимиты, унаследованные от родителя, молча не применяются; предупреждение — на переданный в этом вызове."""
     d = code.jobs.start(code.jobs.plan("proj", code.taskfile()))  # потолки оператора заданы — у родителя 100 и 10
@@ -252,7 +303,8 @@ def test_no_dollars_in_mcp_answers(code):
     jid = _finished(code)
     assert code.jobs.read(jid)["result"]["total_cost_usd"] > 0  # в job.json хранится как раньше
     for name, args in (("code_status", {"job": jid}), ("code_result", {"job": jid}), ("code_jobs", {}),
-                       ("code_stats", {}), ("code_wait", {"job": jid, "seconds": 1})):
+                       ("code_stats", {}), ("code_wait", {"job": jid, "seconds": 1}),
+                       ("code_cancel", {"job": jid})):  # завершённая задача: отмена отдаёт снимок с итогом
         text = _call(code, name, args)
         assert "cost" not in text and "$" not in text, (name, text)
     assert json.loads(_call(code, "code_jobs", {}))[0]["state"] == "completed"  # остальное осталось
@@ -268,7 +320,7 @@ def test_no_dollars_in_card(code):
     assert "cost" not in data and "$" not in data
     assert json.loads(data)["billing"] == "подписка" and json.loads(data)["state"] == "completed"
     html = (resources.files("wshub") / "code_card.html").read_text(encoding="utf-8")
-    assert "cost_usd" not in html and "стоимость" not in html and '"$" +' not in html
+    assert "cost_usd" not in html and "стоимость" not in html and "toFixed" not in html and '"$"' not in html
 
 
 def test_no_dollars_in_cli(code, capsys):

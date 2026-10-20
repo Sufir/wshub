@@ -935,7 +935,7 @@ class Jobs:
         spent = _sum(phase_cost(x) for x in links)
         turns = sum(int((x.get("result") or {}).get("num_turns") or 0) for x in links)
         total_usd = d.get("budget_total") or d.get("budget_usd")
-        total_turns = d.get("max_turns_total") or d.get("max_turns")
+        total_turns = d.get("max_turns_total")  # не max_turns звена: у фазы плана это потолок plan_max_turns
         return (None if not total_usd else _cents(float(total_usd) - spent),
                 None if not total_turns else int(total_turns) - turns)
 

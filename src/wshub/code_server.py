@@ -234,7 +234,7 @@ def build_code_server(hub) -> FastMCP:
             _audit("code_cancel", job=job, status="error", error=str(e))
             return f"отказ: {e}"
         _audit("code_cancel", project=snap.get("project"), job=job)
-        return _dump(snap)
+        return _dump(hide_cost(snap))  # снимок завершённой задачи или корня цепочки несёт суммы (WSH-4.7)
 
     @tool(meta=CARD_META)
     def code_resume(job: str, prompt: str, note: str = "", model: str = "", effort: str = "",

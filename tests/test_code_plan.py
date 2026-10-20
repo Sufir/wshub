@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -791,7 +792,8 @@ def test_code_stats_aggregates(code, capsys):
     assert len(out) == 2 and all("avg_cost_usd" not in r for r in out)  # средняя цена на подписке не показывается
     assert code_cli.code_main("code", ["stats", "proj", "--days", "30"], code.cfg, code.state) == 0
     text = capsys.readouterr().out
-    assert "task/M/low (встроенная)" in text and "policy" in text and "7.0" in text  # средние ходы остались
+    assert "task/M/low (встроенная)" in text and "policy" in text
+    assert re.search(r"\s7\.0\s", text)  # средние ходы остались
     assert "2.25" not in text and "$" not in text
 
 

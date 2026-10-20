@@ -295,6 +295,40 @@ def test_credits_command_turns_zones_on(api, monkeypatch):
     api.cli("credits", "fake", "--left", "1", "--until", "31.10")
     rc, out, _ = api.run()
     assert rc == 0 and "из $1.00, до 31.10" in out
+    led = ledger.read(api.ledger_path)  # credits одного провайдера не включает зоны другого
+    assert ledger.zones_set(led, "fake", registry.ApiProvider())
+    assert not ledger.zones_set(led, "other", registry.ApiProvider())
+    eng = api.engine()  # и под блокировкой перед отправкой зона проверяется заново
+    plan = eng.plan(req(), "fake")
+    assert plan.zone == "included" and plan.zones is not None
+    api.cli("credits", "fake", "--left", "0", "--until", "31.10")
+    with pytest.raises(api_core.ApiError, match="исчерпаны"):
+        eng.run(plan)
+    assert len(prov.calls) == 1
+
+
+class LeakyEstimate(fake.FakeProvider):
+    """count_tokens отвергает ключ и называет его в тексте исключения."""
+
+    def estimate(self, request, key=None):
+        if key is not None:
+            raise RuntimeError(f"count_tokens: bad key {key!r} ({key[:12]}…)")
+        return super().estimate(request)
+
+
+def test_estimate_failure_scrubbed(api, monkeypatch):
+    """Ключ передаётся в estimate (WSH-4.3, п. 2.1.4) — сбой оценки отказывает без ключа и его кусков в тексте."""
+    prov = use(monkeypatch, LeakyEstimate())
+    rc, out, err = api.run()
+    assert rc == 1 and "провайдер fake: оценка входа: RuntimeError: count_tokens: bad key" in err
+    assert "<ключ скрыт>" in err and MARKER not in out + err and MARKER[:12] not in out + err
+    with pytest.raises(api_core.ApiError) as ei:
+        api.engine().plan(req(), "fake")
+    assert MARKER not in str(ei.value) and ei.value.__context__ is None and ei.value.__cause__ is None
+    assert prov.calls == [] and api.rows() == []
+    keys.key_path(api.env.cfg.parent, "fake").unlink()  # без ключа — грубо, без вызова с ключом
+    rc, out, _ = api.run("--estimate")
+    assert rc == 0 and "(грубо)" in out
 
 
 # ---------- ключи (п. 4.4, 2.2) ----------
@@ -660,6 +694,7 @@ def test_api_error_breaks_only_api(api):
     ('[api.providers.fake]\nbase_url = "http://127.0.0.2:8080"\n', "base_url"),
     ('[api.providers.fake]\nbase_url = "https://user@api.example.com"\n', "base_url"),
     ('[api.providers.fake]\nbase_url = "ftp://x"\n', "base_url"),
+    ('[api.providers.fake]\nbase_url = "https://api.anthropic.com\\n"\n', "base_url"),
     ('[api.providers.fake]\nbase_url = 5\n', "base_url"),
     ('[api.providers.fake]\ntimeout_s = 0\n', "timeout_s"),
     ('[api.providers.fake]\ntimeout_s = "30"\n', "timeout_s"),

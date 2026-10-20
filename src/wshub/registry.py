@@ -675,7 +675,7 @@ def _api(t, warnings: list[str]) -> Api:
                 raise RegistryError(f"{where} strong_requires_choice: true или false")
             pv["strong_requires_choice"] = p["strong_requires_choice"]
         if "base_url" in p:
-            if not isinstance(p["base_url"], str) or not API_BASE_URL_RE.match(p["base_url"]):
+            if not isinstance(p["base_url"], str) or not API_BASE_URL_RE.fullmatch(p["base_url"]):
                 raise RegistryError(f"{where} base_url: https://хост[/путь]; http:// — только для 127.0.0.1 и "
                                     "localhost")
             pv["base_url"] = p["base_url"]

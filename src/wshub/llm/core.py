@@ -1,5 +1,6 @@
 """Ядро API хаба (ТЗ WSH-4.2): барьеры реестра, caps провайдера, выбор модели, оценка цены, зоны и потолки трат —
-всё до запроса; ключ читается только в момент запроса. Форматов конкретного API ядро не знает."""
+всё до запроса; ключ читается только в момент запроса и для точной оценки входа (count_tokens, ТЗ WSH-4.3).
+Форматов конкретного API ядро не знает."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -136,12 +137,13 @@ class Api:
             raise ApiError(f"сильная модель ({model}) — только явным выбором оператора: --choice operator "
                            f"(strong_requires_choice в [api.providers.{name}])")
         req = replace(req, model=model, tier=tier)
-        inp, rough = self._estimate(name, prov, req)
         try:
-            est = replace(inp, output=req.max_tokens)
-            est_usd = prov.price(model, est)
+            prov.price(model, Usage())  # цена неизвестна — отказ до оценки входа (count_tokens — запрос с ключом)
         except KeyError:
             raise ApiError(f"цена модели {model} у провайдера {name} неизвестна — запрос не отправлен") from None
+        inp, rough = self._estimate(name, prov, req)
+        est = replace(inp, output=req.max_tokens)
+        est_usd = prov.price(model, est)
         led = self.read_ledger()
         z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
         zone, refusal = self._zone(name, est_usd, z, led)

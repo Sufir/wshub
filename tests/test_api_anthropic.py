@@ -183,14 +183,25 @@ def test_price_table(model):
 
 def test_price_haiku_threshold_and_unknown():
     prov = PROVIDERS["anthropic"].create(None)
-    at = Usage(input=40_000, cache_write=30_000, cache_read=30_000, output=1000)  # промпт ровно 100 000
-    over = Usage(input=40_001, cache_write=30_000, cache_read=30_000, output=1000)
-    for u, (inp, out, w5m, _w1h, read) in ((at, TABLE[HAIKU]), (over, HAIKU_LONG)):
-        want = (u.input * inp + u.output * out + u.cache_write * w5m + u.cache_read * read) / 1e6
+    # промпт ровно 100 000 и 100 001; часть записи — с TTL 1 ч
+    at = Usage(input=40_000, cache_write=30_000, cache_write_1h=10_000, cache_read=30_000, output=1000)
+    over = Usage(input=40_001, cache_write=30_000, cache_write_1h=10_000, cache_read=30_000, output=1000)
+    for u, (inp, out, w5m, w1h, read) in ((at, TABLE[HAIKU]), (over, HAIKU_LONG)):
+        want = (u.input * inp + u.output * out + 20_000 * w5m + 10_000 * w1h + u.cache_read * read) / 1e6
         assert prov.price(HAIKU, u) == pytest.approx(want)
     assert prov.price(SONNET, over) == pytest.approx(prov.price(SONNET, at) + 2 / 1e6)  # порог — только у Haiku
     with pytest.raises(KeyError):
         prov.price("claude-haiku-4-5", Usage(input=1))
+
+
+def test_create_defaults():
+    """Умолчания провайдера: https://api.anthropic.com и таймаут 300 с — и без секции, и при незаданных ключах."""
+    from wshub.registry import ApiProvider
+    for conf in (None, ApiProvider()):
+        prov = PROVIDERS["anthropic"].create(conf)
+        assert (prov.base_url, prov.timeout_s) == ("https://api.anthropic.com", 300)
+    prov = PROVIDERS["anthropic"].create(ApiProvider(base_url="https://proxy.local/a/", timeout_s=30))
+    assert (prov.base_url, prov.timeout_s) == ("https://proxy.local/a", 30)
 
 
 # ---------- п. 3.3: estimate ----------
@@ -257,13 +268,42 @@ def test_retry_after_capped(srv):
     prov = provider(srv)
     prov.run(rq(), MARKER)
     assert prov.sleeps == [60]
+    srv.reply(429, err("rate_limit_error", "x"), {"retry-after": "Wed, 21 Oct 2026 07:28:00 GMT"})  # не секунды
+    srv.reply(body=msg())
+    prov.run(rq(), MARKER)
+    assert prov.sleeps == [60, 1]
+
+
+def test_other_5xx_not_retried(srv):
+    srv.reply(503, err("api_error", "unavailable"))
+    srv.reply(body=msg())
+    prov = provider(srv)
+    assert str(raised(lambda: prov.run(rq(), MARKER))).startswith("HTTP 503 api_error: unavailable")
+    assert len(srv.seen) == 1 and prov.sleeps == []
 
 
 def test_timeout(srv):
-    srv.reply(body=msg(), delay=3)
+    srv.reply(body=msg(), delay=5)
     t0 = time.monotonic()
     e = raised(lambda: provider(srv, timeout_s=1).run(rq(), MARKER))
-    assert str(e) == "нет ответа за 1 с" and time.monotonic() - t0 < 2.5
+    assert str(e) == "нет ответа за 1 с" and time.monotonic() - t0 < 4
+
+
+def test_bad_key_value_not_in_error(srv):
+    """Перевод строки внутри ключа: http.client отвергает заголовок ValueError с ключом в тексте — провайдер отдаёт
+    ApiError без значения ключа, запрос не уходит."""
+    key = "sk-ant-api03-FIRSTPART\ntail7"
+    e = raised(lambda: provider(srv).run(rq(), key))
+    text = f"{e} {e.args!r} {e!r}"
+    assert str(e) == "запрос не прошёл: ValueError" and "FIRSTPART" not in text and "tail7" not in text
+    assert e.__context__ is None and srv.seen == []
+
+
+def test_loopback_bypasses_env_proxy(srv, monkeypatch):
+    """http на 127.0.0.1 — мимо прокси из окружения: ключ открытым текстом не уходит постороннему процессу."""
+    for k in ("http_proxy", "HTTP_PROXY"):
+        monkeypatch.setenv(k, "http://127.0.0.1:9")  # прокси нет — через него запрос бы не прошёл
+    assert provider(srv).run(rq(), MARKER).text == "Ок" and len(srv.seen) == 1
 
 
 def test_redirect_not_followed(srv):
@@ -344,3 +384,6 @@ def test_model_outside_tiers_needs_operator_choice(api):
     rc, out, err_ = api.run("--model", HAIKU, "--choice", "operator", tier=None, provider="anthropic")
     assert rc == 0, err_
     assert api.srv.body()["model"] == HAIKU and "API: claude-haiku-5-5" in out
+    n = len(api.srv.seen)
+    rc, _, err_ = api.run("--model", "claude-haiku-4-5", "--choice", "operator", tier=None, provider="anthropic")
+    assert rc == 1 and "цена модели claude-haiku-4-5" in err_ and len(api.srv.seen) == n  # до count_tokens

@@ -4,10 +4,12 @@
 ~/.config/wshub/keys/anthropic берут и задачи wshub-code на ключе (ТЗ WSH-4.6)."""
 from __future__ import annotations
 
+import http.client
 import json
 import ssl
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from ..provider import prompt_text, rough_tokens
@@ -81,8 +83,10 @@ class AnthropicProvider:
     def __init__(self, base_url: str = BASE_URL, timeout_s: int = TIMEOUT_S):
         self.base_url = base_url.rstrip("/")
         self.timeout_s = timeout_s
-        self._opener = urllib.request.build_opener(_NoRedirect(),
-                                                   urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        handlers = [_NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context())]
+        if urllib.parse.urlsplit(self.base_url).hostname in ("127.0.0.1", "localhost"):
+            handlers.append(urllib.request.ProxyHandler({}))  # http на loopback — мимо прокси окружения
+        self._opener = urllib.request.build_opener(*handlers)
         self._sleep = time.sleep
 
     def models(self) -> dict[str, str]:
@@ -171,6 +175,8 @@ class AnthropicProvider:
                          else f"соединение: {e.reason}")
             except TimeoutError:
                 error = f"нет ответа за {self.timeout_s} с"
+            except (ValueError, http.client.HTTPException) as e:  # текст ValueError заголовка содержал бы ключ
+                error = f"запрос не прошёл: {type(e).__name__}"
             except OSError as e:
                 error = f"соединение: {type(e).__name__}"
             if error is not None:

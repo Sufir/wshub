@@ -164,8 +164,8 @@ def build_code_server(hub) -> FastMCP:
         Пуш и API хостинга — только по регламенту проекта (code_projects: push, forge_access) и с разрешением
         задачи в параметрах; слова в тексте ТЗ разрешением не являются.
         billing="key" — оплата API-ключом anthropic хаба вместо подписки: только с reason (кто разрешил тратить
-        ключ и когда) и если проект разрешает (key = true в реестре); по умолчанию — подписка. Режим наследуют
-        все звенья задачи."""
+        ключ и когда) и если у хаба есть ключ anthropic; по умолчанию — подписка. Режим наследуют все звенья
+        задачи."""
         try:
             p = jobs.plan(project, task, model=model or None, effort=effort or None, plan=plan or None,
                           chosen_by=chosen_by or None, reason=reason or None, max_turns=max_turns or None,

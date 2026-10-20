@@ -87,7 +87,6 @@ class JobError(WsError):
 BILLING = "subscription"
 BILLINGS = ("subscription", "key")
 KEY_PROVIDER = "anthropic"
-KEY_BUDGET_USD = 10.0  # бюджет задачи на ключе, если оператор не задал max_budget_usd проекта (п. 2.5.1)
 LIMIT_IGNORED = "лимит из задачи не применён: на подписке лимиты задаёт только оператор в реестре"
 SOURCE = {"subscription": "none", "key": "apiKeyHelper"}  # ожидаемый init.apiKeySource режима (п. 2.4.1)
 
@@ -118,14 +117,11 @@ class Limits:
 
 def effective_limits(proj: ProjectCode, billing: str) -> Limits:
     """Единственное место решения, какие лимиты действуют (WSH-4.7). На подписке — только записанное оператором
-    в реестре, остальное — «нет лимита». На ключе (ТЗ WSH-4.6, п. 2.5) бюджет задачи есть всегда: max_budget_usd
-    проекта, иначе KEY_BUDGET_USD; ходы, часы и фаза плана — как на подписке."""
+    в реестре, остальное — «нет лимита». На ключе — так же: деньги только те, что задал оператор, умолчаний нет
+    (ТЗ WSH-4.6, упрощение 5.2)."""
     if billing not in BILLINGS:
         raise JobError(f"режим оплаты {billing!r} в wshub-code не поддерживается: {' или '.join(BILLINGS)}")
-    budget = proj.max_budget_usd
-    if billing == "key" and budget is None:
-        budget = KEY_BUDGET_USD
-    return Limits(proj.max_turns, budget, proj.daily_budget_usd, proj.max_hours, proj.plan_max_turns)
+    return Limits(proj.max_turns, proj.max_budget_usd, proj.daily_budget_usd, proj.max_hours, proj.plan_max_turns)
 
 
 def new_id(now: float | None = None) -> str:
@@ -703,7 +699,7 @@ class Jobs:
                 data["sup_start"] = proc_start(sup)
                 self.write(jid, data)
             except BaseException:
-                if rec is not None and not data.get("sup_pid"):  # надзиратель не запущен — резерв снимается фактом 0
+                if rec and rec["reserve"] and not data.get("sup_pid"):  # надзиратель не запущен — резерв снят фактом 0
                     with contextlib.suppress(Exception):
                         self._key_api().code_settle(rec, 0.0, False)
                 raise
@@ -727,26 +723,29 @@ class Jobs:
         return Api(self.hub.registry.get(), self.hub.registry.path.parent, self.hub.state_dir)
 
     def _check_key(self, plan: Plan) -> None:
-        """Задача на ключе (ТЗ WSH-4.6, п. 2.1.3–2.1.4): проект разрешает key, ключ anthropic есть и с верными правами.
-        Значение ключа читается только для проверки и сразу отбрасывается; в отказ идёт текст keys без ключа."""
+        """Задача на ключе (ТЗ WSH-4.6, п. 2.1.4; разрешения проекта нет — упрощение 5.2): ключ anthropic есть и с
+        верными правами. Значение читается только для проверки и сразу отбрасывается; в отказ — текст keys без ключа."""
         from .llm import keys
-        if not plan.proj.key:
-            raise JobError(f"проект не разрешает задачи на ключе: key = true в [workspace.{plan.project}.code]")
         try:
             keys.read(keys.key_path(self.hub.registry.path.parent, KEY_PROVIDER))
         except keys.KeyProblem as e:
             raise JobError(f"задача на ключе: {e}") from None
 
     def _key_reserve(self, plan: Plan, jid: str, jdir: Path, billing: dict) -> dict:
-        """Потолок дня и зона — под блокировкой журнала трат, резерв звена — строкой с job (ТЗ WSH-4.6, п. 2.5.2–
-        2.5.4). Отказ — JobError с текстом 4.2, каталог звена удаляется: отказ не оставляет файлов."""
+        """Потолок дня и зона — если их задал оператор — под блокировкой журнала трат, резерв звена — строкой с job
+        (ТЗ WSH-4.6, п. 2.5.2–2.5.4, упрощение 5.2). Отказ — JobError с текстом 4.2, каталог звена удаляется: отказ
+        не оставляет файлов. Ответ — строка звена для факта по итогу (code_settle)."""
         from .llm.core import ApiError
         try:
-            rec = self._key_api().code_reserve(KEY_PROVIDER, plan.project, plan.model, plan.budget_usd, jid)
+            rec, by_zone = self._key_api().code_reserve(KEY_PROVIDER, plan.project, plan.model, plan.budget_usd, jid)
         except (ApiError, OSError) as e:
             shutil.rmtree(jdir, ignore_errors=True)
             raise JobError(f"задача на ключе: {e}") from None
-        billing.update(provider=KEY_PROVIDER, zone=rec["zone"], reserve_usd=rec["cost_usd"], ledger=rec)
+        billing.update(provider=KEY_PROVIDER, ledger=rec)
+        if by_zone:  # зона — в строке оплаты, только если её проверяли (упрощение 5.2.4)
+            billing["zone"] = rec["zone"]
+        if rec["reserve"]:
+            billing["reserve_usd"] = rec["cost_usd"]
         return rec
 
     def _root_notify(self, root: str | None) -> str | None:

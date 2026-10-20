@@ -1,11 +1,12 @@
-"""WSH-4.6, задачи wshub-code на API-ключе: режим billing, разрешение проекта, передача ключа claude через
-apiKeyHelper, страж оплаты по режиму, остановка key_rejected, лимиты и журнал трат 4.2 (резерв → факт), показ сумм,
-флаги терминала, провайдер-заготовка anthropic. Настоящий claude и сеть не вызываются — tests/fake_claude.py,
-ключ — фейковый с уникальной строкой."""
+"""WSH-4.6, задачи wshub-code на API-ключе: режим billing, передача ключа claude через apiKeyHelper, страж оплаты по
+режиму, остановка key_rejected, деньги только заданные оператором и журнал трат 4.2 (резерв → факт), показ сумм,
+флаги терминала, провайдер-заготовка anthropic (с упрощением 5.2: без key = true и без умолчаний сумм). Настоящий
+claude и сеть не вызываются — tests/fake_claude.py, ключ — фейковый с уникальной строкой."""
 from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import threading
 import time
@@ -32,12 +33,11 @@ MARKER = "sk-ant-api03-WSH46-MARKER-c0ffee7d1e9b"
 REASON = "оператор в чате 20.10: разведка на промокредитах"
 API = '[api]\ndaily_usd = 50\n\n[api.providers.anthropic]\nincluded_usd = 100\ncredits_until = "2099-12-31"\n'
 NO_REASON = "задача на ключе из чата — только с reason"
-NO_PERMISSION = "проект не разрешает задачи на ключе: key = true в [workspace.proj.code]"
 
 
 def _registry(code, api: str = API, **over) -> None:
-    """Реестр проекта с key = true (если не задано иначе) и секциями [api] / [api.providers.anthropic]."""
-    code.write(**{"key": "true", **over})
+    """Реестр проекта и секции [api] / [api.providers.anthropic] (api="" — секций нет)."""
+    code.write(**over)
     code.cfg.write_text(code.cfg.read_text(encoding="utf-8") + "\n" + api, encoding="utf-8")
     code.hub = Hub(code.cfg, code.state)
     code.jobs = Jobs(code.hub)
@@ -91,14 +91,25 @@ HELPER = shlex.join([*claude_cli.wshub_cmd(), "code", "key-helper"])
 
 # ---------- п. 3.1: выбор режима ----------
 
-def test_key_needs_project_permission(code):
-    _registry(code, key=None)  # key = true в реестре нет, ключ и [api.providers.anthropic] — есть
-    with pytest.raises(JobError) as e:
-        code.jobs.start(_plan(code))
-    assert str(e.value) == NO_PERMISSION
-    assert _job_dirs(code) == 0 and _raw(code) == []
-    out = _call(code, "code_start", {"project": "proj", "task": code.taskfile(), "billing": "key", "reason": REASON})
-    assert out == f"отказ: {NO_PERMISSION}"
+def test_key_without_provider_section_and_limits(code, monkeypatch):
+    """Упрощение 5.2: ни разрешения проекта, ни [api], ни max_budget_usd — задача на ключе стартует, флага
+    --max-budget-usd нет, резерва нет, а факт итога в журнале есть; строка оплаты — без зоны."""
+    _registry(code, api="", **NO_LIMITS)
+    text = code.cfg.read_text(encoding="utf-8")
+    assert "[api" not in text and not re.search(r"^key\s*=", text, re.M)
+    jid, d = _run(code, monkeypatch)
+    assert (d["state"], d["billing"]["mode"], d["billing"]["source"]) == ("completed", "key", "apiKeyHelper")
+    assert "--max-budget-usd" not in _argv(code, jid) and d["budget_usd"] is None
+    assert _settings(code, jid)["apiKeyHelper"] == HELPER
+    rows = [r for r in _raw(code) if r.get("job") == jid]
+    assert [(r["reserve"], r["cost_usd"], r["zone"], r["template"]) for r in rows] == \
+        [(False, 0.5, "included", "code")]  # только факт
+    assert "zone" not in d["billing"] and "reserve_usd" not in d["billing"]
+    st = apply_billing(code.jobs, code.jobs.snapshot(jid))
+    assert st["billing"] == "оплата: ключ anthropic · ≈$0.50 за задачу"
+    out = json.loads(_call(code, "code_start", {"project": "proj", "task": code.taskfile(), "billing": "key",
+                                                "reason": REASON}))  # из чата — тоже без разрешения проекта
+    assert wait_terminal(code.jobs, out["job"])["state"] == "completed"
 
 
 def test_key_from_chat_needs_reason(code):
@@ -158,13 +169,17 @@ def test_key_file_problems_refused_before_start(code, case):
     assert _job_dirs(code) == 0 and _raw(code) == []
 
 
-def test_key_registry_flag_typed():
+def test_registry_marks_written_money_keys():
+    """Проверки денег на ключе — только по записанным оператором ключам (упрощение 5.2.2)."""
     from wshub.registry import parse
-    text = '[workspace.p]\npath = "/x"\n[workspace.p.code]\nkey = "yes"\n'
-    reg = parse(text)
-    assert "key: true или false" in reg.code.project_errors["p"]
-    assert parse(text.replace('"yes"', "true")).code.projects["p"].key is True
-    assert parse('[workspace.p]\npath = "/x"\n[workspace.p.code]\n').code.projects["p"].key is False
+    base = '[workspace.p]\npath = "/x"\n'
+    assert parse(base).api.daily_set is False
+    assert parse(base + "[api]\nenabled = true\n").api.daily_set is False
+    assert parse(base + "[api]\ndaily_usd = 10\n").api.daily_set is True
+    reg = parse(base + '[api.providers.anthropic]\ncredits_until = "2099-12-31"\n')
+    assert reg.api.providers["anthropic"].included_set is False
+    reg = parse(base + '[api.providers.anthropic]\nincluded_usd = 0\n')
+    assert reg.api.providers["anthropic"].included_set is True
 
 
 # ---------- п. 3.2: цепочка ----------
@@ -311,16 +326,45 @@ def test_key_helper_problem_exit_1_without_key(code, capsys, case):
 
 # ---------- п. 3.7: деньги ----------
 
-def test_default_budget_10(code, monkeypatch):
-    _registry(code, **NO_LIMITS)
-    assert effective_limits(ProjectCode(), "key").max_budget_usd == 10
+def test_budget_only_if_set(code, monkeypatch):
+    """Упрощение 5.2.2: умолчания бюджета нет — как на подписке (WSH-4.7); заданный max_budget_usd — потолок."""
+    assert effective_limits(ProjectCode(), "key") == effective_limits(ProjectCode(), "subscription")
+    assert effective_limits(ProjectCode(), "key").max_budget_usd is None
     assert effective_limits(ProjectCode(max_budget_usd=3), "key").max_budget_usd == 3
+    _registry(code, **NO_LIMITS)
+    p = _plan(code, code.taskfile(extra="budget_usd: 4\n"), channel="mcp", reason=REASON)
+    assert p.budget_usd is None and LIMIT_IGNORED in p.warnings  # из шапки без потолка — не применяется
     jid, d = _run(code, monkeypatch)
-    assert _opt(_argv(code, jid), "--max-budget-usd") == "10" and "--max-turns" not in _argv(code, jid)
-    assert d["budget_usd"] == 10 and LIMIT_IGNORED not in d["warnings"]
+    assert "--max-budget-usd" not in _argv(code, jid) and "--max-turns" not in _argv(code, jid)
+    assert [(r["reserve"], r["cost_usd"]) for r in _raw(code) if r.get("job") == jid] == [(True, 0.0), (False, 0.5)]
+    _registry(code)  # max_budget_usd = 10 в реестре
+    jid, d = _run(code, monkeypatch)
+    assert _opt(_argv(code, jid), "--max-budget-usd") == "10" and d["budget_usd"] == 10
     with pytest.raises(JobError, match="budget_usd 30 выше потолка 10"):
         _plan(code, code.taskfile(extra="budget_usd: 30\n"))
     assert _plan(code, code.taskfile(extra="budget_usd: 4\n")).budget_usd == 4
+
+
+def test_no_budget_needs_a_cent(code):
+    """Без бюджета звена проверка дня и зон требует хотя бы цента остатка: исчерпанная зона не пропускает задачу."""
+    _registry(code, api=API.replace("included_usd = 100", "included_usd = 0"), **NO_LIMITS)
+    with pytest.raises(JobError, match="включённые кредиты исчерпаны"):
+        code.jobs.start(_plan(code))
+    _registry(code, api="[api]\ndaily_usd = 5\n", **NO_LIMITS)  # зон нет, потолок дня есть
+    ledger.append(ledger.ledger_path(code.state), {"ts": ledger.stamp(datetime.now().astimezone()), "kind": "run",
+                                                   "provider": "fake", "zone": "included", "cost_usd": 5.0})
+    with pytest.raises(JobError, match=r"daily_usd = \$5\.00: сегодня уже ≈\$5\.00"):
+        code.jobs.start(_plan(code))
+    assert _job_dirs(code) == 0
+
+
+def test_daily_only_reserve_without_zone(code, monkeypatch):
+    """Задан только [api] daily_usd: резерв есть (проверка дня), зоны в строке оплаты нет."""
+    _registry(code, api="[api]\ndaily_usd = 50\n")
+    jid, d = _run(code, monkeypatch)
+    assert [(r["reserve"], r["cost_usd"]) for r in _raw(code) if r.get("job") == jid] == [(True, 10.0), (False, 0.5)]
+    assert "zone" not in d["billing"] and d["billing"]["reserve_usd"] == 10
+    assert apply_billing(code.jobs, code.jobs.snapshot(jid))["billing"] == "оплата: ключ anthropic · ≈$0.50 за задачу"
 
 
 def test_daily_ceiling_refuses(code):
@@ -446,7 +490,11 @@ def test_terminal_flags_applied_without_registry_ceiling(code, capsys):
 
 
 def test_terminal_budget_on_key_capped(code, capsys):
+    """Флаг терминала на ключе: без потолка в реестре применяется как есть; с max_budget_usd — не выше него."""
     _registry(code, **NO_LIMITS)
+    jid = _cli_start(code, capsys, "--billing", "key", "--budget-usd", "12", "--max-turns", "500")
+    assert (_opt(_argv(code, jid), "--max-budget-usd"), _opt(_argv(code, jid), "--max-turns")) == ("12", "500")
+    _registry(code)  # max_budget_usd = 10
     assert code_cli.code_main("code", ["start", "proj", code.taskfile(), "--billing", "key", "--budget-usd", "12"],
                               code.cfg, code.state) == 1
     assert "budget_usd 12 выше потолка 10" in capsys.readouterr().err
@@ -523,14 +571,20 @@ def test_api_key_check_anthropic(code, capsys):
     assert "ключ есть, права верны" in out and MARKER not in out
 
 
-def test_doctor_key_line(code):
+def test_doctor_key_line(code, monkeypatch):
+    """Строка о ключе — при включённом wshub-code (разрешения проекта нет, 5.2.1): ключа нет — не ошибка, права
+    неверны — ошибка; значение ключа не выводится."""
+    monkeypatch.setattr(doctor.shutil, "which", lambda name, *a, **k: f"/usr/bin/{name}")  # bwrap/socat — «есть»
     ctx = doctor.Ctx(config=code.cfg, state=code.state, win_users=code.state / "none")
     c = doctor.check_code(ctx, code.hub.registry.get(), code.hub)
-    assert "ключ anthropic (key = true: proj): ключ есть, права верны" in c["detail"]
+    assert "ключ anthropic: ключ есть, права верны" in c["detail"]
+    ok_status = c["status"]
     os.chmod(_key_path(code), 0o644)
     c = doctor.check_code(ctx, code.hub.registry.get(), code.hub)
-    assert c["status"] == "fail" and any("ключ anthropic" in x and "0644" in x for x in c["detail"])
+    assert c["status"] == "fail" and any(x.startswith("ключ anthropic: права ключа") and "0644" in x
+                                         for x in c["detail"])
     assert MARKER not in json.dumps(c, ensure_ascii=False)
-    code.write()  # key = true нет — строки о ключе нет
+    _key_path(code).unlink()
     c = doctor.check_code(ctx, code.hub.registry.get(), code.hub)
-    assert not any("ключ anthropic" in x for x in c["detail"])
+    assert "ключ anthropic: нет — задачи на ключе (billing = key) недоступны" in c["detail"]
+    assert c["status"] == ok_status  # нет ключа — режим недоступен, но это не ошибка doctor

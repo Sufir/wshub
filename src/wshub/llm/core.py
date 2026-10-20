@@ -26,6 +26,7 @@ def usd(v: float) -> str:
     return f"≈${v:.2f}"
 
 
+CENT = 0.01  # задача Code на ключе без бюджета проходит проверку зон и дня, если остался хотя бы цент (ТЗ WSH-4.6)
 HIDDEN = "<ключ скрыт>"
 SCRUB_MIN = 8  # куски ключа от стольких символов вырезаются из текста ошибки
 
@@ -138,19 +139,22 @@ class Api:
         zone, refusal = self._zone(name, est_usd, z, led)
         return Plan(prov, req, est, est_usd, zone, refusal, z, led.skipped)
 
-    def _zone(self, name: str, est: float, z: ledger.Zones, led: ledger.Ledger,
-              per_call: bool = True) -> tuple[str | None, str | None]:
+    def _zone(self, name: str, est: float, z: ledger.Zones | None, led: ledger.Ledger,
+              per_call: bool = True, day: bool = True) -> tuple[str | None, str | None]:
         """Потолки, затем зона: включённая, если оценка помещается в остаток; иначе купленная — только по
-        действующему разрешению оператора (allow). per_call=False — без max_usd_per_call: это потолок одного
-        запроса API, к задаче Code на ключе он не применяется (ТЗ WSH-4.6, решение 5.1.5)."""
+        действующему разрешению оператора (allow). Для задач Code на ключе (ТЗ WSH-4.6, решения 5.1.5 и 5.2):
+        per_call=False — без max_usd_per_call (это потолок одного запроса API); day=False — daily_usd в реестре не
+        записан; z=None — зоны не проверяются (нет included_usd провайдера), строка идёт во включённую зону."""
         api = self.reg.api
         if per_call and est > api.max_usd_per_call:
             return None, (f"оценка запроса {usd(est)} выше потолка max_usd_per_call = ${api.max_usd_per_call:.2f}; "
                           "уменьши --max-tokens или вход")
         today = ledger.spent_today(led, self.now())
-        if today + est > api.daily_usd:
+        if day and today + est > api.daily_usd:
             return None, (f"дневной потолок daily_usd = ${api.daily_usd:.2f}: сегодня уже {usd(today)}, "
                           f"запрос {usd(est)}")
+        if z is None:
+            return "included", None
         if est <= z.included_left:
             return "included", None
         if z.allow_usd is not None and est <= z.purchased_left:
@@ -178,22 +182,29 @@ class Api:
                 raise ApiError(f"{refusal} — запрос не отправлен")
             return self._send(plan, zone)
 
-    def code_reserve(self, name: str, project: str, model: str, budget: float, job: str) -> dict:
-        """Резерв звена задачи Code на ключе (ТЗ WSH-4.6, п. 2.5.2–2.5.4): под блокировкой журнала — потолок дня и
-        зона для бюджета звена, затем строка-резерв с job. Не помещается — ApiError с текстом 4.2. Ответ — строка
-        резерва: по итогу звена её заменит строка с фактом (code_settle)."""
+    def code_reserve(self, name: str, project: str, model: str, budget: float | None, job: str) -> tuple[dict, bool]:
+        """Старт звена задачи Code на ключе (ТЗ WSH-4.6, п. 2.5.2–2.5.4 и упрощение 5.2): проверяется только то, что
+        оператор записал в реестр, — потолок дня, если задан [api] daily_usd, и зоны, если у провайдера задан
+        included_usd. Проверка и строка-резерв с job — под блокировкой журнала; не помещается — ApiError с текстом 4.2.
+        Нечего проверять — резерва нет. Ответ — (строка звена, проверялись ли зоны); reserve в строке — записан ли
+        резерв; по итогу её заменит или дополнит строка с фактом (code_settle). Без бюджета звена проверка требует
+        хотя бы цента остатка."""
+        self.check_section()
+        conf = self.reg.api.providers.get(name)
+        by_zone, day = conf is not None and conf.included_set, self.reg.api.daily_set
+        rec = {"kind": "run", "provider": name, "model": model, "tier": None, "project": project, "template": "code",
+               "zone": "included", "job": job, "usage": Usage().as_dict()}
+        if not by_zone and not day:
+            return {**rec, "ts": ledger.stamp(self.now()), "cost_usd": 0.0, "reserve": False}, False
         with ledger.locked(self.ledger_path):
-            _prov, conf = self.provider(name)
             led = self.read_ledger()
-            z = ledger.zones(led, name, conf, self.now().date())
-            zone, refusal = self._zone(name, budget, z, led, per_call=False)
+            z = ledger.zones(led, name, conf, self.now().date()) if by_zone else None
+            zone, refusal = self._zone(name, CENT if budget is None else budget, z, led, per_call=False, day=day)
             if zone is None:
                 raise ApiError(f"{refusal} — задача не запущена")
-            rec = {"ts": ledger.stamp(self.now()), "kind": "run", "provider": name, "model": model, "tier": None,
-                   "project": project, "template": "code", "zone": zone, "job": job, "usage": Usage().as_dict(),
-                   "cost_usd": float(budget), "reserve": True}
+            rec.update(ts=ledger.stamp(self.now()), zone=zone, cost_usd=float(budget or 0.0), reserve=True)
             ledger.append(self.ledger_path, rec)
-            return rec
+            return rec, by_zone
 
     def code_settle(self, rec: dict, cost: float, ok: bool | None) -> None:
         """Факт звена вместо резерва: строка того же job (ТЗ WSH-4.6, п. 2.5.4)."""

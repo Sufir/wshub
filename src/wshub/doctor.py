@@ -506,15 +506,18 @@ def check_code(ctx: Ctx, reg, hub) -> dict:
     else:
         lines.append("временный каталог claude: свободен или наш")
 
-    keyed = [n for n, p in code.projects.items() if p.key]
-    if keyed:  # задачи на ключе (ТЗ WSH-4.6, п. 2.8.3): ключ anthropic и его права, значение не выводится
+    if enabled:  # задачи на ключе (ТЗ WSH-4.6, п. 2.8.3; разрешения проекта нет — 5.2): ключ и права, без значения
         from .jobs import KEY_PROVIDER
         from .llm import keys
-        try:
-            keys.read(keys.key_path(ctx.config.parent, KEY_PROVIDER))
-            lines.append(f"ключ {KEY_PROVIDER} (key = true: {', '.join(keyed)}): ключ есть, права верны")
-        except keys.KeyProblem as e:
-            problems.append(f"ключ {KEY_PROVIDER} (key = true: {', '.join(keyed)}): {e}")
+        kp = keys.key_path(ctx.config.parent, KEY_PROVIDER)
+        if not os.path.lexists(kp):  # ключа нет — режим key недоступен, это не ошибка: по умолчанию подписка
+            lines.append(f"ключ {KEY_PROVIDER}: нет — задачи на ключе (billing = key) недоступны")
+        else:
+            try:
+                keys.read(kp)
+                lines.append(f"ключ {KEY_PROVIDER}: ключ есть, права верны")
+            except keys.KeyProblem as e:
+                problems.append(f"ключ {KEY_PROVIDER}: {e}")
 
     if entries:
         lines.append("запись wshub-code в Desktop: есть")

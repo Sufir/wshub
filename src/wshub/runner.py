@@ -133,6 +133,8 @@ def key_view(jobs: Jobs, d: dict) -> dict:
     кредитов провайдера по журналу трат (None — журнал или секция провайдера не читаются)."""
     costs = [phase_cost(x) for x in jobs.chain(d.get("chain_root") or d["id"])]
     out: dict = {"cost": _sum(costs) if any(c is not None for c in costs) else None, "cycle": None}
+    if not (d.get("billing") or {}).get("zone"):  # зоны не проверялись — цикла в строке нет
+        return out
     try:
         z = jobs._key_api().zones((d.get("billing") or {}).get("provider") or KEY_PROVIDER)
         out["cycle"] = (z.included_spent, z.included_total, z.until)
@@ -154,11 +156,11 @@ def _key_line(b: dict, reason: str | None, key: dict) -> str:
         return head + (" · задача остановлена" if reason == "billing_mismatch" else "")
     parts = [f"оплата: ключ {b.get('provider') or KEY_PROVIDER}",
              f"{usd(key['cost'])} за задачу" if key.get("cost") is not None else "сумма за задачу — по итогу звена"]
-    if b.get("zone") in ZONE_RU:
+    if b.get("zone") in ZONE_RU:  # зоны проверялись — у провайдера задан included_usd (упрощение 5.2.4)
         parts.append(f"зона: {ZONE_RU[b['zone']]}")
-    if key.get("cycle"):
-        spent, total, until = key["cycle"]
-        parts.append(f"цикл {usd(spent)} из ${total:.2f}, до {ddmm(until)}")
+        if key.get("cycle"):
+            spent, total, until = key["cycle"]
+            parts.append(f"цикл {usd(spent)} из ${total:.2f}, до {ddmm(until)}")
     line = " · ".join(parts)
     if reason == "key_rejected":
         r = b.get("rejected") if isinstance(b.get("rejected"), dict) else {}

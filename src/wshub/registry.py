@@ -161,11 +161,12 @@ class ProjectCode:
     model_min: str = "haiku"
     model_max: str = "opus"
     effort_max: str = "high"
-    max_turns: int = 100
-    max_budget_usd: float = 10
-    daily_budget_usd: float = 30
+    # лимиты расхода: None — «не задано»; на подписке действует только то, что оператор записал сам (WSH-4.7)
+    max_turns: int | None = None
+    max_budget_usd: float | None = None
+    daily_budget_usd: float | None = None
     max_parallel: int = 1
-    max_hours: float = 4
+    max_hours: float | None = None
     prefetch: bool = False
     status_regex: str | None = None
     bash_allow: tuple[str, ...] = ()
@@ -178,7 +179,7 @@ class ProjectCode:
     read_extra: tuple[str, ...] = ()  # Read вне dir: пути и glob от корня проекта (ТЗ WSH-3.1)
     policy: tuple[PolicyRow, ...] = ()
     plan_budget_share: float = 0.3  # доля бюджета задачи на фазу плана
-    plan_max_turns: int = 40
+    plan_max_turns: int | None = None
     execute_prompt: str = "execute"  # шаблон фазы исполнения в каталоге prompts
     push: str = "no"  # регламент пуша: no | task | always (ТЗ WSH-3.4, А1)
     push_protect: tuple[str, ...] = ("main", "master")  # шаблоны веток, куда пуш запрещён всегда

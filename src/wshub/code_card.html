@@ -71,7 +71,7 @@
 <div class="nums">
   <span>ходы <b id="turns">0</b></span>
   <span>действия <b id="actions">0</b></span>
-  <span>стоимость <b id="cost">—</b></span>
+  <span>оплата <b id="pay">—</b></span>
   <span>окно лимита <b id="rate">—</b></span>
 </div>
 <div class="end" id="end" hidden></div>
@@ -239,9 +239,7 @@ function render(d) {
 
   $("turns").textContent = d.turns;
   $("actions").textContent = d.actions_count;
-  $("cost").textContent = d.cost_usd !== null && d.cost_usd !== undefined
-    ? "$" + Number(d.cost_usd).toFixed(2) + (d.billing === "подписка" ? " (подписка, оценка)" : "")
-    : (d.billing === "подписка" ? "подписка" : "—");
+  $("pay").textContent = d.billing || "—";  // сумма в долларах на подписке не показывается (WSH-4.7)
   $("rate").textContent = d.rate ? Object.entries(d.rate).map(([k, v]) => (k === "five_hour" ? "5 ч" : k === "seven_day" ? "7 дн" : k) + " " + Math.round(v * 100) + "%").join(", ") : "—";
 
   $("cancel").disabled = FINAL.includes(d.state);  // конечное состояние — кнопка неактивна, а не скрыта

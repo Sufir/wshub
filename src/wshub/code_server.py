@@ -17,9 +17,9 @@ from mcp.server.fastmcp import FastMCP
 
 from . import code_events, code_policy
 from .core import WsError
-from .jobs import TERMINAL, JobError, Jobs, _end_ts, _sum, meta_warning, outside_view, phase_cost
+from .jobs import TERMINAL, JobError, Jobs, _end_ts, meta_warning, outside_view
 from .registry import RegistryError, forge_url
-from .runner import apply_billing, billing_line
+from .runner import apply_billing, billing_line, hide_cost
 from .runtime import read_json
 from .taskfile import TaskError
 
@@ -116,10 +116,11 @@ def build_code_server(hub) -> FastMCP:
             out.append({"project": name, "root": str(ws.path), "dirs": list(proj.dirs),
                         "profiles": list(proj.profiles), "model_min": proj.model_min,
                         "model_max": proj.model_max, "effort_max": proj.effort_max,
-                        "max_turns": proj.max_turns, "max_budget_usd": proj.max_budget_usd,
-                        "daily_budget_usd": proj.daily_budget_usd, "max_parallel": proj.max_parallel,
+                        # лимит, не записанный оператором в реестр, — «нет» (WSH-4.7)
+                        "max_turns": _limit(proj.max_turns), "max_budget_usd": _limit(proj.max_budget_usd),
+                        "daily_budget_usd": _limit(proj.daily_budget_usd), "max_parallel": proj.max_parallel,
                         "live_jobs": live, "plan_budget_share": proj.plan_budget_share,
-                        "plan_max_turns": proj.plan_max_turns, "execute_prompt": proj.execute_prompt,
+                        "plan_max_turns": _limit(proj.plan_max_turns), "execute_prompt": proj.execute_prompt,
                         "read_extra": list(proj.read_extra),  # как в реестре: от корня проекта
                         # регламент пуша и API хостинга (ТЗ WSH-3.4, А1.3): путь к токену, значение — никогда
                         "push": proj.push, "push_protect": list(proj.push_protect), "forge": proj.forge,
@@ -210,11 +211,11 @@ def build_code_server(hub) -> FastMCP:
 
     @tool()
     def code_result(job: str) -> str:
-        """Итог задачи: состояние, выбор модели и его источник, ходы и действия, звенья цепочки и их стоимость,
-        итоговый текст Code, снимок git, блок «Вне кода» (HEAD и ветка, коммиты, до 10 docker-команд и их число,
-        правки .git/hooks и .git/config — по всем звеньям), «Внешние действия» (пуш, API хостинга, гейты), команда,
-        чтобы открыть сессию в терминале, и пути к существующим файлам. Правка .git/hooks или .git/config —
-        предупреждение первой строкой."""
+        """Итог задачи: состояние, выбор модели и его источник, ходы и действия, звенья цепочки (суммы в долларах
+        на подписке не показываются), итоговый текст Code, снимок git, блок «Вне кода» (HEAD и ветка, коммиты,
+        до 10 docker-команд и их число, правки .git/hooks и .git/config — по всем звеньям), «Внешние действия»
+        (пуш, API хостинга, гейты), команда, чтобы открыть сессию в терминале, и пути к существующим файлам.
+        Правка .git/hooks или .git/config — предупреждение первой строкой."""
         try:
             out = apply_billing(jobs, jobs.result_view(job, docker_max=RESULT_DOCKER_MAX), model=True)
         except USER_ERR as e:
@@ -306,10 +307,10 @@ def build_code_server(hub) -> FastMCP:
 
     @tool()
     def code_stats(project: str = "", days: int = 30) -> str:
-        """Калибровка политики: по строке политики, источнику и каналу выбора — число задач, средние стоимость и ходы,
-        доля completed, доля планов, отправленных на replan."""
+        """Калибровка политики: по строке политики, источнику и каналу выбора — число задач, средние ходы,
+        доля completed, доля планов, отправленных на replan. Средняя цена в долларах на подписке не показывается."""
         try:
-            rows = jobs.stats(project or None, days)
+            rows = hide_cost(jobs.stats(project or None, days))
         except USER_ERR as e:
             _audit("code_stats", project=project or None, status="error", error=str(e))
             return f"отказ: {e}"
@@ -318,9 +319,9 @@ def build_code_server(hub) -> FastMCP:
 
     @tool()
     def code_jobs(project: str = "", limit: int = 20) -> str:
-        """Последние задачи: job, проект, ТЗ, состояние, стоимость."""
+        """Последние задачи: job, проект, ТЗ, состояние, фаза. Стоимость в долларах на подписке не показывается."""
         try:
-            rows = jobs.list(project or None, limit)
+            rows = hide_cost(jobs.list(project or None, limit))
         except USER_ERR as e:
             _audit("code_jobs", project=project or None, status="error", error=str(e))
             return f"отказ: {e}"
@@ -439,7 +440,6 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
         else:
             new_offset = max(new_offset, base + size)
         base += size
-    costs = [phase_cost(x) for x in links]
     billing = next((s.api_key_source for s in scans if s.api_key_source), None)
     out = {"job": job, "active": active["id"], "project": d.get("project"), "profile": d.get("profile"),
            "task": d.get("task_rel"), "state": state, "reason": active.get("reason"),
@@ -447,7 +447,6 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
            "elapsed_s": max(int(_end_ts(active, state, now) - t0), 0), "grants": d.get("grants") or {},
            "turns": sum(s.turns for s in scans), "actions_count": sum(s.actions for s in scans),
            "denials": sum(s.denials for s in scans), "errors": sum(s.errors for s in scans),
-           "cost_usd": _sum(costs) if any(c is not None for c in costs) else None,
            "billing": "подписка" if billing == "none" else ("api" if billing else None),
            "rate": next((s.rate for s in reversed(scans) if s.rate), None),
            "actions": [_card_action(a, t0) for a in acts[-LOG_MAX:]], "marks": marks, "offset": new_offset}
@@ -467,6 +466,10 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
                                    "gate": ex.get("gate") or [], "links": ex.get("links") or []},
                       "result_head": "\n".join(text.strip().splitlines()[:RESULT_HEAD_LINES])}
     return out
+
+
+def _limit(v):
+    return "нет" if v is None else v
 
 
 def _card_action(a: dict, t0: float) -> dict:

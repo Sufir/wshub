@@ -82,6 +82,25 @@ def _short(ts) -> str | None:
         return None
 
 
+def over_time(d: dict, now: float) -> bool:
+    """Звено идёт дольше max_hours из job.json. Нет max_hours — потолка по времени нет (WSH-4.7, п. 2.3.4)."""
+    hours = d.get("max_hours")
+    return bool(hours) and now - d["started"] > float(hours) * 3600
+
+
+COST_KEYS = ("cost_usd", "total_cost_usd", "phase_cost_usd", "session_cost_usd", "avg_cost_usd")
+
+
+def hide_cost(view):
+    """На подписке сумма-оценка в долларах не показывается (WSH-4.7, п. 2.4): копия ответа без ключей стоимости,
+    на любой глубине. В job.json стоимость хранится как раньше — убирается только показ."""
+    if isinstance(view, dict):
+        return {k: hide_cost(v) for k, v in view.items() if k not in COST_KEYS}
+    if isinstance(view, list):
+        return [hide_cost(v) for v in view]
+    return view
+
+
 def billing_line(billing: dict | None, reason: str | None = None) -> str:
     """Строка оплаты (ТЗ WSH-4.1, п. 2.6): окна из unifiedWindows (utilization × 100), сброс, overage; «близко к
     лимиту» при allowed_warning; три причины остановки — хвостом строки. До первого init — источник ещё не известен;
@@ -153,11 +172,11 @@ def billing_hint(reason: str | None, billing: dict | None) -> str | None:
 
 def apply_billing(jobs: Jobs, view: dict, model: bool = False) -> dict:
     """Строка оплаты, подсказка трёх причин и (model) фактическая модель в снимке или итоге — по активному звену
-    (code_status, code_wait, code_result, wshub code status/result)."""
+    (code_status, code_wait, code_result, wshub code status/result). Сумма-оценка из ответа убирается (WSH-4.7)."""
     try:
         d = jobs.read(view.get("active") or view.get("id") or view.get("job"))
     except JobError:
-        return view
+        return hide_cost(view)
     b = d.get("billing") or {}
     view["billing"] = billing_line(b, d.get("reason"))
     hint = billing_hint(d.get("reason"), b)
@@ -165,7 +184,7 @@ def apply_billing(jobs: Jobs, view: dict, model: bool = False) -> dict:
         view["reason_hint"] = hint
     if model:
         view["model_line"] = f"модель: {d.get('model')} → {b.get('model') or 'неизвестна (init не было)'}"
-    return view
+    return hide_cost(view)
 
 
 def _rate_brief(rate) -> dict | None:
@@ -532,13 +551,12 @@ class Supervisor:
         pgid = os.getpgid(proc.pid)
         self._save(state="running", pid=proc.pid, pgid=pgid, proc_start=proc_start(proc.pid),
                    started=time.time())
-        max_s = float(self.d.get("max_hours") or 4) * 3600
         escalated = None
         stream = _Stream(self.jdir / "events.jsonl")
         while proc.poll() is None:
             time.sleep(POLL)
             self._watch(stream)
-            over = time.time() - self.d["started"] > max_s
+            over = over_time(self.d, time.time())
             if (self._cancelled() or over or self.stop) and escalated is None:
                 # остановка стражем — тем же путём, что code_cancel (ТЗ WSH-4.1, п. 2.4)
                 self._save(state="cancelling", reason=self.stop or ("timeout" if over else "cancel"))

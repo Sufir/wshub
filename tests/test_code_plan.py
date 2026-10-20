@@ -402,6 +402,7 @@ def test_plan_auto_chain(code, monkeypatch):
     monkeypatch.setenv("FAKE_RECLOG", str(code.state / "reclog.jsonl"))
     monkeypatch.setenv("FAKE_COST_PLAN", "1.2")
     monkeypatch.setenv("FAKE_COST", "0.5")
+    code.write(plan_max_turns="40")  # лимит фазы плана по умолчанию не задан (WSH-4.7) — здесь он явный
     p = code.jobs.plan("proj", code.taskfile(size="M", risk="low"))
     assert (p.phase, p.plan_mode, p.model, p.budget_usd, p.max_turns) == ("plan", "auto", "opus", 3.0, 40)
     root = code.jobs.start(p)["id"]
@@ -426,7 +427,7 @@ def test_plan_auto_chain(code, monkeypatch):
     assert exe_d["result"]["phase_cost_usd"] == pytest.approx(0.5)
     assert snap["cost_usd"] == pytest.approx(1.7)
     res = json.loads(_call(code, "code_result", {"job": root}))
-    assert res["state"] == "completed" and len(res["chain"]) == 2 and res["cost_usd"] == pytest.approx(1.7)
+    assert res["state"] == "completed" and len(res["chain"]) == 2 and "cost_usd" not in res  # на подписке без сумм
     assert res["open_in_terminal"] == f"cd {code.root} && claude --resume {sid}"
 
 
@@ -787,10 +788,11 @@ def test_code_stats_aggregates(code, capsys):
         (2, 2.25, 7.0, 0.5, pytest.approx(1 / 3, abs=1e-3))
     assert rows[("task/S/low (встроенная)", "chat")]["replan_share"] is None
     out = json.loads(_call(code, "code_stats", {"project": "proj"}))
-    assert len(out) == 2
+    assert len(out) == 2 and all("avg_cost_usd" not in r for r in out)  # средняя цена на подписке не показывается
     assert code_cli.code_main("code", ["stats", "proj", "--days", "30"], code.cfg, code.state) == 0
     text = capsys.readouterr().out
-    assert "task/M/low (встроенная)" in text and "policy" in text and "2.25" in text
+    assert "task/M/low (встроенная)" in text and "policy" in text and "7.0" in text  # средние ходы остались
+    assert "2.25" not in text and "$" not in text
 
 
 def test_code_stats_by_channel(code, capsys):

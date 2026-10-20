@@ -174,7 +174,7 @@ def _status(hub: Hub, args: list[str]) -> int:
         hub._audit_code("cli_code_status", snap.get("project"), pos[0])
     else:
         for row in jobs.list(limit=20):
-            print(f"{row['id']}  {row['state']:10}  {row['project']}  {row.get('cost_usd') or ''}")
+            print(f"{row['id']}  {row['state']:10}  {row['project']}")  # сумма на подписке не показывается (WSH-4.7)
         hub._audit_code("cli_code_status", None, None)
     return 0
 
@@ -204,12 +204,13 @@ def _stats(hub: Hub, args: list[str]) -> int:
         raise WsError("нужно: wshub code stats [project] [--days N]")
     days = int(opts.get("days", 30))
     rows = Jobs(hub).stats(pos[0] if pos else None, days)
-    print(f"{'проект':12} {'строка политики':34} {'источник':9} {'канал':10} {'задач':>5} {'ср. $':>8} "
+    # средняя цена в долларах на подписке не показывается (WSH-4.7)
+    print(f"{'проект':12} {'строка политики':34} {'источник':9} {'канал':10} {'задач':>5} "
           f"{'ср. ходов':>9} {'completed':>9} {'replan':>6}")
     for r in rows:
         rp = "—" if r["replan_share"] is None else f"{r['replan_share']:.0%}"
         print(f"{r['project'] or '':12} {r['row']:34} {r['source']:9} {r['channel']:10} {r['tasks']:>5} "
-              f"{r['avg_cost_usd']:>8.2f} {r['avg_turns']:>9} {r['completed_share']:>9.0%} {rp:>6}")
+              f"{r['avg_turns']:>9} {r['completed_share']:>9.0%} {rp:>6}")
     if not rows:
         print(f"(задач за {days} дн. нет)")
     hub._audit_code("cli_code_stats", pos[0] if pos else None, None)

@@ -204,10 +204,11 @@ def _read_extra_rules(read_extra: list[str]) -> list[str]:
 PERMISSION_MODES = ("dontAsk", "plan")
 
 
-def argv(claude: str, prompt: str, *, job_dir: Path, model: str, effort: str, max_turns: int, budget_usd: float,
-         flags: dict, session_id: str | None = None, resume: str | None = None, permission_mode: str = "dontAsk",
-         name: str | None = None) -> list[str]:
-    """name — имя сессии (--name, PoC WSH-3 0.3.4); permission_mode plan — только для фазы плана."""
+def argv(claude: str, prompt: str, *, job_dir: Path, model: str, effort: str, max_turns: int | None,
+         budget_usd: float | None, flags: dict, session_id: str | None = None, resume: str | None = None,
+         permission_mode: str = "dontAsk", name: str | None = None) -> list[str]:
+    """name — имя сессии (--name, PoC WSH-3 0.3.4); permission_mode plan — только для фазы плана.
+    max_turns и budget_usd равны None — флаг не передаётся: у claude умолчания нет, лимита нет (WSH-4.7)."""
     if (session_id is None) == (resume is None):
         raise CliError("нужен ровно один из session_id и resume")
     if permission_mode not in PERMISSION_MODES:
@@ -216,8 +217,12 @@ def argv(claude: str, prompt: str, *, job_dir: Path, model: str, effort: str, ma
     out += ["--session-id", session_id] if session_id else ["--resume", str(resume)]
     if name:
         out += ["--name", name]
-    out += ["--model", model, "--effort", effort, "--max-turns", str(max_turns),
-            "--max-budget-usd", f"{budget_usd:g}", "--permission-mode", permission_mode]
+    out += ["--model", model, "--effort", effort]
+    if max_turns is not None:
+        out += ["--max-turns", str(max_turns)]
+    if budget_usd is not None:
+        out += ["--max-budget-usd", f"{budget_usd:g}"]
+    out += ["--permission-mode", permission_mode]
     if flags.get("permission_prompts"):
         out += ["--permission-prompts", "none"]
     out += ["--settings", str(job_dir / "settings.json")]

@@ -83,6 +83,30 @@ class JobError(WsError):
     pass
 
 
+# режим оплаты задач wshub-code: только подписка, ключ не пускает страж WSH-4.1; режим «по ключу» — WSH-4.6
+BILLING = "subscription"
+LIMIT_IGNORED = "лимит из задачи не применён: на подписке лимиты задаёт только оператор в реестре"
+
+
+@dataclass(frozen=True)
+class Limits:
+    """Действующие лимиты расхода задачи; None — лимита нет."""
+    max_turns: int | None = None
+    max_budget_usd: float | None = None
+    daily_budget_usd: float | None = None
+    max_hours: float | None = None
+    plan_max_turns: int | None = None
+
+
+def effective_limits(proj: ProjectCode, billing: str) -> Limits:
+    """Единственное место решения, какие лимиты действуют (WSH-4.7). На подписке — только записанное оператором
+    в реестре, остальное — «нет лимита». Лимиты по умолчанию для ключа придут с WSH-4.6."""
+    if billing != "subscription":
+        raise JobError(f"режим оплаты {billing!r} в wshub-code не поддерживается: задачи идут только по подписке "
+                       "(ключ не пускает страж WSH-4.1); лимиты по умолчанию для ключа — задача WSH-4.6")
+    return Limits(proj.max_turns, proj.max_budget_usd, proj.daily_budget_usd, proj.max_hours, proj.plan_max_turns)
+
+
 def new_id(now: float | None = None) -> str:
     t = datetime.fromtimestamp(now if now is not None else time.time())
     tail = "".join(secrets.choice(B32) for _ in range(6))
@@ -101,8 +125,8 @@ class Plan:
     prompt_name: str
     model: str
     effort: str
-    max_turns: int
-    budget_usd: float
+    max_turns: int | None  # None — лимита нет, флаг claude не передаётся (WSH-4.7)
+    budget_usd: float | None
     prompt: str
     warnings: list[str]
     proj: ProjectCode
@@ -112,8 +136,8 @@ class Plan:
     choice: code_policy.Choice | None = None
     phase: str | None = None  # None — без плана; plan | execute — звено цепочки (ТЗ WSH-3, 2.3)
     plan_mode: str = "no"
-    budget_total: float = 0.0  # бюджет всей задачи (цепочки); budget_usd — этого звена
-    max_turns_total: int = 0
+    budget_total: float | None = None  # бюджет всей задачи (цепочки); budget_usd — этого звена
+    max_turns_total: int | None = None
     grants: dict | None = None  # разрешения задачи {push, forge, reason} (ТЗ WSH-3.4, А2)
     gates: tuple = ()  # гейты задачи профиля task; звену плана правила не даются (ТЗ WSH-3.5, Г2)
     sandbox_hidden: list[str] | None = None  # отслеживаемые файлы, скрытые песочницей (ТЗ WSH-3.5, П2)
@@ -312,9 +336,9 @@ class Jobs:
 
         grants, gwarn = task_grants(project, proj, profile, push, forge, reason,
                                     (inherit or {}).get("grants"))
-        max_turns = int(max_turns or header.get("max_turns") or proj.max_turns)
-        budget_usd = float(budget_usd if budget_usd is not None else header.get("budget_usd", proj.max_budget_usd))
-        self._check_limits(proj, max_turns, budget_usd)
+        lim = effective_limits(proj, BILLING)
+        max_turns, budget_usd, limit_warn = self._task_limits(lim, header, max_turns, budget_usd, inherit)
+        self._check_limits(lim, max_turns, budget_usd)
         if inherit is None:
             missing = taskfile.missing_for_profile(header)
             if missing:
@@ -332,7 +356,7 @@ class Jobs:
         hidden = self._hidden(dir_abs, glob, proj, warnings)
         prompt += hub_block(note_left, gates, "plan" if choice.plan != "no" else None, hidden, prompt)
         out = Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, choice.model, choice.effort,
-                   max_turns, budget_usd, prompt, warnings + gwarn, proj, ticket=header["ticket"],
+                   max_turns, budget_usd, prompt, warnings + gwarn + limit_warn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
                    budget_total=budget_usd, max_turns_total=max_turns, grants=grants, gates=gates,
                    sandbox_hidden=hidden)
@@ -344,11 +368,32 @@ class Jobs:
                 self._replan_template(root, proj)
             out.phase = "plan"
             out.model, out.effort = choice.plan_model, choice.plan_effort
-            out.budget_usd = _cents(budget_usd * proj.plan_budget_share)
-            out.max_turns = min(proj.plan_max_turns, max_turns)
-            if out.budget_usd <= 0:
-                raise JobError(f"бюджет фазы плана {budget_usd:g} × {proj.plan_budget_share:g} меньше цента")
+            if budget_usd is not None:  # доля бюджета — только при заданном бюджете
+                out.budget_usd = _cents(budget_usd * proj.plan_budget_share)
+                if out.budget_usd <= 0:
+                    raise JobError(f"бюджет фазы плана {budget_usd:g} × {proj.plan_budget_share:g} меньше цента")
+            out.max_turns = _least(lim.plan_max_turns, max_turns)
         return out
+
+    def _task_limits(self, lim: Limits, header: dict, max_turns, budget_usd, inherit: dict | None):
+        """(ходы, бюджет, предупреждения) задачи. Потолок не задан — лимит из задачи не применяется, а переданный
+        в этом вызове или в шапке даёт одну строку LIMIT_IGNORED; унаследованный от родителя (resume) молча
+        отбрасывается. Потолок задан — прежний порядок: аргумент, родитель, шапка, потолок (WSH-4.7, п. 2.3.2)."""
+        parent = inherit or {}
+        asked_budget = budget_usd if budget_usd is not None else header.get("budget_usd")
+        ignored = False
+        turns = budget = None
+        if lim.max_turns is None:
+            ignored = bool(max_turns or header.get("max_turns"))
+        else:
+            turns = int(max_turns or parent.get("max_turns") or header.get("max_turns") or lim.max_turns)
+        if lim.max_budget_usd is None:
+            ignored = ignored or asked_budget is not None
+        else:
+            budget = float(budget_usd if budget_usd is not None else
+                           parent["budget_usd"] if parent.get("budget_usd") is not None else
+                           header.get("budget_usd", lim.max_budget_usd))
+        return turns, budget, [LIMIT_IGNORED] if ignored else []
 
     def _replan_template(self, root: Path, proj: ProjectCode) -> None:
         path = (root / proj.prompts / f"{REPLAN_PROMPT}.md").resolve()
@@ -428,16 +473,19 @@ class Jobs:
         return code_policy.Choice(vals["model"], vals["effort"], "no", None, None, source, base.get("row"), why,
                                   fields, chan, cf or None)
 
-    def _check_limits(self, proj: ProjectCode, max_turns: int, budget_usd: float):
-        """Бюджеты и ходы — в силе для любого источника выбора (2.2.1); модель и effort проверяет политика."""
-        if max_turns > proj.max_turns:
-            raise JobError(f"max_turns {max_turns} выше потолка {proj.max_turns}")
-        if max_turns < 1:
-            raise JobError("max_turns должен быть ≥ 1")
-        if budget_usd > proj.max_budget_usd:
-            raise JobError(f"budget_usd {budget_usd:g} выше потолка {proj.max_budget_usd:g}")
-        if budget_usd <= 0:
-            raise JobError("budget_usd должен быть > 0")
+    def _check_limits(self, lim: Limits, max_turns: int | None, budget_usd: float | None):
+        """Бюджеты и ходы — в силе для любого источника выбора (2.2.1); модель и effort проверяет политика.
+        Незаданный лимит (None) не проверяется."""
+        if max_turns is not None:
+            if max_turns > lim.max_turns:
+                raise JobError(f"max_turns {max_turns} выше потолка {lim.max_turns}")
+            if max_turns < 1:
+                raise JobError("max_turns должен быть ≥ 1")
+        if budget_usd is not None:
+            if budget_usd > lim.max_budget_usd:
+                raise JobError(f"budget_usd {budget_usd:g} выше потолка {lim.max_budget_usd:g}")
+            if budget_usd <= 0:
+                raise JobError("budget_usd должен быть > 0")
 
     # ---------- хранилище ----------
 
@@ -517,6 +565,7 @@ class Jobs:
             except HelperError as e:
                 raise JobError(f"API хостинга: {e}") from None
         git_start = start_snapshot(plan.dir, dict(os.environ))  # тоже подпроцесс — до flock
+        lim = effective_limits(plan.proj, BILLING)
         with self._flock():
             if link is not None:
                 ld = self.read(link[0])
@@ -530,7 +579,8 @@ class Jobs:
             if len(live) >= plan.proj.max_parallel:
                 raise JobError(f"у проекта {plan.project} уже {len(live)} живых задач "
                                f"(max_parallel = {plan.proj.max_parallel})")
-            self._check_daily_budget(plan, live, now)
+            if lim.daily_budget_usd is not None:  # не задан — дневной бюджет не считается вовсе (WSH-4.7, п. 2.3.3)
+                self._check_daily_budget(plan, live, now, lim.daily_budget_usd)
 
             jid = new_id(now)
             jdir = self.job_dir(jid)
@@ -541,7 +591,7 @@ class Jobs:
                 "task": str(plan.task), "task_rel": plan.task_rel, "profile": plan.profile,
                 "prompt_name": plan.prompt_name, "model": plan.model, "effort": plan.effort,
                 "max_turns": plan.max_turns, "budget_usd": plan.budget_usd, "prefetch": plan.proj.prefetch,
-                "max_hours": plan.proj.max_hours, "status_regex": plan.proj.status_regex,
+                "max_hours": lim.max_hours, "status_regex": plan.proj.status_regex,
                 "state": "starting", "reason": None, "parent": parent, "resume": resume,
                 "session_id": resume, "warnings": plan.warnings,
                 "created": datetime.fromtimestamp(now or time.time()).astimezone().isoformat(timespec="seconds"),
@@ -610,7 +660,7 @@ class Jobs:
         except JobError:
             return None
 
-    def _check_daily_budget(self, plan: Plan, live: list[dict], now: float | None):
+    def _check_daily_budget(self, plan: Plan, live: list[dict], now: float | None, daily_usd: float):
         day = datetime.fromtimestamp(now or time.time()).date()
         spent = 0.0
         seen = set()
@@ -626,9 +676,10 @@ class Jobs:
                 continue
             cost = phase_cost(d)  # стоимость звена один раз: у resume total_cost_usd накопительный (решение 6)
             spent += float(cost if cost is not None else d.get("budget_usd") or 0)
-        if spent + plan.budget_usd > plan.proj.daily_budget_usd:
-            raise JobError(f"дневной бюджет проекта исчерпан: уже {spent:g} + {plan.budget_usd:g} > "
-                           f"{plan.proj.daily_budget_usd:g} (daily_budget_usd)")
+        asked = plan.budget_usd or 0  # звено без бюджета (лимит бюджета задачи не задан) входит как 0
+        if spent + asked > daily_usd:
+            raise JobError(f"дневной бюджет проекта исчерпан: уже {spent:g} + {asked:g} > "
+                           f"{daily_usd:g} (daily_budget_usd)")
 
     def _spawn_supervisor(self, jid: str) -> int:
         # cwd — каталог задачи: рабочий каталог сервера мог быть удалён (ревью WSH-3.4, п. 11)
@@ -823,8 +874,7 @@ class Jobs:
             raise JobError(f"у задачи {jid} нет session_id — продолжить нельзя")
         # prompt — имя шаблона (не литеральный текст из чата, замечание 6); рендер тем же taskfile.render
         plan = self.plan(d["project"], d["task"], model=model, effort=effort, chosen_by=chosen_by, reason=reason,
-                         max_turns=max_turns or d.get("max_turns"),
-                         budget_usd=budget_usd if budget_usd is not None else d.get("budget_usd"),
+                         max_turns=max_turns, budget_usd=budget_usd,  # только переданное: родительское — inherit
                          note=note, prompt_override=prompt, inherit=d, push=push, forge=forge)
         # тот же dir и профиль, что у родителя (п. 2.5.6): задача-потомок могла править свою шапку
         if str(plan.dir) != d.get("dir") or plan.profile != d.get("profile"):
@@ -878,13 +928,16 @@ class Jobs:
         if waiting:
             raise JobError("план утверждается автоматически (plan = auto) — code_approve не нужен")
 
-    def _remaining(self, d: dict) -> tuple[float, int]:
-        """Остаток бюджета и ходов задачи после всех звеньев цепочки (стоимость звена — разностью)."""
+    def _remaining(self, d: dict) -> tuple[float | None, int | None]:
+        """Остаток бюджета и ходов задачи после всех звеньев цепочки (стоимость звена — разностью).
+        У задачи без бюджета или без потолка ходов остатка нет — None (WSH-4.7, п. 2.3.6)."""
         links = self.chain(d.get("chain_root") or d["id"])
         spent = _sum(phase_cost(x) for x in links)
         turns = sum(int((x.get("result") or {}).get("num_turns") or 0) for x in links)
-        return _cents(float(d.get("budget_total") or d.get("budget_usd") or 0) - spent), \
-            int(d.get("max_turns_total") or d.get("max_turns") or 0) - turns
+        total_usd = d.get("budget_total") or d.get("budget_usd")
+        total_turns = d.get("max_turns_total") or d.get("max_turns")
+        return (None if not total_usd else _cents(float(total_usd) - spent),
+                None if not total_turns else int(total_turns) - turns)
 
     def _link_plan(self, d: dict, phase: str, note, template: str | None = None) -> Plan:
         """Звено цепочки из job.json фазы плана: те же проект, dir, ТЗ, профиль и выбор; бюджет — остаток."""
@@ -895,18 +948,20 @@ class Jobs:
             raise JobError(f"dir задачи {dir_abs} больше не в code.dirs проекта {d['project']}")
         if d["profile"] not in proj.profiles:
             raise JobError(f"профиль {d['profile']} больше не разрешён проекту (profiles = {', '.join(proj.profiles)})")
+        lim = effective_limits(proj, BILLING)
         budget, turns = self._remaining(d)
         choice = code_policy.Choice(**d["choice"])
         template = template or proj.execute_prompt
         if phase == "plan":
-            budget = min(budget, _cents(float(d["budget_total"]) * proj.plan_budget_share))
-            turns = min(turns, proj.plan_max_turns)
+            if budget is not None:
+                budget = min(budget, _cents(float(d["budget_total"]) * proj.plan_budget_share))
+            turns = _least(lim.plan_max_turns, turns)
             model, effort = choice.plan_model, choice.plan_effort
         else:
             model, effort = choice.model, choice.effort
-        if budget <= 0:
+        if budget is not None and budget <= 0:
             raise JobError(f"бюджет задачи исчерпан: остаток {budget:g} из {d.get('budget_total')}")
-        if turns < 1:
+        if turns is not None and turns < 1:
             raise JobError(f"ходы задачи исчерпаны: из {d.get('max_turns_total')} не осталось")
         prompt, warnings, note_left = self._render(root, proj, template, d.get("ticket") or "", d["task_rel"], note)
         gates = link_gates(proj, d["profile"], warnings)
@@ -917,8 +972,10 @@ class Jobs:
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
                     effort, turns, budget, prompt, warnings + gwarn, proj, ticket=d.get("ticket") or "",
                     size=d.get("size"), risk=d.get("risk"), choice=choice, phase=phase,
-                    plan_mode=d.get("plan_mode") or "no", budget_total=float(d["budget_total"]),
-                    max_turns_total=int(d["max_turns_total"]), grants=grants, gates=gates, sandbox_hidden=hidden)
+                    plan_mode=d.get("plan_mode") or "no",
+                    budget_total=float(d["budget_total"]) if d.get("budget_total") else None,
+                    max_turns_total=int(d["max_turns_total"]) if d.get("max_turns_total") else None,
+                    grants=grants, gates=gates, sandbox_hidden=hidden)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
         """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk, модель исполнения,
@@ -1576,6 +1633,12 @@ def phase_cost(d: dict) -> float | None:
 
 def _sum(values) -> float:
     return round(sum(v for v in values if v is not None), 6)
+
+
+def _least(*values):
+    """Меньшее из заданных значений; ни одного нет — None."""
+    got = [v for v in values if v is not None]
+    return min(got) if got else None
 
 
 def _cents(v: float) -> float:

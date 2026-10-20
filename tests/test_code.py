@@ -55,7 +55,7 @@ def registry_text(root: Path, prompts="prompts", claude=None, **code_over) -> st
              "[code]", *gcode, "",
              '[workspace.proj]', f'path = "{root}"', 'mode = "rw"', "",
              "[workspace.proj.code]"]
-    lines += [f"{k} = {v}" for k, v in code.items()]
+    lines += [f"{k} = {v}" for k, v in code.items() if v is not None]  # None — ключа в реестре нет (WSH-4.7)
     return "\n".join(lines) + "\n"
 
 

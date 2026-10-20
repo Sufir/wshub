@@ -75,7 +75,12 @@ enabled = true
 dirs = ["org"]                    # где можно запускать; строго вне служебных каталогов wshub
 prompts = ".agents/templates/code-prompts"
 profiles = ["recon", "task", "review"]
-model_max = "opus"                # потолки модели, effort, ходов и бюджета
+model_max = "opus"                # потолок модели
+# на подписке по умолчанию лимитов расхода нет; задаются оператором в реестре — раскомментируй нужные
+# max_turns = 150                 # ходы задачи
+# max_budget_usd = 20             # бюджет задачи
+# daily_budget_usd = 60           # дневной бюджет проекта
+# max_hours = 4                   # время звена
 
 [workspace.team-service.code.gates]  # гейты: проверки вне песочницы командой wshub gate <имя> (только task)
 test-docker = ".venv/bin/python -m pytest -m docker"       # строка — одна команда без оболочки

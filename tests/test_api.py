@@ -165,7 +165,8 @@ def test_providers_imported_only_through_dict():
     dynamic = [str(f) for f in (src / "llm").rglob("*.py")
                if re.search(r"import_module|__import__|importlib", f.read_text(encoding="utf-8"))]
     assert dynamic == []
-    assert "from . import fake" in allowed.read_text(encoding="utf-8")
+    # провайдеров несколько — isort собирает их в одну строку (ТЗ WSH-4.6, решение 5.1.4)
+    assert re.search(r"^from \. import .*\bfake\b", allowed.read_text(encoding="utf-8"), re.M)
 
 
 # ---------- caps (п. 4.2) ----------

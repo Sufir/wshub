@@ -81,6 +81,7 @@ model_max = "opus"                # потолок модели
 # max_budget_usd = 20             # бюджет задачи
 # daily_budget_usd = 60           # дневной бюджет проекта
 # max_hours = 4                   # время звена
+key = false                       # задачи на API-ключе anthropic (billing = "key"); true — разрешает оператор
 
 [workspace.team-service.code.gates]  # гейты: проверки вне песочницы командой wshub gate <имя> (только task)
 test-docker = ".venv/bin/python -m pytest -m docker"       # строка — одна команда без оболочки
@@ -90,6 +91,12 @@ check = { cmd = ["scripts/check.sh"], timeout_s = 1500 }   # cmd строкой 
 `gates` — имя (`^[a-z0-9][a-z0-9_-]{0,39}$`) → команда. В строковой форме операторы оболочки, `$` и обратная
 кавычка — ошибка секции проекта; нужна цепочка — скрипт в репозитории или `cmd` списком. Подробно — раздел
 «Гейты» в [docs/code.md](code.md).
+
+`key` — булево, по умолчанию `false`; не булево значение — ошибка секции проекта. При `key = true` задача может идти
+на ключе `~/.config/wshub/keys/anthropic` (`code_start(billing="key", reason=…)` или `wshub code start --billing
+key`); для неё нужна и секция `[api.providers.anthropic]` (зоны кредитов), `[api] enabled` не нужен. Бюджет задачи на
+ключе — `max_budget_usd`, иначе $10, дневной потолок — `[api] daily_usd`. Подробно — раздел «Задачи на ключе» в
+[docs/code.md](code.md); `wshub doctor` при `key = true` проверяет ключ и его права.
 
 ## Состояние `~/.local/state/wshub`
 

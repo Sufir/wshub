@@ -215,7 +215,8 @@ wshub uninstall           — убрать запись из Desktop; --purge �
 wshub outbox set <путь>   — папка перевалки для publish, например C:\\Users\\<имя>\\ClaudeOutbox
 wshub outbox clean        — удалить все каталоги перевалки wshub
 wshub code                — MCP-сервер wshub-code (stdio); его запускает Claude Desktop
-wshub code start <проект> <ТЗ>  — запустить задачу Claude Code; печатает job (--follow — события до конца)
+wshub code start <проект> <ТЗ>  — запустить задачу Claude Code; печатает job (--follow — события до конца,
+                                  --billing key — оплата API-ключом anthropic хаба)
 wshub code status [job]   — список последних задач или снимок одной
 wshub code result <job>   — итог задачи
 wshub code stop <job>|--all     — остановить задачу
@@ -226,6 +227,7 @@ wshub api key set|check <провайдер>  — ключ API хаба (скр�
 wshub api run …           — один запрос к модели через провайдера; --estimate — оценка без запроса
 wshub api stats           — траты API за цикл (оценка); credits / allow — остаток и разрешение купленной зоны
 wshub code-run <job>      — служебная: надзиратель задачи (запускает хаб, вручную не вызывается)
+wshub code key-helper     — служебная: ключ anthropic для claude задачи на ключе (apiKeyHelper)
 wshub code-hook <кат>…    — служебная: PreToolUse-хук Bash (ставится в settings.json как python -m wshub.hook)
 wshub --version           — версия и коммит"""
 

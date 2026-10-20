@@ -20,8 +20,12 @@
   FAKE_RESET   — git reset --hard HEAD~1 (HEAD назад)
   FAKE_GIT_META — создать .git/hooks/pre-commit и дописать секцию в .git/config (обход через смонтированный каталог)
   FAKE_COMMIT  — сделать коммит в cwd
-  FAKE_SOURCE  — apiKeySource в init (по умолчанию "none" — подписка; "-" — поля нет). Не FAKE_KEY_SOURCE: имя
+  FAKE_SOURCE  — apiKeySource в init (по умолчанию "apiKeyHelper", если в --settings есть apiKeyHelper, как у
+                 настоящего claude на ключе, иначе "none" — подписка; "-" — поля нет). Не FAKE_KEY_SOURCE: имя
                  с KEY реестр не пускает в pass_env (ТЗ WSH-4.1, 7.1)
+  FAKE_HELPER_OUT — выполнить apiKeyHelper из --settings (как claude, через sh -c) и записать его stdout в этот файл
+  FAKE_API_RETRY — после init событие system/api_retry с этим error_status (401, 403, 429…), затем FAKE_SLEEP
+  FAKE_API_ERROR — итог с is_error: true и api_error_status с этим кодом (ключ отклонён без api_retry)
   FAKE_INIT_MODEL — model в init (по умолчанию — значение --model)
   FAKE_RATE    — JSON rate_limit_info: событие rate_limit_event; FAKE_RATE_AT — напечатать после N-го события
                  (по умолчанию — перед итогом, как на подписке, PoC WSH-4.0); FAKE_RATE_COUNT — сколько раз (1)
@@ -112,14 +116,32 @@ def main() -> int:
     signal.signal(signal.SIGINT, on_sig)
     signal.signal(signal.SIGTERM, on_sig)
 
+    helper = None
+    if "--settings" in argv:
+        try:
+            with open(argv[argv.index("--settings") + 1], encoding="utf-8") as f:
+                helper = json.load(f).get("apiKeyHelper")
+        except (OSError, ValueError):
+            pass
+    if helper and os.environ.get("FAKE_HELPER_OUT"):
+        r = subprocess.run(["sh", "-c", helper], capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        with open(os.environ["FAKE_HELPER_OUT"], "w", encoding="utf-8") as f:
+            json.dump({"code": r.returncode, "stdout": r.stdout}, f)
+
     init = {"type": "system", "subtype": "init", "session_id": sid, "tools": ["Read", "Edit", "Bash", "Task"],
             "permissionMode": perm_mode, "cwd": os.getcwd(),
             "model": os.environ.get("FAKE_INIT_MODEL") or (argv[argv.index("--model") + 1] if "--model" in argv
                                                             else "fake")}
-    if os.environ.get("FAKE_SOURCE", "none") != "-":
-        init["apiKeySource"] = os.environ.get("FAKE_SOURCE", "none")
+    source = os.environ.get("FAKE_SOURCE") or ("apiKeyHelper" if helper else "none")
+    if source != "-":
+        init["apiKeySource"] = source
     if not os.environ.get("FAKE_NO_INIT"):
         emit(init)
+    if os.environ.get("FAKE_API_RETRY"):  # формат — PoC WSH-4.0, факт 3.4
+        emit({"type": "system", "subtype": "api_retry", "attempt": 1, "max_retries": 10, "retry_delay_ms": 2260,
+              "error_status": int(os.environ["FAKE_API_RETRY"]),
+              "error": "authentication_failed" if os.environ["FAKE_API_RETRY"] in ("401", "403") else "rate_limit",
+              "session_id": sid})
     emit({"type": "assistant", "message": {"content": [{"type": "text", "text": "начинаю"}]}})
     if os.environ.get("FAKE_TOUCH"):
         open(os.path.join(os.getcwd(), os.environ["FAKE_TOUCH"]), "w").close()
@@ -207,9 +229,13 @@ def main() -> int:
     if not os.environ.get("FAKE_RATE_AT"):
         emit_rate()
     limit = bool(os.environ.get("FAKE_LIMIT_ERROR"))
-    emit({"type": "result", "subtype": os.environ.get("FAKE_SUBTYPE", "success"), "session_id": sid,
-          "total_cost_usd": total, "num_turns": 2, "duration_ms": 10,
-          "is_error": limit, "result": "You've hit your limit" if limit else "готово", "permission_denials": denials})
+    res = {"type": "result", "subtype": os.environ.get("FAKE_SUBTYPE", "success"), "session_id": sid,
+           "total_cost_usd": total, "num_turns": 2, "duration_ms": 10,
+           "is_error": limit, "result": "You've hit your limit" if limit else "готово", "permission_denials": denials}
+    if os.environ.get("FAKE_API_ERROR"):  # итог отказа ключа (PoC WSH-4.0, факт 3.4)
+        res.update(is_error=True, api_error_status=int(os.environ["FAKE_API_ERROR"]),
+                   result="Invalid API key · Fix external API key")
+    emit(res)
     return 0
 
 

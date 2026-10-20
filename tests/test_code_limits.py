@@ -68,9 +68,9 @@ def test_effective_limits_subscription_takes_registry_only():
     assert effective_limits(ProjectCode(), "subscription") == Limits()
 
 
-@pytest.mark.parametrize("mode", ["api", "key", "", "Subscription"])
+@pytest.mark.parametrize("mode", ["api", "", "Subscription"])
 def test_effective_limits_other_billing_refused(mode):
-    with pytest.raises(JobError, match="WSH-4.1"):
+    with pytest.raises(JobError, match="не поддерживается: subscription или key"):
         effective_limits(ProjectCode(max_turns=7), mode)
 
 
@@ -320,7 +320,9 @@ def test_no_dollars_in_card(code):
     assert "cost" not in data and "$" not in data
     assert json.loads(data)["billing"] == "подписка" and json.loads(data)["state"] == "completed"
     html = (resources.files("wshub") / "code_card.html").read_text(encoding="utf-8")
-    assert "cost_usd" not in html and "стоимость" not in html and "toFixed" not in html and '"$"' not in html
+    # сумму карточка выводит только из cost_usd, а его card_data отдаёт лишь на ключе (ТЗ WSH-4.6, п. 2.6.2)
+    assert "стоимость" not in html and '"$"' not in html
+    assert html.count("cost_usd") == 4 and html.count("toFixed") == 1  # одно место показа — рядом с оплатой
 
 
 def test_no_dollars_in_cli(code, capsys):

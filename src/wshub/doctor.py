@@ -506,6 +506,16 @@ def check_code(ctx: Ctx, reg, hub) -> dict:
     else:
         lines.append("временный каталог claude: свободен или наш")
 
+    keyed = [n for n, p in code.projects.items() if p.key]
+    if keyed:  # задачи на ключе (ТЗ WSH-4.6, п. 2.8.3): ключ anthropic и его права, значение не выводится
+        from .jobs import KEY_PROVIDER
+        from .llm import keys
+        try:
+            keys.read(keys.key_path(ctx.config.parent, KEY_PROVIDER))
+            lines.append(f"ключ {KEY_PROVIDER} (key = true: {', '.join(keyed)}): ключ есть, права верны")
+        except keys.KeyProblem as e:
+            problems.append(f"ключ {KEY_PROVIDER} (key = true: {', '.join(keyed)}): {e}")
+
     if entries:
         lines.append("запись wshub-code в Desktop: есть")
     else:

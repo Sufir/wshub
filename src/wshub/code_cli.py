@@ -54,6 +54,8 @@ def code_main(cmd: str, rest: list[str], config: Path, state: Path) -> int:
     # cmd == "code"
     if not rest:
         return _serve(config, state)
+    if rest[0] == "key-helper":  # служебная: apiKeyHelper задачи на ключе (ТЗ WSH-4.6, п. 2.3) — до Hub
+        return _key_helper(config, rest[1:])
     sub, args = rest[0], rest[1:]
     if sub not in ("start", "status", "result", "stop", "stats"):
         print("wshub code [start|status|result|stop|stats] (без аргументов — MCP-сервер wshub-code)",
@@ -67,6 +69,24 @@ def code_main(cmd: str, rest: list[str], config: Path, state: Path) -> int:
         hub._audit_code(f"cli_code_{sub}", None, None, status="error", error=str(e))
         print(f"wshub code: отказ: {e}", file=sys.stderr)  # без трассировки (замечание 14)
         return 1
+
+
+def _key_helper(config: Path, args: list[str]) -> int:
+    """Ключ anthropic в stdout и больше ничего — его запрашивает claude задачи на ключе (apiKeyHelper в --settings).
+    Права и чтение — wshub.llm.keys; любая проблема — код 1 и текст в stderr без значения ключа."""
+    from .jobs import KEY_PROVIDER
+    from .llm import keys
+    if args:
+        print("wshub code key-helper — служебная команда задачи на ключе, без аргументов", file=sys.stderr)
+        return 2
+    try:
+        value = keys.read(keys.key_path(Path(config).parent, KEY_PROVIDER))
+    except (keys.KeyProblem, OSError) as e:
+        print(f"wshub code key-helper: {e}", file=sys.stderr)
+        return 1
+    sys.stdout.write(value + "\n")
+    sys.stdout.flush()
+    return 0
 
 
 def _reap(signum=None, frame=None) -> None:
@@ -99,11 +119,11 @@ def _serve(config: Path, state: Path) -> None:
 
 
 def _parse(args: list[str]) -> tuple[list[str], dict]:
-    """Позиционные аргументы и опции --model/--effort/--plan/--max-turns/--budget-usd/--days/--follow."""
+    """Позиционные аргументы и опции --model/--effort/--plan/--max-turns/--budget-usd/--billing/--days/--follow."""
     pos, opts = [], {}
     i = 0
     val = {"--model": "model", "--effort": "effort", "--plan": "plan", "--max-turns": "max_turns",
-           "--budget-usd": "budget_usd", "--days": "days"}
+           "--budget-usd": "budget_usd", "--billing": "billing", "--days": "days"}
     while i < len(args):
         a = args[i]
         if a == "--follow":
@@ -130,11 +150,12 @@ def _start(hub: Hub, args: list[str]) -> int:
     pos, opts = _parse(args)
     if len(pos) != 2:
         raise WsError("нужно: wshub code start <project> <task> [--model M --effort E --plan no|auto|review "
-                      "--max-turns N --budget-usd B --follow]")
+                      "--max-turns N --budget-usd B --billing subscription|key --follow]")
     jobs = Jobs(hub)
-    # флаги терминала — выбор оператора (ТЗ WSH-3, 2.2.1): применяется как есть, без пола и потолка
+    # флаги терминала — выбор оператора (ТЗ WSH-3, 2.2.1): применяется как есть, без пола и потолка; лимиты — без
+    # потолка реестра, на ключе — не выше его потолков (ТЗ WSH-4.6, п. 2.6.1); --billing key — выбор оператора
     plan = jobs.plan(pos[0], pos[1], model=opts.get("model"), effort=opts.get("effort"), plan=opts.get("plan"),
-                     chosen_by="operator", channel="cli",
+                     chosen_by="operator", channel="cli", billing=opts.get("billing"),
                      max_turns=int(opts["max_turns"]) if "max_turns" in opts else None,
                      budget_usd=float(opts["budget_usd"]) if "budget_usd" in opts else None)
     d = jobs.start(plan)
@@ -164,7 +185,7 @@ def _follow(jobs, jid: str) -> None:
 
 
 def _status(hub: Hub, args: list[str]) -> int:
-    from .jobs import Jobs
+    from .jobs import Jobs, cost_shown
     from .runner import apply_billing
     jobs = Jobs(hub)
     pos, _ = _parse(args)
@@ -174,7 +195,9 @@ def _status(hub: Hub, args: list[str]) -> int:
         hub._audit_code("cli_code_status", snap.get("project"), pos[0])
     else:
         for row in jobs.list(limit=20):
-            print(f"{row['id']}  {row['state']:10}  {row['project']}")  # сумма на подписке не показывается (WSH-4.7)
+            # сумма на подписке не показывается (WSH-4.7), на ключе — да (ТЗ WSH-4.6, п. 2.6.2)
+            cost = f"  ≈${row['cost_usd']:.2f}" if cost_shown(row) and row.get("cost_usd") is not None else ""
+            print(f"{row['id']}  {row['state']:10}  {row['project']}{cost}")
         hub._audit_code("cli_code_status", None, None)
     return 0
 
@@ -204,13 +227,16 @@ def _stats(hub: Hub, args: list[str]) -> int:
         raise WsError("нужно: wshub code stats [project] [--days N]")
     days = int(opts.get("days", 30))
     rows = Jobs(hub).stats(pos[0] if pos else None, days)
-    # средняя цена в долларах на подписке не показывается (WSH-4.7)
+    # средняя цена в долларах на подписке не показывается (WSH-4.7); колонка «ср. $» — только при задачах на ключе
+    key = any(r["billing"] == "key" for r in rows)
     print(f"{'проект':12} {'строка политики':34} {'источник':9} {'канал':10} {'задач':>5} "
-          f"{'ср. ходов':>9} {'completed':>9} {'replan':>6}")
+          f"{'ср. ходов':>9} {'completed':>9} {'replan':>6}" + (f" {'оплата':12} {'ср. $':>8}" if key else ""))
     for r in rows:
         rp = "—" if r["replan_share"] is None else f"{r['replan_share']:.0%}"
+        pay = (f" {'ключ':12} {r['avg_cost_usd']:>8.2f}" if r["billing"] == "key" else f" {'подписка':12} {'—':>8}") \
+            if key else ""
         print(f"{r['project'] or '':12} {r['row']:34} {r['source']:9} {r['channel']:10} {r['tasks']:>5} "
-              f"{r['avg_turns']:>9} {r['completed_share']:>9.0%} {rp:>6}")
+              f"{r['avg_turns']:>9} {r['completed_share']:>9.0%} {rp:>6}" + pay)
     if not rows:
         print(f"(задач за {days} дн. нет)")
     hub._audit_code("cli_code_stats", pos[0] if pos else None, None)

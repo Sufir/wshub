@@ -73,6 +73,10 @@ def read(path: Path) -> Ledger:
     if data.strip() and not rows:
         raise LedgerError(f"журнал трат {path}: не разбирается ни одна строка — исправь или перенеси файл; "
                           "до тех пор API хаба не тратит")
+    # звено задачи Code пишет резерв на старте и факт по итогу (ТЗ WSH-4.6, п. 2.5.4): из строк одного job
+    # действует последняя — прежние в зоны, потолок дня и stats не входят
+    last = {r["job"]: i for i, r in enumerate(rows) if isinstance(r.get("job"), str)}
+    rows = [r for i, r in enumerate(rows) if not isinstance(r.get("job"), str) or last[r["job"]] == i]
     return Ledger(tuple(rows), skipped)
 
 

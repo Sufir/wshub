@@ -17,9 +17,21 @@ from mcp.server.fastmcp import FastMCP
 
 from . import code_events, code_policy
 from .core import WsError
-from .jobs import TERMINAL, JobError, Jobs, _end_ts, meta_warning, outside_view
+from .jobs import (
+    KEY_PROVIDER,
+    TERMINAL,
+    JobError,
+    Jobs,
+    _end_ts,
+    _sum,
+    billing_mode,
+    cost_shown,
+    meta_warning,
+    outside_view,
+    phase_cost,
+)
 from .registry import RegistryError, forge_url
-from .runner import apply_billing, billing_line, hide_cost
+from .runner import apply_billing, billing_line, hide_cost_for, shown
 from .runtime import read_json
 from .taskfile import TaskError
 
@@ -141,7 +153,7 @@ def build_code_server(hub) -> FastMCP:
     @tool(meta=CARD_META)
     def code_start(project: str, task: str, model: str = "", effort: str = "", plan: str = "",
                    chosen_by: str = "", reason: str = "", max_turns: int = 0, budget_usd: float = 0.0,
-                   note: str = "", push: bool = False, forge: bool = False) -> str:
+                   note: str = "", push: bool = False, forge: bool = False, billing: str = "") -> str:
         """Запустить задачу Claude Code по файлу ТЗ с шапкой (ticket, dir, profile, size, risk). Модель, effort
         и план (no | auto | review) выбирает политика по profile/size/risk — не передавай их без нужды.
         model/effort/plan от себя — отступление от политики: только в пределах потолков и с reason (≥ 15
@@ -150,12 +162,15 @@ def build_code_server(hub) -> FastMCP:
         регламенте task — с reason (кто разрешил и когда), при always — само, при no — отказ. Ответ: job,
         модель/effort/план, источник выбора и канал, строка политики, разрешения, предупреждения.
         Пуш и API хостинга — только по регламенту проекта (code_projects: push, forge_access) и с разрешением
-        задачи в параметрах; слова в тексте ТЗ разрешением не являются."""
+        задачи в параметрах; слова в тексте ТЗ разрешением не являются.
+        billing="key" — оплата API-ключом anthropic хаба вместо подписки: только с reason (кто разрешил тратить
+        ключ и когда) и если проект разрешает (key = true в реестре); по умолчанию — подписка. Режим наследуют
+        все звенья задачи."""
         try:
             p = jobs.plan(project, task, model=model or None, effort=effort or None, plan=plan or None,
                           chosen_by=chosen_by or None, reason=reason or None, max_turns=max_turns or None,
                           budget_usd=budget_usd or None, note=note or None, channel="mcp", push=push,
-                          forge=forge)
+                          forge=forge, billing=billing or None)
             d = jobs.start(p)  # start сам пишет строку code_start со всеми параметрами, источником и job
         except USER_ERR as e:
             _audit("code_start", project=project, status="error", error=str(e))
@@ -163,7 +178,7 @@ def build_code_server(hub) -> FastMCP:
         return _dump({"job": d["id"], "state": d["state"], "choice": p.choice.line(), "phase": p.phase,
                       "params": {"model": p.model, "effort": p.effort, "max_turns": p.max_turns,
                                  "budget_usd": p.budget_usd, "budget_total": p.budget_total,
-                                 "profile": p.profile, "plan": p.plan_mode},
+                                 "profile": p.profile, "plan": p.plan_mode, "billing": p.billing},
                       "grants": _grants_line(p.grants), "warnings": p.warnings,
                       "next": NEXT.get(d.get("notify"), NEXT["poll"])})
 
@@ -234,23 +249,25 @@ def build_code_server(hub) -> FastMCP:
             _audit("code_cancel", job=job, status="error", error=str(e))
             return f"отказ: {e}"
         _audit("code_cancel", project=snap.get("project"), job=job)
-        return _dump(hide_cost(snap))  # снимок завершённой задачи или корня цепочки несёт суммы (WSH-4.7)
+        return _dump(hide_cost_for(jobs, snap))  # суммы снимка — по режиму оплаты (WSH-4.7, ТЗ WSH-4.6, 2.6.2)
 
     @tool(meta=CARD_META)
     def code_resume(job: str, prompt: str, note: str = "", model: str = "", effort: str = "",
                     max_turns: int = 0, budget_usd: float = 0.0, chosen_by: str = "", reason: str = "",
-                    push: bool = False, forge: bool = False) -> str:
+                    push: bool = False, forge: bool = False, billing: str = "") -> str:
         """Продолжить задачу. prompt — ИМЯ шаблона промпта (не текст): рендер как при старте, с {note}.
         note — одна строка ≤ 300 символов; длинную инструкцию — разделом в ТЗ, в note — ссылку на раздел.
         Новый job с --resume session_id родителя; родитель не завершён или это фаза плана — отказ.
         model/effort — как у родителя; сменить — с reason (чат) или chosen_by="operator".
         push/forge — добавить разрешение (как у code_start); разрешения родителя наследуются.
         Пуш и API хостинга — только по регламенту проекта (code_projects: push, forge_access) и с разрешением
-        задачи в параметрах; слова в тексте ТЗ разрешением не являются."""
+        задачи в параметрах; слова в тексте ТЗ разрешением не являются.
+        billing — режим оплаты родителя наследуется; другой режим — отказ (сменить внутри задачи нельзя)."""
         try:
             d = jobs.resume(job, prompt, note=note or None, model=model or None, effort=effort or None,
                             max_turns=max_turns or None, budget_usd=budget_usd or None,
-                            chosen_by=chosen_by or None, reason=reason or None, push=push, forge=forge)
+                            chosen_by=chosen_by or None, reason=reason or None, push=push, forge=forge,
+                            billing=billing or None)
         except USER_ERR as e:
             _audit("code_resume", job=job, status="error", error=str(e))
             return f"отказ: {e}"
@@ -307,10 +324,10 @@ def build_code_server(hub) -> FastMCP:
 
     @tool()
     def code_stats(project: str = "", days: int = 30) -> str:
-        """Калибровка политики: по строке политики, источнику и каналу выбора — число задач, средние ходы,
-        доля completed, доля планов, отправленных на replan. Средняя цена в долларах на подписке не показывается."""
+        """Калибровка политики: по строке политики, источнику, каналу выбора и режиму оплаты — число задач, средние
+        ходы, доля completed, доля планов, отправленных на replan. Средняя цена в долларах — только у задач на ключе."""
         try:
-            rows = hide_cost(jobs.stats(project or None, days))
+            rows = [shown(r, r) for r in jobs.stats(project or None, days)]
         except USER_ERR as e:
             _audit("code_stats", project=project or None, status="error", error=str(e))
             return f"отказ: {e}"
@@ -319,9 +336,10 @@ def build_code_server(hub) -> FastMCP:
 
     @tool()
     def code_jobs(project: str = "", limit: int = 20) -> str:
-        """Последние задачи: job, проект, ТЗ, состояние, фаза. Стоимость в долларах на подписке не показывается."""
+        """Последние задачи: job, проект, ТЗ, состояние, фаза, режим оплаты. Стоимость в долларах — только у задач
+        на ключе (и у остановленных стражем оплаты)."""
         try:
-            rows = hide_cost(jobs.list(project or None, limit))
+            rows = [shown(r, r) for r in jobs.list(project or None, limit)]
         except USER_ERR as e:
             _audit("code_jobs", project=project or None, status="error", error=str(e))
             return f"отказ: {e}"
@@ -441,15 +459,21 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
             new_offset = max(new_offset, base + size)
         base += size
     billing = next((s.api_key_source for s in scans if s.api_key_source), None)
+    on_key = billing_mode(d) == "key"
+    pay = (f"ключ {KEY_PROVIDER}" if billing == "apiKeyHelper" else "api" if billing else None) if on_key else \
+        ("подписка" if billing == "none" else ("api" if billing else None))
     out = {"job": job, "active": active["id"], "project": d.get("project"), "profile": d.get("profile"),
            "task": d.get("task_rel"), "state": state, "reason": active.get("reason"),
            "plan_mode": d.get("plan_mode"), "phases": _phases(links, state), "notify": d.get("notify") or "poll",
            "elapsed_s": max(int(_end_ts(active, state, now) - t0), 0), "grants": d.get("grants") or {},
            "turns": sum(s.turns for s in scans), "actions_count": sum(s.actions for s in scans),
            "denials": sum(s.denials for s in scans), "errors": sum(s.errors for s in scans),
-           "billing": "подписка" if billing == "none" else ("api" if billing else None),
+           "billing": pay,
            "rate": next((s.rate for s in reversed(scans) if s.rate), None),
            "actions": [_card_action(a, t0) for a in acts[-LOG_MAX:]], "marks": marks, "offset": new_offset}
+    costs = [phase_cost(x) for x in links]
+    if (cost_shown(d) or cost_shown(active)) and any(c is not None for c in costs):
+        out["cost_usd"] = _sum(costs)  # сумма — на ключе и при остановке стражем оплаты (ТЗ WSH-4.6, п. 2.6.2)
     if log:
         feed = [a for s in scans for a in s.feed][-LOG_MAX:]
         out["log"] = [_card_action(a, t0) for a in feed]

@@ -103,13 +103,15 @@ def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home:
 
 def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
              data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path, phase: str | None = None,
-             read_extra: list[str] = (), grants: dict | None = None, gates: tuple = ()) -> dict:
+             read_extra: list[str] = (), grants: dict | None = None, gates: tuple = (),
+             key_helper: str | None = None) -> dict:
     """settings.json задачи. cwd — dir (рабочий каталог Code), task_rel — путь к ТЗ от него; protected — все
     служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук).
     phase="plan" — фаза плана (ТЗ WSH-3, решение 5): отличие от эталона профиля — ровно plan_overrides.
     read_extra — абсолютные пути и шаблоны, проверенные jobs (ТЗ WSH-3.1, п. 2.2): Read вне cwd.
     grants — разрешения задачи {push, forge} (ТЗ WSH-3.4, А3.5): помощник в allow и excludedCommands — только с ними.
-    gates — гейты, доступные звену (ТЗ WSH-3.5, Г2): wshub gate в allow и excludedCommands и потолок таймаута Bash."""
+    gates — гейты, доступные звену (ТЗ WSH-3.5, Г2): wshub gate в allow и excludedCommands и потолок таймаута Bash.
+    key_helper — команда apiKeyHelper задачи на ключе (ТЗ WSH-4.6, п. 2.3): сама команда, ключа в settings.json нет."""
     if RULE_UNSAFE.search(task_rel):
         raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
     allow = ["Read(./**)", *_read_extra_rules(read_extra), f"Edit(./{task_rel})",
@@ -164,6 +166,8 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     }
     if proj.claude_md_excludes:
         data["claudeMdExcludes"] = list(proj.claude_md_excludes)
+    if key_helper:
+        data["apiKeyHelper"] = key_helper
     if gates:
         # гейт дольше потолка Bash ушёл бы в фон (Г2.4): потолок — наибольший timeout_s плюс минута
         data["env"] = {"BASH_MAX_TIMEOUT_MS": str(max(BASH_MAX_TIMEOUT_MS,

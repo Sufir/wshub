@@ -49,7 +49,7 @@ WS_CODE_KEYS = {"enabled", "dirs", "prompts", "profiles", "model_min", "model_ma
                 "max_budget_usd", "daily_budget_usd", "max_parallel", "max_hours", "prefetch", "status_regex",
                 "policy", "plan_budget_share", "plan_max_turns", "execute_prompt", *WS_CODE_LISTS,
                 *("push", "push_protect", "forge", "forge_access", "forge_write", "forge_url", "forge_token"),
-                "gates"}
+                "gates", "key"}
 # гейты проекта (ТЗ WSH-3.5, Г1): имя — как hook.GATE_NAME_RE, таймаут в секундах
 GATE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 GATE_KEYS = {"cmd", "timeout_s"}
@@ -189,6 +189,7 @@ class ProjectCode:
     forge_url: str | None = None  # адрес API; None — адрес пресета по умолчанию
     forge_token: str | None = None  # путь к файлу токена, как в реестре (~ раскрывается при чтении)
     gates: tuple[Gate, ...] = ()  # гейты проекта (ТЗ WSH-3.5)
+    key: bool = False  # задачи на API-ключе anthropic разрешены (ТЗ WSH-4.6); разрешение даёт только оператор
 
 
 @dataclass(frozen=True)
@@ -436,7 +437,7 @@ def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
     t = _table(t, where)
     warnings += [unknown_key(f"workspace.{name}.code.{k}") for k in t if k not in WS_CODE_KEYS]
     vals: dict = {}
-    for k in ("enabled", "prefetch"):
+    for k in ("enabled", "prefetch", "key"):
         if k in t:
             if not isinstance(t[k], bool):
                 raise RegistryError(f"{where} {k}: true или false")

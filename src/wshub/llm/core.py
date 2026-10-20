@@ -138,11 +138,13 @@ class Api:
         zone, refusal = self._zone(name, est_usd, z, led)
         return Plan(prov, req, est, est_usd, zone, refusal, z, led.skipped)
 
-    def _zone(self, name: str, est: float, z: ledger.Zones, led: ledger.Ledger) -> tuple[str | None, str | None]:
+    def _zone(self, name: str, est: float, z: ledger.Zones, led: ledger.Ledger,
+              per_call: bool = True) -> tuple[str | None, str | None]:
         """Потолки, затем зона: включённая, если оценка помещается в остаток; иначе купленная — только по
-        действующему разрешению оператора (allow)."""
+        действующему разрешению оператора (allow). per_call=False — без max_usd_per_call: это потолок одного
+        запроса API, к задаче Code на ключе он не применяется (ТЗ WSH-4.6, решение 5.1.5)."""
         api = self.reg.api
-        if est > api.max_usd_per_call:
+        if per_call and est > api.max_usd_per_call:
             return None, (f"оценка запроса {usd(est)} выше потолка max_usd_per_call = ${api.max_usd_per_call:.2f}; "
                           "уменьши --max-tokens или вход")
         today = ledger.spent_today(led, self.now())
@@ -175,6 +177,29 @@ class Api:
             if zone is None:
                 raise ApiError(f"{refusal} — запрос не отправлен")
             return self._send(plan, zone)
+
+    def code_reserve(self, name: str, project: str, model: str, budget: float, job: str) -> dict:
+        """Резерв звена задачи Code на ключе (ТЗ WSH-4.6, п. 2.5.2–2.5.4): под блокировкой журнала — потолок дня и
+        зона для бюджета звена, затем строка-резерв с job. Не помещается — ApiError с текстом 4.2. Ответ — строка
+        резерва: по итогу звена её заменит строка с фактом (code_settle)."""
+        with ledger.locked(self.ledger_path):
+            _prov, conf = self.provider(name)
+            led = self.read_ledger()
+            z = ledger.zones(led, name, conf, self.now().date())
+            zone, refusal = self._zone(name, budget, z, led, per_call=False)
+            if zone is None:
+                raise ApiError(f"{refusal} — задача не запущена")
+            rec = {"ts": ledger.stamp(self.now()), "kind": "run", "provider": name, "model": model, "tier": None,
+                   "project": project, "template": "code", "zone": zone, "job": job, "usage": Usage().as_dict(),
+                   "cost_usd": float(budget), "reserve": True}
+            ledger.append(self.ledger_path, rec)
+            return rec
+
+    def code_settle(self, rec: dict, cost: float, ok: bool | None) -> None:
+        """Факт звена вместо резерва: строка того же job (ТЗ WSH-4.6, п. 2.5.4)."""
+        with ledger.locked(self.ledger_path):
+            ledger.append(self.ledger_path, {**rec, "ts": ledger.stamp(self.now()), "cost_usd": float(cost),
+                                             "reserve": False, "ok": ok})
 
     def _send(self, plan: Plan, zone: str) -> Response:
         name, req = plan.provider.name, plan.request

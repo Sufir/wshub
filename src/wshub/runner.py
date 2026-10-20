@@ -25,16 +25,22 @@ from .jobs import (
     COMMITS_MAX,
     DOCKER_MAX,
     GIT_START,
+    KEY_PROVIDER,
+    SOURCE,
     JobError,
     Jobs,
+    _sum,
+    billing_mode,
     billing_settings_problem,
     cancel_timers,
     clip_list,
     config_keys,
+    cost_shown,
     git_meta,
     head_state,
     kill_gate,
     meta_changes,
+    phase_cost,
 )
 from .runtime import atomic_write_text, proc_start, read_json
 
@@ -59,7 +65,13 @@ BILLING_HINT = {
                                 "если claude упал на старте — смотри текст итога (result) и stderr.log",
     "overage": "задача начала тратить extra usage сверх подписки (isUsingOverage) и остановлена; разрешить — "
                "[code] allow_overage = true в реестре",
+    "billing_mismatch/key": "задача на ключе, а claude сообщил источник оплаты не «apiKeyHelper» — ключ хаба не "
+                            "применён, задача остановлена; проверь apiKeyHelper и env в .claude/settings*.json "
+                            "рабочего каталога и ~/.claude/settings.json",
+    "key_rejected": "API отклонил ключ anthropic (401/403) — задача остановлена сразу, без повторов claude; проверь "
+                    "ключ: wshub api key check anthropic, задай заново: wshub api key set anthropic",
 }
+KEY_REJECT = (401, 403)  # error_status в system/api_retry и api_error_status в result (ТЗ WSH-4.6, п. 2.4.3–2.4.4)
 
 
 def _iso(ts) -> str | None:
@@ -101,11 +113,67 @@ def hide_cost(view):
     return view
 
 
-def billing_line(billing: dict | None, reason: str | None = None) -> str:
+def shown(view, d: dict):
+    """Сумма — по режиму оплаты задачи (ТЗ WSH-4.6, п. 2.6.2): на ключе и у billing_mismatch/key_rejected видна,
+    на подписке — убрана (WSH-4.7). d — job.json задачи или строка list/stats."""
+    return view if cost_shown(d) else hide_cost(view)
+
+
+def hide_cost_for(jobs: Jobs, view: dict) -> dict:
+    """shown по задаче ответа (активное звено, корень или job); задачи нет — суммы убираются."""
+    try:
+        d = jobs.read(view.get("active") or view.get("id") or view.get("job"))
+    except JobError:
+        return hide_cost(view)
+    return shown(view, d)
+
+
+def key_view(jobs: Jobs, d: dict) -> dict:
+    """Данные строки оплаты задачи на ключе: сумма звеньев цепочки (None — итогов ещё нет) и цикл включённых
+    кредитов провайдера по журналу трат (None — журнал или секция провайдера не читаются)."""
+    costs = [phase_cost(x) for x in jobs.chain(d.get("chain_root") or d["id"])]
+    out: dict = {"cost": _sum(costs) if any(c is not None for c in costs) else None, "cycle": None}
+    try:
+        z = jobs._key_api().zones((d.get("billing") or {}).get("provider") or KEY_PROVIDER)
+        out["cycle"] = (z.included_spent, z.included_total, z.until)
+    except Exception:  # noqa: BLE001 — строка оплаты не должна ронять ответ
+        pass
+    return out
+
+
+def _key_line(b: dict, reason: str | None, key: dict) -> str:
+    """Строка оплаты задачи на ключе (ТЗ WSH-4.6, п. 2.4.5): окон подписки и overage нет — на ключе rate_limit_event
+    не приходит (факт 1)."""
+    from .llm.cli import ZONE_RU
+    from .llm.core import ddmm, usd
+    m = b.get("mismatch")
+    src = b.get("source")
+    if m or reason == "billing_mismatch" or ("source" in b and src != SOURCE["key"]):
+        got = m or "apiKeySource: " + (src if src is not None else "поля нет")
+        head = f"оплата: НЕ подтверждена ({NO_INIT})" if m == NO_INIT else f"оплата: НЕ ключ хаба ({got})"
+        return head + (" · задача остановлена" if reason == "billing_mismatch" else "")
+    parts = [f"оплата: ключ {b.get('provider') or KEY_PROVIDER}",
+             f"{usd(key['cost'])} за задачу" if key.get("cost") is not None else "сумма за задачу — по итогу звена"]
+    if b.get("zone") in ZONE_RU:
+        parts.append(f"зона: {ZONE_RU[b['zone']]}")
+    if key.get("cycle"):
+        spent, total, until = key["cycle"]
+        parts.append(f"цикл {usd(spent)} из ${total:.2f}, до {ddmm(until)}")
+    line = " · ".join(parts)
+    if reason == "key_rejected":
+        r = b.get("rejected") if isinstance(b.get("rejected"), dict) else {}
+        what = " ".join(str(r[k]) for k in ("error_status", "error") if r.get(k) is not None)
+        line += f" · ключ отклонён{f' ({what})' if what else ''} · задача остановлена"
+    return line
+
+
+def billing_line(billing: dict | None, reason: str | None = None, key: dict | None = None) -> str:
     """Строка оплаты (ТЗ WSH-4.1, п. 2.6): окна из unifiedWindows (utilization × 100), сброс, overage; «близко к
     лимиту» при allowed_warning; три причины остановки — хвостом строки. До первого init — источник ещё не известен;
-    result без init — «НЕ подтверждена» (ревью круга 1, п. 2)."""
+    result без init — «НЕ подтверждена» (ревью круга 1, п. 2). Задача на ключе — своя строка (key — key_view)."""
     b = billing or {}
+    if b.get("mode") == "key":
+        return _key_line(b, reason, key or {})
     m = b.get("mismatch")
     if m or reason == "billing_mismatch" or ("source" in b and b["source"] != "none"):
         if m == NO_INIT:
@@ -167,24 +235,27 @@ def billing_hint(reason: str | None, billing: dict | None) -> str | None:
         return BILLING_HINT["billing_mismatch/no_init"]
     if reason == "billing_mismatch" and isinstance(m, str) and m.startswith("settings: "):
         return BILLING_HINT["billing_mismatch/settings"]
+    if reason == "billing_mismatch" and (billing or {}).get("mode") == "key":
+        return BILLING_HINT["billing_mismatch/key"]
     return BILLING_HINT.get(reason)
 
 
 def apply_billing(jobs: Jobs, view: dict, model: bool = False) -> dict:
-    """Строка оплаты, подсказка трёх причин и (model) фактическая модель в снимке или итоге — по активному звену
-    (code_status, code_wait, code_result, wshub code status/result). Сумма-оценка из ответа убирается (WSH-4.7)."""
+    """Строка оплаты, подсказка причин стража и (model) фактическая модель в снимке или итоге — по активному звену
+    (code_status, code_wait, code_result, wshub code status/result). Сумма-оценка из ответа убирается на подписке
+    (WSH-4.7) и остаётся на ключе (ТЗ WSH-4.6, п. 2.6.2)."""
     try:
         d = jobs.read(view.get("active") or view.get("id") or view.get("job"))
     except JobError:
         return hide_cost(view)
     b = d.get("billing") or {}
-    view["billing"] = billing_line(b, d.get("reason"))
+    view["billing"] = billing_line(b, d.get("reason"), key_view(jobs, d) if billing_mode(d) == "key" else None)
     hint = billing_hint(d.get("reason"), b)
     if hint:
         view["reason_hint"] = hint
     if model:
         view["model_line"] = f"модель: {d.get('model')} → {b.get('model') or 'неизвестна (init не было)'}"
-    return hide_cost(view)
+    return shown(view, d)
 
 
 def _rate_brief(rate) -> dict | None:
@@ -578,18 +649,26 @@ class Supervisor:
             if problem and not self.stop:
                 self._halt("billing_mismatch", f"settings: {problem[0]}", f"settings: {problem[0]}")
                 changed = True
+        mode = billing_mode(self.d)
+        expect = SOURCE[mode]  # подписка — "none", ключ — "apiKeyHelper" (ТЗ WSH-4.6, п. 2.4.1)
         for e in stream.read():
             if e.get("type") not in ("system", "rate_limit_event"):
                 continue
             b = self.d.setdefault("billing", {})
             if e.get("type") == "system" and e.get("subtype") == "init":
                 src = e.get("apiKeySource")
-                if b.get("source", "none") == "none":  # несовпадение не затирается следующим init
+                if b.get("source", expect) == expect:  # несовпадение не затирается следующим init
                     b["source"] = src
                 b["model"] = e.get("model")
                 changed = True
-                if src != "none":
+                if src != expect:
                     self._halt("billing_mismatch", src, f"apiKeySource: {src if src is not None else 'поля нет'}")
+            elif e.get("type") == "system" and e.get("subtype") == "api_retry" and mode == "key" \
+                    and e.get("error_status") in KEY_REJECT:
+                # ключ отклонён: 4 минуты повторов claude не ждём (ТЗ WSH-4.6, п. 2.4.3); 429 и 5xx — его повторы
+                b.setdefault("rejected", {"error_status": e.get("error_status"), "error": e.get("error")})
+                changed = True
+                self._halt("key_rejected")
             elif e.get("type") == "rate_limit_event":
                 b["rate_events"] = int(b.get("rate_events") or 0) + 1
                 info = e.get("rate_limit_info")
@@ -670,11 +749,20 @@ class Supervisor:
             state, reason = ("timeout", "max_hours") if self.d.get("reason") == "timeout" else ("cancelled", "cancel")
         elif not res_event:
             state, reason = "failed", "no_result"
+        elif billing_mode(self.d) == "key" and res_event.get("is_error") \
+                and res_event.get("api_error_status") in KEY_REJECT:
+            # отказ ключа итогом, без api_retry в потоке (ТЗ WSH-4.6, п. 2.4.4)
+            state, reason = "failed", "key_rejected"
+            billing = self.d.setdefault("billing", {})
+            billing.setdefault("rejected", {"error_status": res_event.get("api_error_status"),
+                                            "error": _clip_bytes(str(res_event.get("result") or ""), 300)})
         elif res_event.get("is_error") and rate.get("status") == "rejected":  # лимит подписки (п. 2.5, факт 9)
             state, reason = "failed", "subscription_limit"
             result["resets_at"] = _iso(rate.get("resetsAt"))
         else:
             state, reason = _map_state(res_event.get("subtype"), res_event.get("is_error"))
+        if reason == "key_rejected":  # в итоге — error_status и error из события (ТЗ WSH-4.6, п. 2.4.3)
+            result.update((self.d.get("billing") or {}).get("rejected") or {})
         result["session_id"] = result["session_id"] or self.d.get("session_id")
         result["taskfile_status"] = self._taskfile_status(cwd)
         result["phase_cost_usd"] = self._phase_cost(result.get("total_cost_usd"))
@@ -683,6 +771,8 @@ class Supervisor:
                 state, reason = "cancelled", "cancel"
             else:
                 state, reason = self._save_plan(result)
+        if billing_mode(self.d) == "key":
+            self._settle(result, state, reason)
         atomic_write_text(self.jdir / "result.json", json.dumps(result, ensure_ascii=False, indent=1))
         # журнал пишем до терминального состояния в job.json: читатель, увидевший терминал, уже видит строку
         self.d.update(state=state, reason=reason, session_id=result["session_id"], result=result,
@@ -714,6 +804,23 @@ class Supervisor:
         if isinstance(prev, (int, float)) and 0 <= prev <= total:
             return round(total - prev, 6)
         return float(total)
+
+    def _settle(self, result: dict, state: str, reason: str | None) -> None:
+        """Факт звена на ключе вместо резерва в журнале трат (ТЗ WSH-4.6, п. 2.5.4): стоимость звена (phase_cost).
+        key_rejected — факт $0: при 401/403 запрос не тарифицируется (решение 5.1.3). Итога нет — резерв остаётся,
+        как у lost. Сбой записи — предупреждение, итог звена не теряется."""
+        b = self.d.get("billing") or {}
+        rec = b.get("ledger")
+        cost = 0.0 if reason == "key_rejected" else result.get("phase_cost_usd")
+        if not isinstance(rec, dict) or not isinstance(cost, (int, float)) or isinstance(cost, bool) \
+                or not math.isfinite(cost) or cost < 0:
+            return
+        try:
+            self.jobs._key_api().code_settle({**rec, "model": b.get("model") or rec.get("model")}, cost,
+                                             state in ("completed", "plan_ready"))
+            b["settled_usd"] = float(cost)
+        except Exception as e:  # noqa: BLE001 — журнал трат не должен ронять итог звена
+            self.d.setdefault("warnings", []).append(f"факт звена в журнал трат не записан: {e}"[:500])
 
     def _save_plan(self, result: dict) -> tuple[str, str | None]:
         """Копия плана в plan.md каталога задачи (≤ 200 КБ). Нет вызова Write в каталог планов — no_plan."""
@@ -789,7 +896,7 @@ class Supervisor:
                                  "git_meta_changed": oc.get("git_meta_changed"),
                                  # при billing_mismatch — как в итоге (apiKeySource, «settings: …» или None)
                                  "billing_source": res.get("billing_source", b.get("source")),
-                                 "billing_model": b.get("model"),
+                                 "billing_model": b.get("model"), "billing_mode": billing_mode(self.d),
                                  "rate_events": b.get("rate_events") or 0, "rate": _rate_brief(b.get("rate"))})
 
 

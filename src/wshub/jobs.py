@@ -83,9 +83,27 @@ class JobError(WsError):
     pass
 
 
-# режим оплаты задач wshub-code: только подписка, ключ не пускает страж WSH-4.1; режим «по ключу» — WSH-4.6
+# режим оплаты задачи wshub-code (ТЗ WSH-4.6, п. 2.1): подписка — по умолчанию; key — API-ключ anthropic хаба
 BILLING = "subscription"
+BILLINGS = ("subscription", "key")
+KEY_PROVIDER = "anthropic"
+KEY_BUDGET_USD = 10.0  # бюджет задачи на ключе, если оператор не задал max_budget_usd проекта (п. 2.5.1)
 LIMIT_IGNORED = "лимит из задачи не применён: на подписке лимиты задаёт только оператор в реестре"
+SOURCE = {"subscription": "none", "key": "apiKeyHelper"}  # ожидаемый init.apiKeySource режима (п. 2.4.1)
+
+
+def billing_mode(d: dict) -> str:
+    """Режим оплаты задачи: billing.mode в job.json (решение 5.1.1) или billing строкой (строки list и stats); у задач
+    до WSH-4.6 — подписка."""
+    b = d.get("billing")
+    mode = b.get("mode") if isinstance(b, dict) else b
+    return mode if mode in BILLINGS else BILLING
+
+
+def cost_shown(d: dict) -> bool:
+    """Показывать ли сумму в долларах (ТЗ WSH-4.6, п. 2.6.2): на ключе — да; на подписке — нет, кроме задачи,
+    остановленной не по подписке (billing_mismatch) или по отклонённому ключу (key_rejected)."""
+    return billing_mode(d) == "key" or d.get("reason") in ("billing_mismatch", "key_rejected")
 
 
 @dataclass(frozen=True)
@@ -100,11 +118,14 @@ class Limits:
 
 def effective_limits(proj: ProjectCode, billing: str) -> Limits:
     """Единственное место решения, какие лимиты действуют (WSH-4.7). На подписке — только записанное оператором
-    в реестре, остальное — «нет лимита». Лимиты по умолчанию для ключа придут с WSH-4.6."""
-    if billing != "subscription":
-        raise JobError(f"режим оплаты {billing!r} в wshub-code не поддерживается: задачи идут только по подписке "
-                       "(ключ не пускает страж WSH-4.1); лимиты по умолчанию для ключа — задача WSH-4.6")
-    return Limits(proj.max_turns, proj.max_budget_usd, proj.daily_budget_usd, proj.max_hours, proj.plan_max_turns)
+    в реестре, остальное — «нет лимита». На ключе (ТЗ WSH-4.6, п. 2.5) бюджет задачи есть всегда: max_budget_usd
+    проекта, иначе KEY_BUDGET_USD; ходы, часы и фаза плана — как на подписке."""
+    if billing not in BILLINGS:
+        raise JobError(f"режим оплаты {billing!r} в wshub-code не поддерживается: {' или '.join(BILLINGS)}")
+    budget = proj.max_budget_usd
+    if billing == "key" and budget is None:
+        budget = KEY_BUDGET_USD
+    return Limits(proj.max_turns, budget, proj.daily_budget_usd, proj.max_hours, proj.plan_max_turns)
 
 
 def new_id(now: float | None = None) -> str:
@@ -141,6 +162,7 @@ class Plan:
     grants: dict | None = None  # разрешения задачи {push, forge, reason} (ТЗ WSH-3.4, А2)
     gates: tuple = ()  # гейты задачи профиля task; звену плана правила не даются (ТЗ WSH-3.5, Г2)
     sandbox_hidden: list[str] | None = None  # отслеживаемые файлы, скрытые песочницей (ТЗ WSH-3.5, П2)
+    billing: str = BILLING  # режим оплаты; у звеньев цепочки — режим корня (ТЗ WSH-4.6, п. 2.1.1)
 
     @property
     def permission_mode(self) -> str:
@@ -194,11 +216,15 @@ def billing_settings_problem(d: Path) -> tuple[str, bool] | None:
     return None
 
 
-def check_billing_settings(d: Path) -> None:
-    """Проверка до старта (ТЗ WSH-4.1, п. 2.1): нарушение или непроверяемый файл — JobError."""
+def check_billing_settings(d: Path, billing: str = BILLING) -> None:
+    """Проверка до старта (ТЗ WSH-4.1, п. 2.1): нарушение или непроверяемый файл — JobError. Действует в обоих
+    режимах оплаты: на ключе ключ задаёт только хаб через --settings (ТЗ WSH-4.6, п. 2.4.2)."""
     problem = billing_settings_problem(d)
     if problem:
         msg, unsure = problem
+        if billing == "key":
+            raise JobError(f"{msg}, — хаб не может проверить, чем будет оплачена задача на ключе" if unsure
+                           else f"задача на ключе: {msg} — ключ задаёт только хаб (--settings задачи)")
         raise JobError(f"{msg}, — задача могла бы пойти не по подписке" if unsure
                        else f"задача пошла бы не по подписке: {msg}")
 
@@ -295,11 +321,13 @@ class Jobs:
 
     def plan(self, project: str, task: str, *, model=None, effort=None, plan=None, chosen_by=None, reason=None,
              max_turns=None, budget_usd=None, note=None, prompt_override: str | None = None,
-             inherit: dict | None = None, channel: str = "mcp", push: bool = False, forge: bool = False) -> Plan:
+             inherit: dict | None = None, channel: str = "mcp", push: bool = False, forge: bool = False,
+             billing: str | None = None) -> Plan:
         """Проверить задачу и выбрать модель/effort/план. chosen_by="operator" — аргументы model/effort/plan
         выбрал оператор (2.2.1); иначе это отступление чата. inherit — job.json родителя при resume.
         channel — откуда пришли аргументы: «cli» (флаги wshub code) или «mcp» (решение 12).
-        push/forge — разрешения задачи по регламенту проекта (ТЗ WSH-3.4, А2)."""
+        push/forge — разрешения задачи по регламенту проекта (ТЗ WSH-3.4, А2).
+        billing — режим оплаты (ТЗ WSH-4.6, п. 2.1): None — подписка или режим родителя."""
         ws, proj, glob = self._project(project)
         root = ws.path.resolve()
         dirs = self._dirs(root, proj)
@@ -336,9 +364,13 @@ class Jobs:
 
         grants, gwarn = task_grants(project, proj, profile, push, forge, reason,
                                     (inherit or {}).get("grants"))
-        lim = effective_limits(proj, BILLING)
-        max_turns, budget_usd, limit_warn = self._task_limits(lim, header, max_turns, budget_usd, inherit)
-        self._check_limits(lim, max_turns, budget_usd)
+        mode = self._billing(billing, inherit, channel, reason)
+        lim = effective_limits(proj, mode)
+        explicit = channel == "cli"  # флаги терминала — ручной выбор оператора (ТЗ WSH-4.6, п. 2.6.1)
+        asked_turns, asked_budget = max_turns, budget_usd
+        max_turns, budget_usd, limit_warn = self._task_limits(lim, header, max_turns, budget_usd, inherit, explicit)
+        self._check_limits(lim, max_turns, budget_usd, free_turns=explicit and bool(asked_turns),
+                           free_budget=explicit and asked_budget is not None and mode == BILLING)
         if inherit is None:
             missing = taskfile.missing_for_profile(header)
             if missing:
@@ -359,7 +391,7 @@ class Jobs:
                    max_turns, budget_usd, prompt, warnings + gwarn + limit_warn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
                    budget_total=budget_usd, max_turns_total=max_turns, grants=grants, gates=gates,
-                   sandbox_hidden=hidden)
+                   sandbox_hidden=hidden, billing=mode)
         if choice.plan != "no":
             # шаблон исполнения проверяем на старте, а не после оплаченной фазы плана (2.6.3)
             self._render(root, proj, proj.execute_prompt, header["ticket"], task_rel,
@@ -375,19 +407,43 @@ class Jobs:
             out.max_turns = _least(lim.plan_max_turns, max_turns)
         return out
 
-    def _task_limits(self, lim: Limits, header: dict, max_turns, budget_usd, inherit: dict | None):
+    def _billing(self, billing: str | None, inherit: dict | None, channel: str, reason) -> str:
+        """Режим оплаты звена (ТЗ WSH-4.6, п. 2.1): у продолжения — режим родителя, сменить его нельзя; key из чата —
+        только с reason (≥ 15 символов), из терминала — выбор оператора. Разрешение проекта и ключ проверяет start."""
+        if billing is not None and billing not in BILLINGS:
+            raise JobError(f"billing: {' или '.join(BILLINGS)}")
+        if inherit is not None:
+            mode = billing_mode(inherit)
+            if billing is not None and billing != mode:
+                raise JobError(f"сменить режим оплаты внутри цепочки нельзя: задача {inherit.get('id')} идёт в режиме "
+                               f"{mode}, а запрошен {billing}")
+            return mode
+        mode = billing or BILLING
+        if mode == "key" and channel == "mcp" and len(code_policy.clean_reason(reason)) < code_policy.REASON_MIN:
+            raise JobError(f"задача на ключе из чата — только с reason (≥ {code_policy.REASON_MIN} символов): кто "
+                           "разрешил тратить ключ и когда, например «оператор в чате 20.10: разведка на ключе»")
+        return mode
+
+    def _task_limits(self, lim: Limits, header: dict, max_turns, budget_usd, inherit: dict | None,
+                     explicit: bool = False):
         """(ходы, бюджет, предупреждения) задачи. Потолок не задан — лимит из задачи не применяется, а переданный
         в этом вызове или в шапке даёт одну строку LIMIT_IGNORED; унаследованный от родителя (resume) молча
-        отбрасывается. Потолок задан — прежний порядок: аргумент, родитель, шапка, потолок (WSH-4.7, п. 2.3.2)."""
+        отбрасывается. Потолок задан — прежний порядок: аргумент, родитель, шапка, потолок (WSH-4.7, п. 2.3.2).
+        explicit — аргументы пришли флагами терминала: это ручной выбор оператора, он применяется и без потолка
+        (ТЗ WSH-4.6, п. 2.6.1); потолки проверяет _check_limits."""
         parent = inherit or {}
         asked_budget = budget_usd if budget_usd is not None else header.get("budget_usd")
         ignored = False
         turns = budget = None
-        if lim.max_turns is None:
+        if explicit and max_turns:
+            turns = int(max_turns)
+        elif lim.max_turns is None:
             ignored = bool(max_turns or header.get("max_turns"))
         else:
             turns = int(max_turns or parent.get("max_turns") or header.get("max_turns") or lim.max_turns)
-        if lim.max_budget_usd is None:
+        if explicit and budget_usd is not None:
+            budget = float(budget_usd)
+        elif lim.max_budget_usd is None:
             ignored = ignored or asked_budget is not None
         else:
             budget = float(budget_usd if budget_usd is not None else
@@ -473,16 +529,18 @@ class Jobs:
         return code_policy.Choice(vals["model"], vals["effort"], "no", None, None, source, base.get("row"), why,
                                   fields, chan, cf or None)
 
-    def _check_limits(self, lim: Limits, max_turns: int | None, budget_usd: float | None):
+    def _check_limits(self, lim: Limits, max_turns: int | None, budget_usd: float | None,
+                      free_turns: bool = False, free_budget: bool = False):
         """Бюджеты и ходы — в силе для любого источника выбора (2.2.1); модель и effort проверяет политика.
-        Незаданный лимит (None) не проверяется."""
+        Незаданный лимит (None) не проверяется. free_* — флаг терминала: без потолка реестра (ТЗ WSH-4.6, п. 2.6.1);
+        бюджет на ключе свободным не бывает — потолок ключа действует всегда."""
         if max_turns is not None:
-            if max_turns > lim.max_turns:
+            if not free_turns and lim.max_turns is not None and max_turns > lim.max_turns:
                 raise JobError(f"max_turns {max_turns} выше потолка {lim.max_turns}")
             if max_turns < 1:
                 raise JobError("max_turns должен быть ≥ 1")
         if budget_usd is not None:
-            if budget_usd > lim.max_budget_usd:
+            if not free_budget and lim.max_budget_usd is not None and budget_usd > lim.max_budget_usd:
                 raise JobError(f"budget_usd {budget_usd:g} выше потолка {lim.max_budget_usd:g}")
             if budget_usd <= 0:
                 raise JobError("budget_usd должен быть > 0")
@@ -544,7 +602,9 @@ class Jobs:
               chain_root: str | None = None, link: tuple[str, str] | None = None, now: float | None = None) -> dict:
         """Записать и запустить звено. link = (id фазы плана, причина) — переход из plan_ready: под тем же flock
         проверяем, что план всё ещё plan_ready и не утверждён, и отмечаем его (code_approve/replan/auto)."""
-        check_billing_settings(plan.dir)  # до каталога задачи: отказ не оставляет файлов (ТЗ WSH-4.1, п. 2.1)
+        if plan.billing == "key":
+            self._check_key(plan)  # до каталога задачи: отказ не оставляет файлов
+        check_billing_settings(plan.dir, plan.billing)  # до каталога задачи: отказ не оставляет файлов (WSH-4.1)
         glob = self.hub.registry.get().code.glob
         read_extra = self._read_extra(plan.root, plan.proj)  # до каталога задачи: отказ не оставляет файлов
         # claude и его флаги (вызовы подпроцесса) — до flock: не трогают общее состояние, не держат лок
@@ -565,7 +625,7 @@ class Jobs:
             except HelperError as e:
                 raise JobError(f"API хостинга: {e}") from None
         git_start = start_snapshot(plan.dir, dict(os.environ))  # тоже подпроцесс — до flock
-        lim = effective_limits(plan.proj, BILLING)
+        lim = effective_limits(plan.proj, plan.billing)
         with self._flock():
             if link is not None:
                 ld = self.read(link[0])
@@ -603,6 +663,7 @@ class Jobs:
                 "sandbox_hidden": (plan.sandbox_hidden or [])[:HIDDEN_JOB_MAX],
                 # режим notify — на момент старта корня; звенья и resume берут его у корня (ТЗ WSH-3.4, В3.1)
                 "notify": self._root_notify(chain_root) or glob.notify,
+                "billing": {"mode": plan.billing},  # режим оплаты; init и rate допишет надзиратель (ТЗ WSH-4.6)
             }
             sid = resume or str(_uuid4())
             data["session_id"] = sid if not resume else resume
@@ -610,10 +671,12 @@ class Jobs:
             data["flags"] = flags
             protected = [p for p in (self.hub.protected_data + self.hub.protected_code)]
             hook_cmd = [sys.executable, "-m", "wshub.hook"]  # лёгкий запуск хука (замечание 9)
+            # ключ — командой хаба, а не значением (ТЗ WSH-4.6, п. 2.3): claude запросит его сам
+            key_helper = shlex.join([*claude_cli.wshub_cmd(), "code", "key-helper"]) if plan.billing == "key" else None
             settings = claude_cli.settings(plan.profile, plan.task_rel, glob, plan.proj, protected,
                                            self.hub.protected_data, hook_cmd, Path.home(), plan.dir,
                                            phase="plan" if plan.phase == "plan" else None, read_extra=read_extra,
-                                           grants=grants, gates=gates)
+                                           grants=grants, gates=gates, key_helper=key_helper)
             claude_cli.write_job_files(jdir, settings, plan.prompt)
             # помощнику — задача и хаб (не секреты); агент ssh — только в каталог задачи, Code туда не видит (А3)
             env = {**env, "WSHUB_JOB": jid, "WSHUB_CONFIG": str(self.hub.registry.path),
@@ -627,16 +690,23 @@ class Jobs:
             atomic_write_text(jdir / "argv.json", json.dumps(argv, ensure_ascii=False))
             atomic_write_text(jdir / "env.json", json.dumps(env, ensure_ascii=False))
             atomic_write_text(jdir / GIT_START, json.dumps(git_start, ensure_ascii=False, indent=1))
+            rec = self._key_reserve(plan, jid, jdir, data["billing"]) if plan.billing == "key" else None
             try:
                 write_exclude(plan.dir)
             except OSError as e:
                 data["warnings"] = [*data["warnings"], f".git/info/exclude не записан: {e}"]
-            self.write(jid, data)
+            try:
+                self.write(jid, data)
 
-            sup = self._spawn_supervisor(jid)
-            data["sup_pid"] = sup
-            data["sup_start"] = proc_start(sup)
-            self.write(jid, data)
+                sup = self._spawn_supervisor(jid)
+                data["sup_pid"] = sup
+                data["sup_start"] = proc_start(sup)
+                self.write(jid, data)
+            except BaseException:
+                if rec is not None and not data.get("sup_pid"):  # надзиратель не запущен — резерв снимается фактом 0
+                    with contextlib.suppress(Exception):
+                        self._key_api().code_settle(rec, 0.0, False)
+                raise
             if link is not None:
                 ld = self.read(link[0])
                 ld.update(state="completed", reason=link[1], next=jid)
@@ -649,8 +719,35 @@ class Jobs:
             "choice_fields": c.choice_fields or {} if c else None,
             "policy_row": c.row if c else None,
             "reason": c.reason if c else None, "parent": parent,
-            "grants": {k: v for k, v in grants.items() if v}})
+            "grants": {k: v for k, v in grants.items() if v}, "billing": plan.billing})
         return data
+
+    def _key_api(self):
+        from .llm.core import Api
+        return Api(self.hub.registry.get(), self.hub.registry.path.parent, self.hub.state_dir)
+
+    def _check_key(self, plan: Plan) -> None:
+        """Задача на ключе (ТЗ WSH-4.6, п. 2.1.3–2.1.4): проект разрешает key, ключ anthropic есть и с верными правами.
+        Значение ключа читается только для проверки и сразу отбрасывается; в отказ идёт текст keys без ключа."""
+        from .llm import keys
+        if not plan.proj.key:
+            raise JobError(f"проект не разрешает задачи на ключе: key = true в [workspace.{plan.project}.code]")
+        try:
+            keys.read(keys.key_path(self.hub.registry.path.parent, KEY_PROVIDER))
+        except keys.KeyProblem as e:
+            raise JobError(f"задача на ключе: {e}") from None
+
+    def _key_reserve(self, plan: Plan, jid: str, jdir: Path, billing: dict) -> dict:
+        """Потолок дня и зона — под блокировкой журнала трат, резерв звена — строкой с job (ТЗ WSH-4.6, п. 2.5.2–
+        2.5.4). Отказ — JobError с текстом 4.2, каталог звена удаляется: отказ не оставляет файлов."""
+        from .llm.core import ApiError
+        try:
+            rec = self._key_api().code_reserve(KEY_PROVIDER, plan.project, plan.model, plan.budget_usd, jid)
+        except (ApiError, OSError) as e:
+            shutil.rmtree(jdir, ignore_errors=True)
+            raise JobError(f"задача на ключе: {e}") from None
+        billing.update(provider=KEY_PROVIDER, zone=rec["zone"], reserve_usd=rec["cost_usd"], ledger=rec)
+        return rec
 
     def _root_notify(self, root: str | None) -> str | None:
         if not root:
@@ -778,7 +875,8 @@ class Jobs:
             if not d or (project and d.get("project") != project):
                 continue
             rows.append({"id": d.get("id"), "project": d.get("project"), "task": d.get("task"),
-                         "state": self.effective_state(d), "cost_usd": phase_cost(d), "phase": d.get("phase")})
+                         "state": self.effective_state(d), "cost_usd": phase_cost(d), "phase": d.get("phase"),
+                         "billing": billing_mode(d), "reason": d.get("reason")})  # показ суммы — cost_shown
             if len(rows) >= limit:
                 break
         return rows
@@ -858,7 +956,8 @@ class Jobs:
     # ---------- resume ----------
 
     def resume(self, jid: str, prompt: str, *, note=None, model=None, effort=None, max_turns=None,
-               budget_usd=None, chosen_by=None, reason=None, push: bool = False, forge: bool = False) -> dict:
+               budget_usd=None, chosen_by=None, reason=None, push: bool = False, forge: bool = False,
+               billing: str | None = None) -> dict:
         d = self.read(jid)
         if d.get("phase") == "plan":
             # resume поднял бы dontAsk с правами профиля без утверждения плана
@@ -875,7 +974,7 @@ class Jobs:
         # prompt — имя шаблона (не литеральный текст из чата, замечание 6); рендер тем же taskfile.render
         plan = self.plan(d["project"], d["task"], model=model, effort=effort, chosen_by=chosen_by, reason=reason,
                          max_turns=max_turns, budget_usd=budget_usd,  # только переданное: родительское — inherit
-                         note=note, prompt_override=prompt, inherit=d, push=push, forge=forge)
+                         note=note, prompt_override=prompt, inherit=d, push=push, forge=forge, billing=billing)
         # тот же dir и профиль, что у родителя (п. 2.5.6): задача-потомок могла править свою шапку
         if str(plan.dir) != d.get("dir") or plan.profile != d.get("profile"):
             raise JobError(f"шапка ТЗ изменилась с момента родителя (dir/profile): было "
@@ -948,7 +1047,8 @@ class Jobs:
             raise JobError(f"dir задачи {dir_abs} больше не в code.dirs проекта {d['project']}")
         if d["profile"] not in proj.profiles:
             raise JobError(f"профиль {d['profile']} больше не разрешён проекту (profiles = {', '.join(proj.profiles)})")
-        lim = effective_limits(proj, BILLING)
+        mode = billing_mode(d)  # звено цепочки — в режиме оплаты фазы плана, сменить нельзя (ТЗ WSH-4.6, п. 2.1.1)
+        lim = effective_limits(proj, mode)
         budget, turns = self._remaining(d)
         choice = code_policy.Choice(**d["choice"])
         template = template or proj.execute_prompt
@@ -975,7 +1075,7 @@ class Jobs:
                     plan_mode=d.get("plan_mode") or "no",
                     budget_total=float(d["budget_total"]) if d.get("budget_total") else None,
                     max_turns_total=int(d["max_turns_total"]) if d.get("max_turns_total") else None,
-                    grants=grants, gates=gates, sandbox_hidden=hidden)
+                    grants=grants, gates=gates, sandbox_hidden=hidden, billing=mode)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
         """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk, модель исполнения,
@@ -1100,7 +1200,9 @@ class Jobs:
             if (first.get("created_ts") or 0) < since:
                 continue
             c = first.get("choice") or {}
-            key = (first.get("project"), c.get("row") or "—", c.get("source") or "—", c.get("channel") or "—")
+            # режим оплаты — тоже в ключе группы: средняя сумма показывается только у задач на ключе (ТЗ WSH-4.6)
+            key = (first.get("project"), c.get("row") or "—", c.get("source") or "—", c.get("channel") or "—",
+                   billing_mode(first))
             a = agg.setdefault(key, {"tasks": 0, "cost": 0.0, "turns": 0, "completed": 0, "plans": 0,
                                      "replanned": 0})
             a["tasks"] += 1
@@ -1110,7 +1212,7 @@ class Jobs:
             plans = [x for x in links if x.get("phase") == "plan"]
             a["plans"] += len(plans)
             a["replanned"] += sum(x.get("reason") == "replanned" for x in plans)
-        return [{"project": k[0], "row": k[1], "source": k[2], "channel": k[3], "tasks": a["tasks"],
+        return [{"project": k[0], "row": k[1], "source": k[2], "channel": k[3], "billing": k[4], "tasks": a["tasks"],
                  "avg_cost_usd": round(a["cost"] / a["tasks"], 4), "avg_turns": round(a["turns"] / a["tasks"], 1),
                  "completed_share": round(a["completed"] / a["tasks"], 3),
                  "replan_share": round(a["replanned"] / a["plans"], 3) if a["plans"] else None}

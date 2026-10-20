@@ -239,7 +239,9 @@ function render(d) {
 
   $("turns").textContent = d.turns;
   $("actions").textContent = d.actions_count;
-  $("pay").textContent = d.billing || "—";  // сумма в долларах на подписке не показывается (WSH-4.7)
+  // сумма в долларах на подписке не показывается (WSH-4.7); cost_usd приходит только на ключе (ТЗ WSH-4.6)
+  $("pay").textContent = (d.billing || "—") + (d.cost_usd !== null && d.cost_usd !== undefined
+    ? " · ≈$" + Number(d.cost_usd).toFixed(2) : "");
   $("rate").textContent = d.rate ? Object.entries(d.rate).map(([k, v]) => (k === "five_hour" ? "5 ч" : k === "seven_day" ? "7 дн" : k) + " " + Math.round(v * 100) + "%").join(", ") : "—";
 
   $("cancel").disabled = FINAL.includes(d.state);  // конечное состояние — кнопка неактивна, а не скрыта

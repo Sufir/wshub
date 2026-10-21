@@ -365,7 +365,9 @@ def _glob_files(hub: Hub, s: Session, pattern: str) -> list[str]:
     for base, _dirs, files in hub._walk(s, s.root, Skipped(s)):
         for f in files:
             rel = hub._rel(s, base / f)
-            if glob_match(pattern, rel) and not s.policy.denied(rel):
+            # симлинк и не обычный файл (FIFO, сокет) пропускаются, а не валят весь пакет (ревью, п. 12)
+            if glob_match(pattern, rel) and not s.policy.denied(rel) and _is_file(base / f) \
+                    and not (base / f).is_symlink():
                 hits.append(rel)
                 check_batch_size(len(hits))
     if not hits:
@@ -378,17 +380,20 @@ def _out_dir_check(hub: Hub, reg: Registry, project: str, out_dir: str, names: l
     from ..api_server import _out_target
     for n in names:
         try:
-            _out_target(hub, reg, project, f"{out_dir.rstrip('/')}/{n}")
+            target, _rel = _out_target(hub, reg, project, f"{out_dir.rstrip('/')}/{n}")
         except WsError as e:
             raise WsError("out_dir: " + str(e).removeprefix("out_file: ")) from None
+        if os.path.lexists(target.parent) and not target.parent.is_dir():  # ревью, п. 9
+            raise WsError(f"out_dir: {out_dir} — не каталог")
 
 
 def batch_prepare(api: Api, hub: Hub, reg: Registry, project: str, provider: str, files: list[str] | None,
                   glob: str, texts: list[str] | None, system: str, schema: dict | None, tier: str | None,
                   model: str | None, effort: str | None, max_tokens: int, cache: str, choice: str | None,
-                  out_dir: str) -> tuple[list[Plan], list[str], dict]:
+                  out_dir: str, check=None) -> tuple[list[Plan], list[str], dict]:
     """Общий путь CLI batch submit и api_batch_submit: входы (файлы по политике проекта, маска или тексты), имена
-    custom_id и файлов ответа (Р4, Р5), out_dir — до чтения входов, проверки ядра для каждого запроса."""
+    custom_id и файлов ответа (Р4, Р5), out_dir — до чтения входов, проверки ядра для каждого запроса; check — по
+    первому плану (reason сервера)."""
     api.batch_provider(provider)
     if sum(bool(x) for x in (files, glob, texts)) != 1:
         raise ApiError("вход пакета — ровно одно из: список файлов, маска файлов или (из чата) список текстов")
@@ -408,7 +413,7 @@ def batch_prepare(api: Api, hub: Hub, reg: Registry, project: str, provider: str
     bodies = texts or [_read(hub, s, p) for p in paths]
     reqs = [Request(system, ({"role": "user", "text": t},), project, tier=tier or None, model=model or None,
                     schema=schema, effort=effort or None, max_tokens=max_tokens, cache=cache) for t in bodies]
-    plans = api.batch_plan(reqs, provider, choice or None)
+    plans = api.batch_plan(reqs, provider, choice or None, check)
     inputs = {cid: {"input": b, "file": f} for cid, b, f in zip(ids, briefs, fnames, strict=True)}
     return plans, ids, {"project": project, "out_dir": out_dir or None, "inputs": inputs}
 
@@ -443,10 +448,10 @@ def batch_result_lines(rec: dict, items: list[dict]) -> list[str]:
     """Сводка results: сколько успешно, с ошибкой, цена со скидкой, строки журнала; ошибки — по custom_id."""
     ok = sum(1 for i in items if i["ok"])
     new = sum(1 for i in items if i["logged"])
+    own = sum(1 for i in items if not i.get("foreign"))
     out = [f"пакет {rec['id']}: успешно {ok}, с ошибкой {len(items) - ok} · "
            f"{usd(sum(i['cost_usd'] for i in items))} со скидкой 50 %",
-           f"журнал трат: записано строк {new}" + (f", уже были {len(items) - new} — не дублируются"
-                                                   if new < len(items) else "")]
+           f"журнал трат: записано строк {new}" + (f", уже были {own - new} — не дублируются" if new < own else "")]
     for i in items:
         if not i["ok"]:
             src = (rec["inputs"].get(i["custom_id"]) or {}).get("input", "")

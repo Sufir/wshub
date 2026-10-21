@@ -13,7 +13,7 @@ from test_api_server import Srv
 
 from wshub.core import BLOCKED
 from wshub.llm import batches, cli, keys
-from wshub.llm.core import ApiError
+from wshub.llm.core import Api, ApiError
 from wshub.llm.providers import fake
 
 SUBMIT = ("batch", "submit", "--provider", "fake", "--project", "payload", "--tier", "cheap")
@@ -155,16 +155,19 @@ def test_anthropic_cli_end_to_end(aapi):
     assert rows["one"]["cost_usd"] == pytest.approx((31 * 0.10 + 2267 * 0.20 + 18 * 0.50) / 1e6 * 0.5)
     assert (rows["one"]["model"], rows["one"]["ok"], rows["one"]["template"]) == (HAIKU, True, None)
     assert (rows["two"]["cost_usd"], rows["two"]["ok"]) == (0.0, False)
-    # денежная проверка включена — точная оценка: count_tokens на каждый запрос (решение Р2)
-    set_api(aapi.env, "[api]\nenabled = true\ndaily_usd = 10.0\n\n" + aapi.section)
-    n = len(srv.seen)
-    srv.reply(body={"input_tokens": 10})
-    srv.reply(body={"input_tokens": 12})
-    srv.reply(body=created("msgbatch_02Def"))
-    rc, out, err = aapi.cli(*sub)
-    assert rc == 0, err
-    assert [p for p, _h, _b in srv.seen[n:]] == ["/v1/messages/count_tokens"] * 2 + ["/v1/messages/batches"]
-    assert "(вход грубо)" not in out
+    # денежная проверка включена (любая из трёх) — точная оценка: count_tokens на каждый запрос (решение Р2)
+    for i, (api_keys, prov_keys) in enumerate((("daily_usd = 10.0\n", ""), ("max_usd_per_call = 1.0\n", ""),
+                                               ("", 'included_usd = 5\ncredits_until = "2026-10-31"\n'))):
+        set_api(aapi.env, "[api]\nenabled = true\n" + api_keys + "\n" + aapi.section + prov_keys)
+        bid = ("msgbatch_02Def", "msgbatch_03Ghi", "msgbatch_04Jkl")[i]
+        n = len(srv.seen)
+        srv.reply(body={"input_tokens": 10})
+        srv.reply(body={"input_tokens": 12})
+        srv.reply(body=created(bid))
+        rc, out, err = aapi.cli(*sub)
+        assert rc == 0, (api_keys, prov_keys, err)
+        assert [p for p, _h, _b in srv.seen[n:]] == ["/v1/messages/count_tokens"] * 2 + ["/v1/messages/batches"]
+        assert "(вход грубо)" not in out
     srv.reply(body=created("msgbatch_02Def", status="canceling"))
     rc, out, _ = aapi.cli("batch", "cancel", "msgbatch_02Def")
     assert rc == 0 and "отмена запрошена: msgbatch_02Def · canceling" in out
@@ -233,6 +236,10 @@ def test_batch_results_repeat_no_duplicate(api, monkeypatch):
     assert (api.env.proj / "out" / "one.md").read_text(encoding="utf-8") == "правка оператора"
     saved = api.env.state / "api" / "out" / "fakebatch_1" / "one.md"
     assert saved.read_text(encoding="utf-8") == "текст один" and len(batch_rows(api, "fakebatch_1")) == 2
+    # другой пакет с теми же custom_id — свои строки: фильтр дублей — по паре (пакет, custom_id) (ревью, п. 2)
+    assert api.cli(*SUBMIT, "--inputs", "in/one.txt", "in/two.txt")[0] == 0
+    rc, out, _ = api.cli("batch", "results", "fakebatch_2")
+    assert rc == 0 and "журнал трат: записано строк 2" in out and len(batch_rows(api, "fakebatch_2")) == 2
 
 
 def test_cli_out_dir_refusals(api, monkeypatch):
@@ -243,7 +250,8 @@ def test_cli_out_dir_refusals(api, monkeypatch):
     for project, out_dir, err in (("rt", "new", "out_dir: проект rt в реестре только для чтения (ro)"),
                                   ("payload", "out", "out_dir: файл out/q.md уже есть"),
                                   ("payload", "../outside", "out_dir: путь вне проекта"),
-                                  ("payload", ".git", "запись внутрь .git")):
+                                  ("payload", ".git", "запись внутрь .git"),
+                                  ("payload", "q.txt", "out_dir: q.txt — не каталог")):  # ревью, п. 9
         rc, _, e = api.cli("batch", "submit", "--provider", "fake", "--project", project, "--tier", "cheap",
                            "--inputs", "q.txt", "--out-dir", out_dir)
         assert rc == 1 and err in e, (out_dir, e)
@@ -328,6 +336,7 @@ def test_glob_inputs_skip_deny(api, monkeypatch):
     prov = use(monkeypatch, fake.FakeProvider())
     (api.env.proj / "secrets").mkdir()
     (api.env.proj / "secrets" / "k.txt").write_text("секрет", encoding="utf-8")
+    (api.env.proj / "link.txt").symlink_to(api.env.outside / "secret.txt")  # симлинк пропускается (ревью, п. 12)
     rc, out, err = api.cli(*SUBMIT, "--inputs-glob", "*.txt")
     assert rc == 0, err
     rec = batches.load(api.env.state, "fakebatch_1")
@@ -348,6 +357,11 @@ def test_bad_batch_id_refused(api, monkeypatch):
     assert "неверный id пакета" in Srv(api).call("api_batch_results", id="../../etc/passwd")
     rc, _, err = api.cli("batch", "results", "fakebatch_9")
     assert rc == 1 and "пакета fakebatch_9 нет в учёте хаба" in err
+    bdir = batches.batches_dir(api.env.state)
+    bdir.mkdir(parents=True)
+    (bdir / "fakebatch_7.json").write_text('{"id": "fakebatch_7", "inputs": {"a": "строка"}}', encoding="utf-8")
+    rc, _, err = api.cli("batch", "results", "fakebatch_7")  # отказ, а не трассировка (ревью, п. 15)
+    assert rc == 1 and "учёт пакета" in err and "повреждён" in err
 
 
 def test_results_before_ended_refused(api, monkeypatch):
@@ -367,9 +381,12 @@ def test_strong_needs_choice_and_reason(api, monkeypatch):
     rc, _, err = api.cli("batch", "submit", "--provider", "fake", "--project", "payload", "--tier", "strong",
                          "--inputs", "q.txt")
     assert rc == 1 and "только явным выбором оператора" in err
-    out = s.call("api_batch_submit", project="payload", inputs=["x"], tier="strong", choice="operator")
+    planned = []
+    orig = Api.plan
+    monkeypatch.setattr(Api, "plan", lambda self, *a, **k: planned.append(1) or orig(self, *a, **k))
+    out = s.call("api_batch_submit", project="payload", inputs=["x", "y", "z"], tier="strong", choice="operator")
     assert out.startswith("отказ: ") and "только с reason" in out
-    assert prov.batches == {}
+    assert prov.batches == {} and len(planned) == 1  # reason — по первому плану, до оценки остальных (ревью, п. 10)
     rc, out, err = api.cli("batch", "submit", "--provider", "fake", "--project", "payload", "--tier", "strong",
                            "--inputs", "q.txt", "--choice", "operator")
     assert rc == 0 and "fake-strong" in out, err
@@ -470,3 +487,93 @@ def test_schema_answers_json_and_broken_paid(api, monkeypatch):
     assert not (api.env.state / "api" / "out" / "fakebatch_2").exists()
     [row] = batch_rows(api, "fakebatch_2")
     assert row["ok"] is False and row["cost_usd"] > 0
+
+
+# ---------- по ревью субагента ----------
+
+def test_anthropic_results_foreign_id_and_paid_without_usage(aapi):
+    """Ревью, п. 1, 3, 4: custom_id не из учёта и повтор — ни файла (имя шло бы в путь), ни строки журнала; оплаченный
+    ответ с неразобранным usage и без usage — по оценке запроса из учёта, а не $0; файлов нет."""
+    srv = aapi.srv
+    srv.reply(body=created())
+    assert aapi.cli("batch", "submit", "--provider", "anthropic", "--project", "payload", "--tier", "cheap",
+                    "--inputs", "in/one.txt", "in/two.txt")[0] == 0
+    rec = batches.load(aapi.env.state, "msgbatch_01Abc")
+    no_usage = {k: v for k, v in msg("без usage").items() if k != "usage"}
+    lines = [{"custom_id": "one", "result": {"type": "succeeded",
+                                             "message": msg("плохой usage", usage={"input_tokens": "x"})}},
+             {"custom_id": "two", "result": {"type": "succeeded", "message": no_usage}},
+             {"custom_id": "../../evil", "result": {"type": "succeeded", "message": msg("чужой")}},
+             {"custom_id": "one", "result": {"type": "succeeded", "message": msg("повтор")}}]
+    srv.reply(body=created(status="ended", succeeded=2))
+    srv.reply(body=b"\n".join(json.dumps(x, ensure_ascii=False).encode() for x in lines))
+    rc, out, err = aapi.cli("batch", "results", "msgbatch_01Abc")
+    assert rc == 0, err
+    assert "успешно 0, с ошибкой 4" in out and "журнал трат: записано строк 2" in out
+    assert "✗ ../../evil: custom_id не из этого пакета или повтор — пропущен" in out
+    assert "✗ one (in/one.txt): usage ответа не разобран" in out and "✗ two (in/two.txt): в ответе нет usage" in out
+    rows = {r["custom_id"]: r for r in batch_rows(aapi, "msgbatch_01Abc")}
+    assert sorted(rows) == ["one", "two"]
+    for cid in ("one", "two"):
+        assert rows[cid]["ok"] is False and rows[cid]["cost_usd"] == pytest.approx(rec["inputs"][cid]["estimate_usd"])
+        assert rows[cid]["cost_usd"] > 0
+    assert not (aapi.env.state / "api" / "out").exists()
+    assert [p for p in aapi.env.tmp.rglob("evil*")] == []
+
+
+def test_zones_on_batch_sum_and_row_zone(api, monkeypatch):
+    """Ревью, п. 5: зоны — на сумму пакета; зона строки результата — определённая при отправке."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    # 3 запроса по ≈$0.00256: включённой зоны $0.006 хватает на каждый, но не на сумму
+    set_api(api.env, '[api]\nenabled = true\n\n[api.providers.fake]\nincluded_usd = 0.006\n'
+                     'credits_until = "2026-10-31"\n')
+    rc, _, err = api.cli(*SUBMIT, "--inputs", "in/one.txt", "in/two.txt", "in/three.txt")
+    assert rc == 1 and "пакет: включённые кредиты исчерпаны" in err and prov.batches == {}
+    assert api.cli("allow", "fake", "--usd", "1", "--until", "31.10")[0] == 0
+    rc, out, err = api.cli(*SUBMIT, "--inputs", "in/one.txt", "in/two.txt", "in/three.txt")
+    assert rc == 0, err
+    assert batches.load(api.env.state, "fakebatch_1")["zone"] == "purchased"
+    assert api.cli("batch", "results", "fakebatch_1")[0] == 0
+    assert [r["zone"] for r in batch_rows(api, "fakebatch_1")] == ["purchased"] * 3
+
+
+def test_results_recheck_out_dir_before_write(api, monkeypatch):
+    """Ревью, п. 7: перед записью out_dir проверяется заново — проект стал ro, каталог подменён симлинком наружу:
+    в проект и наружу не пишется, ответ — в каталог состояния."""
+    use(monkeypatch, fake.FakeProvider())
+    proj, outside = api.env.proj, api.env.outside
+    assert api.cli(*SUBMIT, "--inputs", "in/one.txt", "--out-dir", "out")[0] == 0
+    assert api.cli(*SUBMIT, "--inputs", "in/two.txt", "--out-dir", "out2")[0] == 0
+    api.env.workspaces["payload"]["mode"] = "ro"
+    set_api(api.env)
+    rc, out, _ = api.cli("batch", "results", "fakebatch_1")
+    assert rc == 0 and "one → out/one.md не записан: проект payload в реестре только для чтения (ro)" in out
+    assert not (proj / "out").exists()
+    assert (api.env.state / "api" / "out" / "fakebatch_1" / "one.md").read_text(encoding="utf-8") == "текст один"
+    api.env.workspaces["payload"]["mode"] = "rw"
+    set_api(api.env)
+    (proj / "out2").symlink_to(outside, target_is_directory=True)
+    rc, out, _ = api.cli("batch", "results", "fakebatch_2")
+    assert rc == 0 and "two → out2/two.md не записан: путь вне проекта" in out
+    assert sorted(p.name for p in outside.iterdir()) == ["secret.txt"]
+    assert (api.env.state / "api" / "out" / "fakebatch_2" / "two.md").exists()
+
+
+def test_server_blocked_before_write(api, monkeypatch):
+    """Ревью, п. 8: проект заблокирован из панели после выборки результатов — в out_dir не пишется, ответ — в каталог
+    состояния, текст ответа — не в чат."""
+    use(monkeypatch, fake.FakeProvider(reply="ОПЛАЧЕННЫЙ-ОТВЕТ"))
+    s = Srv(api)
+    assert s.call("api_batch_submit", project="payload", input_files=["q.txt"], tier="cheap", out_dir="out") \
+        .startswith("пакет fakebatch_1 отправлен")
+    orig = Api.batch_results
+
+    def then_block(self, batch_id):
+        res = orig(self, batch_id)
+        api.env.hub.runtime.block("payload")
+        return res
+    monkeypatch.setattr(Api, "batch_results", then_block)
+    out = s.call("api_batch_results", id="fakebatch_1")
+    assert "q → out/q.md не записан: проект заблокирован пользователем" in out
+    assert "ОПЛАЧЕННЫЙ-ОТВЕТ" not in out and not (api.env.proj / "out").exists()
+    assert (api.env.state / "api" / "out" / "fakebatch_1" / "q.md").read_text(encoding="utf-8") == "ОПЛАЧЕННЫЙ-ОТВЕТ"

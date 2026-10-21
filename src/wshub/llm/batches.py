@@ -42,7 +42,10 @@ def load(state_dir: Path, batch_id: str) -> dict:
         raise BatchError(f"пакета {batch_id} нет в учёте хаба ({p.parent})") from None
     except ValueError:
         rec = None
-    if not isinstance(rec, dict) or rec.get("id") != batch_id or not isinstance(rec.get("inputs"), dict):
+    # повреждённый вручную учёт — отказ, а не трассировка ниже (ревью, п. 15)
+    if not isinstance(rec, dict) or rec.get("id") != batch_id or not isinstance(rec.get("inputs"), dict) \
+            or not all(isinstance(rec.get(k), str) for k in ("provider", "project", "model")) \
+            or not all(isinstance(v, dict) for v in rec["inputs"].values()):
         raise BatchError(f"учёт пакета {p} повреждён")
     return rec
 

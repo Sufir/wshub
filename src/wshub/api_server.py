@@ -353,8 +353,7 @@ def build_api_server(hub: Hub, now=now_local) -> FastMCP:
             sys_text, schema = system_schema(s, system, system_file, schema, schema_file)
             plans, ids, meta = batch_prepare(api, hub, reg, project, provider, input_files, inputs_glob, inputs,
                                              sys_text, schema, tier, model, effort, max_tokens, cache, choice,
-                                             out_dir)
-            need_reason(plans[0], reason)
+                                             out_dir, check=lambda p: need_reason(p, reason))
             rec = api.submit(plans, ids, meta)
         except USER_ERR as e:
             audit("api_batch_submit", project, error=_audit_text(e))
@@ -392,7 +391,12 @@ def build_api_server(hub: Hub, now=now_local) -> FastMCP:
             audit("api_batch_results", project, {"batch": id}, error=_audit_text(e))
             return f"отказ: {e}"
         bodies = [(i["custom_id"], answer_body(i["response"])) for i in items if i["ok"]]
-        if 0 < len(bodies) <= BATCH_TEXTS and all(len(b.encode("utf-8")) <= HEAD_MAX for _c, b in bodies):
+        try:  # проект заблокировали за время выборки — тексты ответов в чат не идут (как out_file в 4.4)
+            _blocked(hub, project)
+            small = 0 < len(bodies) <= BATCH_TEXTS and all(len(b.encode("utf-8")) <= HEAD_MAX for _c, b in bodies)
+        except WsError:
+            small = False
+        if small:
             for cid, b in bodies:
                 out += [f"--- {cid} ---", b]
         audit("api_batch_results", project, {"provider": rec["provider"], "model": rec["model"], "batch": id,

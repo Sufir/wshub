@@ -359,15 +359,25 @@ class Api:
         return (api.max_usd_per_call is not None or api.daily_usd is not None
                 or ledger.zones_set(self.read_ledger(), name, conf))
 
-    def batch_plan(self, requests: list[Request], name: str, choice: str | None = None) -> list[Plan]:
+    def batch_plan(self, requests: list[Request], name: str, choice: str | None = None, check=None) -> list[Plan]:
         """Каждый запрос пакета — те же проверки, что у run (выбор модели, choice для strong, потолок одного запроса —
-        по оценке со скидкой). count_tokens — только при денежной проверке (решение Р2), иначе вход грубо, без сети."""
+        по оценке со скидкой). count_tokens — только при денежной проверке (решение Р2), иначе вход грубо, без сети.
+        Первый отказ останавливает оценку остальных; check(plan) — проверка вызывающего (reason сервера) по первому
+        плану, до оценки остальных (ревью, п. 10)."""
         self.batch_provider(name)
         if not requests:
             raise ApiError("пакет пуст: нет входов")
         check_batch_size(len(requests))
         exact = self.money_checks(name)
-        return [self.plan(r, name, choice, batch=True, exact=exact) for r in requests]
+        plans: list[Plan] = []
+        for n, r in enumerate(requests, 1):
+            p = self.plan(r, name, choice, batch=True, exact=exact)
+            if p.zone is None:
+                raise ApiError(f"запрос {n} пакета: {p.refusal} — пакет не отправлен")
+            if check is not None and not plans:
+                check(p)
+            plans.append(p)
+        return plans
 
     def _keyed(self, name: str, what: str, call):
         """Вызов провайдера с ключом: ключ — только здесь; ошибка — ApiError без ключа и без цепочки исключений."""
@@ -466,13 +476,22 @@ class Api:
         def fetch(key: str) -> list[BatchItem]:
             return [replace(i, error=scrub(i.error, key)) if i.error else i
                     for i in prov.batch_results(batch_id, key)]
-        items = [self._batch_item(prov, rec, i) for i in self._keyed(name, "результаты пакета", fetch)]
+        items, seen = [], set()
+        for i in self._keyed(name, "результаты пакета", fetch):
+            # custom_id не из учёта или повтор — не наш результат: ни файла (имя шло бы в путь), ни строки журнала
+            # (ревью, п. 1)
+            if i.custom_id not in rec["inputs"] or i.custom_id in seen:
+                items.append({"custom_id": i.custom_id[:80], "ok": False, "response": None, "foreign": True,
+                              "error": "custom_id не из этого пакета или повтор — пропущен", "cost_usd": 0.0})
+                continue
+            seen.add(i.custom_id)
+            items.append(self._batch_item(prov, rec, i))
         with ledger.locked(self.ledger_path):
             done = {r.get("custom_id") for r in self.read_ledger().rows if r.get("batch") == batch_id}
             base = {"kind": "run", "provider": name, "tier": rec.get("tier"), "project": rec["project"],
                     "template": None, "batch": batch_id, "zone": rec.get("zone") or "included"}
             for it in items:
-                it["logged"] = it["custom_id"] not in done
+                it["logged"] = not it.get("foreign") and it["custom_id"] not in done
                 if not it["logged"]:
                     continue
                 row = {"ts": ledger.stamp(self.now()), **base, "custom_id": it["custom_id"], "model": it["model"],

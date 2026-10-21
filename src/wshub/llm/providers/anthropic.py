@@ -144,6 +144,8 @@ class AnthropicProvider:
             bad_usage = True
         if bad_usage:  # вне except: без цепочки исключений
             raise _paid("usage ответа не разобран", None, model)
+        if request is None and not isinstance(raw_usage, dict):  # результат пакета без usage — по оценке, а не $0
+            raise _paid("в ответе нет usage", None, model)
         parsed, broken = None, False
         if request is not None and request.schema is not None:
             try:
@@ -162,7 +164,8 @@ class AnthropicProvider:
         data = self._post(BATCHES, body, key, paid=False)  # создание пакета не оплачивается
         bid = data.get("id")
         if not isinstance(bid, str) or not BATCH_ID.fullmatch(bid):
-            raise _error("пакет: в ответе нет id")
+            raise _error("пакет: в ответе нет id — пакет мог быть создан: проверь консоль провайдера, прежде чем "
+                         "повторять")
         return bid
 
     def batch_status(self, batch_id: str, key: str) -> dict:
@@ -218,9 +221,12 @@ class AnthropicProvider:
     def _batch_state(data: dict) -> dict:
         counts = data.get("request_counts")
         counts = {k: v for k, v in counts.items() if isinstance(v, int)} if isinstance(counts, dict) else {}
-        status = data.get("processing_status")
-        return {"status": status if isinstance(status, str) else "?", "counts": counts,
-                "ended_at": data.get("ended_at"), "expires_at": data.get("expires_at")}
+        def text(k: str) -> str | None:  # в учёт — только короткие строки, а не что угодно из ответа
+            v = data.get(k)
+            return v[:40] if isinstance(v, str) else None
+        status = text("processing_status")
+        return {"status": status or "?", "counts": counts, "ended_at": text("ended_at"),
+                "expires_at": text("expires_at")}
 
     def _body(self, request: Request, with_max: bool = True) -> dict:
         body: dict = {"model": request.model,

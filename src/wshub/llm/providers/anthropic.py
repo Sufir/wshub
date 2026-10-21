@@ -110,7 +110,7 @@ class AnthropicProvider:
     def estimate(self, request: Request, key: str | None = None) -> Usage:
         if key is None:
             return Usage(input=rough_tokens(prompt_text(request)))
-        data = self._post("/v1/messages/count_tokens", self._body(request, with_max=False), key)
+        data = self._post("/v1/messages/count_tokens", self._body(request, with_max=False), key, paid=False)
         n = data.get("input_tokens")
         if not isinstance(n, int) or isinstance(n, bool):
             raise _error("count_tokens: в ответе нет input_tokens")
@@ -119,20 +119,22 @@ class AnthropicProvider:
     def run(self, request: Request, key: str) -> Response:
         data = self._post("/v1/messages", self._body(request), key)
         content = data.get("content")
-        text = "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text") \
-            if isinstance(content, list) else ""
+        # текстовый блок без строки text — пропускается: ошибка разбора не должна обнулить оплаченный запрос
+        text = "".join(b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text"
+                       and isinstance(b.get("text"), str)) if isinstance(content, list) else ""
         model = str(data.get("model") or request.model or "")
-        u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        raw_usage = data.get("usage")
+        u = raw_usage if isinstance(raw_usage, dict) else {}
         cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
-        usage = None
+        usage, bad_usage = None, False
         try:  # usage — до разбора JSON: оплаченный ответ с битой схемой пишется по нему (ТЗ WSH-4.4, п. 2.3а.1)
             usage = Usage(input=int(u.get("input_tokens") or 0), output=int(u.get("output_tokens") or 0),
                           cache_read=int(u.get("cache_read_input_tokens") or 0),
                           cache_write=int(u.get("cache_creation_input_tokens") or 0),
                           cache_write_1h=int(cc.get("ephemeral_1h_input_tokens") or 0))
         except (TypeError, ValueError):
-            pass
-        if usage is None:  # вне except: без цепочки исключений
+            bad_usage = True
+        if bad_usage:  # вне except: без цепочки исключений
             raise _paid("usage ответа не разобран", None, model)
         parsed, broken = None, False
         if request.schema is not None:
@@ -140,8 +142,9 @@ class AnthropicProvider:
                 parsed = json.loads(text)
             except ValueError:
                 broken = True
-        if broken:  # вне except: без цепочки исключений
-            raise _paid("ответ не разобран как JSON по схеме", usage, model, text[:200])
+        if broken:  # вне except: без цепочки исключений; usage в ответе нет — ядро запишет оценку до запроса
+            raise _paid("ответ не разобран как JSON по схеме", usage if isinstance(raw_usage, dict) else None, model,
+                        text[:200])
         return Response(text, parsed, usage, model, self.name)
 
     def _body(self, request: Request, with_max: bool = True) -> dict:
@@ -165,9 +168,10 @@ class AnthropicProvider:
             body["output_config"] = oc
         return body
 
-    def _post(self, path: str, body: dict, key: str) -> dict:
+    def _post(self, path: str, body: dict, key: str, paid: bool = True) -> dict:
         """POST с ключом в заголовке. 429 и 529 — один повтор после retry-after (не больше 60 с), остальное — без
-        повторов. Ошибка — ApiError без ключа и заголовков запроса; поднимается вне except (без цепочки)."""
+        повторов. Ошибка — ApiError без ключа и заголовков запроса; поднимается вне except (без цепочки). paid —
+        запрос платный (messages): успешный ответ, который не JSON-объект, — PaidError."""
         data = json.dumps(body, ensure_ascii=False).encode("utf-8")
         for attempt in (1, 2):
             req = urllib.request.Request(self.base_url + path, data=data, method="POST",
@@ -201,8 +205,11 @@ class AnthropicProvider:
                 out = json.loads(raw)
             except ValueError:
                 out = None
-            if not isinstance(out, dict):  # HTTP-ответ успешный — запрос мог быть оплачен (ТЗ WSH-4.4, п. 2.3а.1)
-                raise _paid("ответ не JSON-объект", preview=(raw or b"").decode("utf-8", "replace")[:200])
+            if not isinstance(out, dict):
+                head = (raw or b"").decode("utf-8", "replace")[:200]
+                if paid:  # HTTP-ответ messages успешный — запрос мог быть оплачен (ТЗ WSH-4.4, п. 2.3а.1)
+                    raise _paid("ответ не JSON-объект", preview=head)
+                raise _error(f"ответ не JSON-объект: {head}")  # count_tokens бесплатен — обычный отказ, как в 4.3
             return out
         raise _error("повтор не удался")  # недостижимо: вторая попытка либо отвечает, либо ошибка
 

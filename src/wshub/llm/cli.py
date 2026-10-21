@@ -254,9 +254,11 @@ def answer_body(resp: Response) -> str:
 
 def estimate_lines(plan: Plan) -> list[str]:
     """Оценка без запроса: модель, вход, выход, сумма, зона или причина отказа, цикл; общий вывод CLI --estimate и
-    api_estimate сервера wshub-api."""
-    return [f"оценка: {plan.request.model} · вход ≈{plan.estimate.input}{' (грубо)' if plan.rough else ''} · "
-            f"выход до {plan.estimate.output} · {usd(plan.estimate_usd)}",
+    api_estimate сервера wshub-api. Вход — весь, с записью в кэш (её часть — в скобках; без cache её нет)."""
+    e = plan.estimate
+    cached = f" (запись в кэш {e.cache_write})" if e.cache_write else ""
+    return [f"оценка: {plan.request.model} · вход ≈{e.input + e.cache_write + e.cache_read}{cached}"
+            f"{' (грубо)' if plan.rough else ''} · выход до {e.output} · {usd(plan.estimate_usd)}",
             f"зона: {ZONE_RU[plan.zone]}" if plan.zone else f"запрос был бы отклонён: {plan.refusal}",
             _cycle(plan.zones) if plan.zones is not None else NO_ZONES,
             *_skipped(plan.skipped), *_burn(plan.zones)]

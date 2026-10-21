@@ -68,8 +68,11 @@ def _head(text: str) -> str:
 
 def _write_new(target: Path, data: bytes) -> None:
     """Атомарная запись нового файла с правами 0644: временный файл в том же каталоге, затем os.link — существующий
-    файл не перезаписывается (FileExistsError), а читатель не видит недописанный (п. 2.3.2)."""
+    файл не перезаписывается (FileExistsError), а читатель не видит недописанный (п. 2.3.2). target.parent уже
+    разрешён (resolve) в _out_target: после mkdir разрешается иначе — в пути появился симлинк, отказ."""
     target.parent.mkdir(parents=True, exist_ok=True)
+    if target.parent.resolve() != target.parent:
+        raise WsError("каталог out_file подменён симлинком во время записи — запись запрещена")
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".wshub-tmp")
     try:
         with os.fdopen(fd, "wb") as fh:
@@ -87,8 +90,11 @@ def _write_new(target: Path, data: bytes) -> None:
 
 def _out_target(hub: Hub, reg: Registry, project: str, out_file: str) -> tuple[Path, str]:
     """Проверка out_file до запроса (п. 2.3.2): проект rw, не служебные каталоги хаба, путь внутри корня, без симлинка
-    в конце и наружу, не под deny, не в .git, файла ещё нет. Отказ — WsError, модель не вызывается."""
-    ws = reg.workspaces[project]
+    в конце и наружу, не под deny, не в .git, файла ещё нет. Отказ — WsError, модель не вызывается. Перед записью
+    проверка повторяется по свежему реестру: за время запроса реестр и файлы могли измениться (ревью WSH-4.4, п. 1)."""
+    ws = reg.workspaces.get(project)
+    if ws is None:
+        raise WsError(f"out_file: проекта {project} больше нет в реестре")
     if ws.mode != "rw":
         raise WsError(f"out_file: проект {project} в реестре только для чтения (ro) — запись ответа в проект запрещена")
     root = ws.path.resolve()
@@ -119,11 +125,15 @@ def build_api_server(hub: Hub, now=now_local) -> FastMCP:
     def audit(name: str, project: str | None = None, params: dict | None = None, error: str | None = None) -> None:
         hub._audit_code(name, project, None, params=params, status="error" if error else "ok", error=error)
 
-    def save_state(body: str) -> Path:
+    def save_state(body: str) -> str:
+        """Ответ — в файл состояния; что вышло — строкой для чата (сбой записи не теряет вызов, ревью WSH-4.4, п. 9)."""
         path = _out_path(hub.state_dir, now())
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(body, encoding="utf-8")
-        return path
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body, encoding="utf-8")
+        except OSError as e:
+            return f"не сохранён — ошибка записи в {path.parent}: {e.strerror or type(e).__name__}"
+        return f"сохранён: {path}"
 
     def prepare(api: Api, reg: Registry, project: str, input: str, input_file: str, system: str, system_file: str,
                 schema: dict | None, schema_file: str, provider: str, tier: str, model: str, effort: str,
@@ -212,26 +222,28 @@ def build_api_server(hub: Hub, now=now_local) -> FastMCP:
                                    provider, tier, model, effort, max_tokens, cache, choice, reason, out_file)
             resp = api.run(plan)
         except USER_ERR as e:
-            audit("api_run", project, error=_audit_text(e))
+            paid = isinstance(e, PaidError) and e.cost_usd is not None  # оплачен, но не разобран: модель и сумма
+            audit("api_run", project, {"provider": plan.provider.name, "model": e.model, "cost_usd": e.cost_usd}
+                  if paid else None, error=_audit_text(e))
             return f"отказ: {e}"
         params = {"provider": plan.provider.name, "model": resp.model, "cost_usd": resp.cost_usd}
         body = answer_body(resp)
         data = body.encode("utf-8")
         out, error = [], None
         if target is not None:
-            path, rel = target
-            try:
+            rel = target[1]
+            try:  # блокировка и вся проверка out_file — заново: за время запроса могли измениться реестр и файлы
                 _blocked(hub, project)
+                path, rel = _out_target(hub, hub.registry.get(), project, out_file)
                 _write_new(path, data)
                 out.append(f"ответ записан: {rel} ({len(data)} байт)")
-            except (WsError, OSError) as e:
+            except (WsError, RegistryError, OSError) as e:
                 error = f"out_file {rel} не записан: " + (
                     "файл появился во время запроса — перезапись запрещена" if isinstance(e, FileExistsError)
-                    else str(e))
-                out.append(f"{error}; оплаченный ответ сохранён: {save_state(body)}")
+                    else str(e).removeprefix("out_file: "))
+                out.append(f"{error}; оплаченный ответ {save_state(body)}")
         elif len(data) > OUT_MAX:
-            out += [f"ответ длиннее 8 КБ ({len(data)} байт) — в файле: {save_state(body)}", "начало (2 КБ):",
-                    _head(body)]
+            out += [f"ответ длиннее 8 КБ ({len(data)} байт) — {save_state(body)}", "начало (2 КБ):", _head(body)]
         else:
             out.append(body)
         try:

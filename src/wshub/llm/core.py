@@ -21,11 +21,13 @@ class ApiError(Exception):
 class PaidError(ApiError):
     """HTTP-ответ получен (запрос оплачен), но не разобран: битый JSON по схеме, не JSON-объект, usage. Ядро пишет
     в журнал стоимость по usage, а без него — оценку до запроса (ТЗ WSH-4.4, п. 2.3а.1). preview — начало ответа:
-    в тексте исключения есть, в журнал вызовов сервера не идёт (там msg)."""
+    в тексте исключения есть, в журнал вызовов сервера не идёт (там msg). cost_usd — стоимость, записанная ядром в
+    журнал трат (у исключения, которое поднимает ядро после записи)."""
 
-    def __init__(self, msg: str, usage: Usage | None = None, model: str | None = None, preview: str = ""):
+    def __init__(self, msg: str, usage: Usage | None = None, model: str | None = None, preview: str = "",
+                 cost_usd: float | None = None):
         super().__init__(msg)
-        self.msg, self.usage, self.model, self.preview = msg, usage, model, preview
+        self.msg, self.usage, self.model, self.preview, self.cost_usd = msg, usage, model, preview, cost_usd
 
     def __str__(self) -> str:
         return f"{self.msg}: {self.preview}" if self.preview else self.msg
@@ -117,6 +119,8 @@ class Api:
             keys.read(keys.key_path(self.config_dir, name))
         except keys.KeyProblem as e:
             return str(e)
+        except OSError as e:  # каталог ключей не читается (нет прав) — ключа для хаба нет, а не падение
+            return f"ключ {name} не читается: {e.strerror or type(e).__name__}"
         return None
 
     def provider(self, name: str) -> tuple[Provider, ApiProvider]:
@@ -307,8 +311,9 @@ class Api:
         try:
             resp = plan.provider.run(req, key)
         except PaidError as e:  # ответ получен и оплачен, но не разобран (ТЗ WSH-4.4, п. 2.3а.1)
-            error = scrub(f"{type(e).__name__}: {e}", key)
-            paid = (e.usage, e.model or req.model, scrub(f"{type(e).__name__}: {e.msg}", key), scrub(e.preview, key))
+            # подпись ApiError — как у прочих отказов провайдера: текст ошибки CLI 4.3 не меняется (ревью, п. 10)
+            error = scrub(f"ApiError: {e}", key)
+            paid = (e.usage, e.model or req.model, scrub(f"ApiError: {e.msg}", key), scrub(e.preview, key))
         except Exception as e:  # любой сбой провайдера — в журнал и в понятный отказ
             error = scrub(f"{type(e).__name__}: {e}", key)
         del key
@@ -320,7 +325,7 @@ class Api:
                 cost = plan.estimate_usd
             ledger.append(self.ledger_path, {**rec, "model": model, "usage": (usage or Usage()).as_dict(),
                                              "cost_usd": cost, "ok": False, "error": error})
-            raise PaidError(f"провайдер {name}: {msg}", preview=preview)
+            raise PaidError(f"провайдер {name}: {msg}", model=model, preview=preview, cost_usd=cost)
         if error is not None:  # исключение поднимаем вне except: без __context__ с исходным текстом
             ledger.append(self.ledger_path, {**rec, "usage": Usage().as_dict(), "cost_usd": 0.0, "ok": False,
                                              "error": error})

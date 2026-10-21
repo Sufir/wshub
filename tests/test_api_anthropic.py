@@ -398,11 +398,32 @@ def test_broken_json_paid_by_usage(api):
     api.srv.reply(body={"input_tokens": 10})
     api.srv.reply(body=msg("не JSON вовсе"))
     rc, _, err_ = api.run("--schema", "s.json", provider="anthropic")
-    assert rc == 1 and "ответ не разобран как JSON по схеме: не JSON вовсе" in err_
+    # текст отказа CLI — как в 4.3: «ApiError: …» (ревью WSH-4.4, п. 10)
+    assert rc == 1
+    assert "провайдер anthropic: ApiError: ответ не разобран как JSON по схеме: не JSON вовсе" in err_
     row = api.rows()[-1]
     assert row["ok"] is False and row["model"] == HAIKU
     assert row["cost_usd"] == pytest.approx((16 * 0.10 + 5 * 0.50 + 2018 * 0.125) / 1e6)
     assert row["usage"] == {"input": 16, "output": 5, "cache_read": 0, "cache_write": 2018, "cache_write_1h": 0}
+    # текстовый блок без строки text — тоже ошибка разбора по usage, а не $0 (ревью, п. 3)
+    api.srv.reply(body={"input_tokens": 10})
+    api.srv.reply(body={**msg(), "content": [{"type": "text", "text": 5}]})
+    rc, _, err_ = api.run("--schema", "s.json", provider="anthropic")
+    assert rc == 1 and "ответ не разобран как JSON по схеме" in err_
+    assert api.rows()[-1]["cost_usd"] == pytest.approx((16 * 0.10 + 5 * 0.50 + 2018 * 0.125) / 1e6)
+    # usage в ответе нет — оценка до запроса, а не нули (ревью, п. 2)
+    api.srv.reply(body={"input_tokens": 10})
+    api.srv.reply(body={k: v for k, v in msg("{битый").items() if k != "usage"})
+    rc, _, err_ = api.run("--schema", "s.json", provider="anthropic")
+    assert rc == 1 and api.rows()[-1]["cost_usd"] == pytest.approx((10 * 0.10 + 1024 * 0.50) / 1e6)
+
+
+def test_count_tokens_non_json_is_not_paid(api):
+    """count_tokens бесплатен: не-JSON ответ — обычный отказ оценки, как в 4.3, без строки журнала (ревью, п. 10)."""
+    api.srv.reply(body=b"<html>oops</html>")
+    rc, _, err_ = api.run("--estimate", provider="anthropic")
+    assert rc == 1 and "оценка входа: ApiError: ответ не JSON-объект: <html>oops</html>" in err_
+    assert api.rows() == []
 
 
 def test_non_json_200_paid_by_estimate(api):
@@ -437,6 +458,10 @@ def test_estimate_cache_write_prices(api):
     assert p.estimate_usd == pytest.approx((2 * 0.10 + 100 * 0.20 + 1024 * 0.50) / 1e6)
     p = plan("none")
     assert p.estimate_usd == pytest.approx((102 * 0.10 + 1024 * 0.50) / 1e6)
+    keys.write(keys.key_path(api.env.cfg.parent, "anthropic"), MARKER)
+    api.srv.reply(body={"input_tokens": 50})  # точный вход меньше грубой системной части — не больше всего входа
+    p = plan("short")
+    assert (p.estimate.input, p.estimate.cache_write) == (0, 50)  # ревью, п. 12
 
 
 # ---------- без настроек реестра (ТЗ WSH-4.4, п. 2.3б) ----------
@@ -466,6 +491,8 @@ def test_no_registry_settings_reaches_http(api, monkeypatch):
     assert out.startswith("Ок из чата\nAPI: claude-haiku-5-5"), out
     assert len(api.srv.seen) == 4 and api.srv.seen[-1][1]["x-api-key"] == MARKER
     assert [p["provider"] for p in json.loads(call("api_models"))["providers"]] == ["anthropic"]
+    stats = call("api_stats")  # провайдер без секции — в stats по ключу (ревью, п. 14)
+    assert "anthropic: зоны не проверяются" in stats and "по моделям: claude-haiku-5-5" in stats
     n = len(api.srv.seen)
     set_api(api.env, "", ws="[workspace.payload.api]\nenabled = false\n")  # проект закрыт — отказ до HTTP
     assert "закрыт от отправки в API" in call("api_run", project="payload", input_file="q.txt", tier="cheap")

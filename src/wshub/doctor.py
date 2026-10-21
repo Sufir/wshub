@@ -578,14 +578,14 @@ def check_api(ctx: Ctx, reg) -> dict:
         try:
             keys.read(paths[name])
             lines.append(f"ключ {name}: ключ есть, права верны")
-        except keys.KeyProblem as e:
+        except (keys.KeyProblem, OSError) as e:
             (problems if os.path.lexists(paths[name]) else infos).append(f"ключ {name}: {e}")
     if not names:
         infos.append("ключей API нет — задать: wshub api key set <провайдер>")
     if problems:
         return _check("api", title, "fail", lines + problems, "исправь реестр [api] или права ключа")
-    if not entries and not names:
-        return _check("api", title, "info", lines + infos, "модели по ключу из чата не настроены — это опция")
+    if not entries:  # сервер — опция: без записи в Desktop это не «внимание» (ключ может быть только для задач Code)
+        return _check("api", title, "info", lines + infos, "сервер wshub-api не подключён — это опция")
     return _check("api", title, "warn" if infos else "ok", lines + infos)
 
 

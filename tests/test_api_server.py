@@ -104,10 +104,21 @@ def test_long_answer_goes_to_state_file(srv, monkeypatch):
     use(monkeypatch, fake.FakeProvider(reply="я" * 6000))  # 12 000 байт
     out = srv.run(input="длинно")
     head = out.splitlines()[0]
-    assert head.startswith("ответ длиннее 8 КБ (12000 байт) — в файле: ")
-    path = Path(head.split("в файле: ")[1])
+    assert head.startswith("ответ длиннее 8 КБ (12000 байт) — сохранён: ")
+    path = Path(head.split("сохранён: ")[1])
     assert path.is_relative_to(srv.env.state / "api" / "out") and path.read_text(encoding="utf-8") == "я" * 6000
     assert out.count("я") <= api_server.HEAD_MAX // 2 and "я" * 1000 in out and "API: fake-cheap" in out
+
+
+def test_state_save_failure_keeps_call(srv, monkeypatch):
+    """Файл состояния не записался — вызов не падает: в чате причина, начало ответа и строка API (ревью, п. 9)."""
+    use(monkeypatch, fake.FakeProvider(reply="я" * 6000))
+    srv.env.state.mkdir(parents=True, exist_ok=True)
+    (srv.env.state / "plain").write_text("не каталог")
+    monkeypatch.setattr(api_server, "_out_path", lambda state, now: state / "plain" / "x.txt")
+    out = srv.run(input="длинно")
+    assert out.splitlines()[0].startswith("ответ длиннее 8 КБ (12000 байт) — не сохранён — ошибка записи в ")
+    assert "я" * 1000 in out and "API: fake-cheap" in out and srv.audit()[-1]["status"] == "ok"
 
 
 def test_estimate_without_request(srv, monkeypatch):
@@ -115,6 +126,30 @@ def test_estimate_without_request(srv, monkeypatch):
     out = srv.call("api_estimate", project="payload", input_file="q.txt", tier="cheap")
     assert out.splitlines()[0] == "оценка: fake-cheap · вход ≈4 · выход до 1024 · ≈$0.01"
     assert "зона: включённая" in out and prov.calls == [] and srv.api.rows() == []
+    out = srv.call("api_estimate", project="payload", input="привет", system="s" * 400, tier="cheap", cache="short")
+    assert out.splitlines()[0].startswith("оценка: fake-cheap · вход ≈102 (запись в кэш 100) · ")  # ревью, п. 11
+
+
+def test_default_provider_only_when_single(srv, monkeypatch):
+    """provider пуст: единственный доступный — он; несколько — отказ с перечнем (ревью, п. 13)."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    assert srv.call("api_run", project="payload", input="x", tier="cheap").startswith("x\nAPI: fake-cheap")
+    keys.write(keys.key_path(srv.env.cfg.parent, "anthropic"), "sk-ant-other-key-0000")  # anthropic — по ключу
+    out = srv.call("api_run", project="payload", input="x", tier="cheap")
+    assert out == "отказ: provider обязателен: доступны fake, anthropic" and len(prov.calls) == 1
+
+
+def test_out_file_refused_in_hub_code_dir(api, code_dir, monkeypatch):
+    """Проект rw с корнем в каталоге кода wshub: читать в API можно (ro), out_file — отказ (служебные каталоги хаба,
+    п. 2.3.2; ревью, п. 5)."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    api.env.workspaces["hubcode"] = {"path": str(code_dir), "mode": "rw"}
+    set_api(api.env)
+    s = Srv(api)  # Hub из фикстуры code_dir знает каталог кода
+    assert s.call("api_run", project="hubcode", input_file="x.txt", tier="cheap").startswith("code\n")
+    out = s.call("api_run", project="hubcode", input="x", tier="cheap", out_file="answer.txt")
+    assert out.startswith("отказ: out_file: папка пересекается с кодом wshub") and len(prov.calls) == 1
+    assert not (code_dir / "answer.txt").exists()
 
 
 def test_models_and_stats(srv, monkeypatch):
@@ -189,7 +224,8 @@ def test_out_file_existing_not_overwritten(srv, monkeypatch):
 
 
 def test_out_file_appears_during_request_not_overwritten(srv, monkeypatch):
-    """Файл появился, пока шёл запрос: os.link не перезаписывает; оплаченный ответ — в файл состояния."""
+    """Файл появился, пока шёл запрос: повторная проверка перед записью отказывает; оплаченный ответ — в файл
+    состояния."""
     target = srv.env.proj / "late.txt"
 
     class Racer(fake.FakeProvider):
@@ -199,11 +235,60 @@ def test_out_file_appears_during_request_not_overwritten(srv, monkeypatch):
     use(monkeypatch, Racer(reply="ОПЛАЧЕННЫЙ-ОТВЕТ"))
     out = srv.run(input="x", out_file="late.txt")
     assert target.read_text() == "чужое"
-    assert "out_file late.txt не записан: файл появился во время запроса — перезапись запрещена" in out
+    assert "out_file late.txt не записан: файл late.txt уже есть — перезапись запрещена" in out
     saved = Path(out.split("оплаченный ответ сохранён: ")[1].splitlines()[0])
     assert saved.is_relative_to(srv.env.state / "api" / "out") and saved.read_text() == "ОПЛАЧЕННЫЙ-ОТВЕТ"
     assert "ОПЛАЧЕННЫЙ-ОТВЕТ" not in out
     assert srv.audit()[-1]["status"] == "error" and srv.audit()[-1]["params"]["cost_usd"] > 0
+
+
+def test_out_file_atomic_link_never_overwrites(srv, monkeypatch):
+    """Запись — временный файл с полным текстом и правами 0644, затем link: в момент link цели ещё нет; если цель
+    появилась уже после всех проверок, link не перезаписывает её (ревью, п. 16)."""
+    use(monkeypatch, fake.FakeProvider(reply="полный ответ"))
+    real_link, seen = os.link, []
+
+    def link(src, dst):
+        seen.append((Path(src).read_text(), stat.S_IMODE(os.stat(src).st_mode), os.path.lexists(dst)))
+        return real_link(src, dst)
+    monkeypatch.setattr(api_server.os, "link", link)
+    srv.run(input="x", out_file="atomic.txt")
+    assert seen == [("полный ответ", 0o644, False)]
+    assert (srv.env.proj / "atomic.txt").read_text() == "полный ответ"
+
+    def racing_link(src, dst):
+        Path(dst).write_text("чужое")  # гонка после повторной проверки
+        return real_link(src, dst)
+    monkeypatch.setattr(api_server.os, "link", racing_link)
+    out = srv.run(input="x", out_file="race.txt")
+    assert (srv.env.proj / "race.txt").read_text() == "чужое"
+    assert "out_file race.txt не записан: файл появился во время запроса — перезапись запрещена" in out
+    assert sorted(p.name for p in srv.env.proj.iterdir() if p.name.endswith(".wshub-tmp")) == []
+
+
+def test_out_file_rechecked_before_write(srv, monkeypatch):
+    """Путь и реестр проверяются заново перед записью (ревью, п. 1): каталог стал симлинком наружу или проект —
+    ro, пока шёл запрос, — в проект и наружу не пишется, оплаченный ответ — в файл состояния."""
+    env = srv.env
+
+    class Swap(fake.FakeProvider):
+        def run(self, request, key):
+            (env.proj / "new").symlink_to(env.outside, target_is_directory=True)
+            return super().run(request, key)
+    use(monkeypatch, Swap(reply="ОТВЕТ"))
+    out = srv.run(input="x", out_file="new/x.txt")
+    assert "out_file new/x.txt не записан: путь вне проекта" in out and "оплаченный ответ сохранён: " in out
+    assert sorted(p.name for p in env.outside.iterdir()) == ["secret.txt"]
+
+    class ToRo(fake.FakeProvider):
+        def run(self, request, key):
+            env.workspaces["payload"]["mode"] = "ro"
+            set_api(env)
+            return super().run(request, key)
+    use(monkeypatch, ToRo(reply="ОТВЕТ"))
+    out = srv.run(input="x", out_file="ro-later.txt")
+    assert "out_file ro-later.txt не записан: проект payload в реестре только для чтения (ro)" in out
+    assert not (env.proj / "ro-later.txt").exists()
 
 
 def test_out_file_blocked_during_request(srv, monkeypatch):
@@ -267,6 +352,16 @@ def test_off_tier_model_needs_reason(srv, monkeypatch):
     assert "API: fake-cheap" in out and len(prov.calls) == 1
 
 
+def test_strong_without_choice_requirement_still_needs_reason(srv, monkeypatch):
+    """strong_requires_choice = false: ядро strong пропускает без выбора оператора, а сервер — только с reason
+    (ревью, п. 4)."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    set_api(srv.env, API + "strong_requires_choice = false\n")
+    out = srv.run(input="x", tier="strong")
+    assert out.startswith("отказ: ") and "сильная модель (fake-strong) — только с reason" in out and prov.calls == []
+    assert "API: fake-strong" in srv.run(input="x", tier="strong", reason=REASON) and len(prov.calls) == 1
+
+
 # ---------- ключ не утекает, журнал вызовов (п. 2.3.3–2.3.4, тест 5) ----------
 
 def test_key_marker_never_leaks(srv, monkeypatch, capsys, caplog):
@@ -325,14 +420,31 @@ def test_paid_parse_error_logged_with_cost(srv, monkeypatch):
     журнал вызовов."""
     use(monkeypatch, Paid())
     out = srv.run(input="x", schema=SCHEMA)
-    assert out.startswith("отказ: провайдер fake: PaidError: ответ не разобран как JSON по схеме: СЫРОЙ-ОТВЕТ")
+    assert out.startswith("отказ: провайдер fake: ApiError: ответ не разобран как JSON по схеме: СЫРОЙ-ОТВЕТ")
     row = srv.api.rows()[-1]
     assert row["ok"] is False and row["cost_usd"] == pytest.approx((100 * 1 + 50 * 5) / 1e6)
     assert row["usage"]["input"] == 100 and row["model"] == "fake-cheap"
     assert "СЫРОЙ-ОТВЕТ" not in json.dumps(srv.audit(), ensure_ascii=False)
-    assert "ответ не разобран" in srv.audit()[-1]["error"]
+    a = srv.audit()[-1]  # журнал вызовов: модель и сумма оплаченного вызова есть (ревью, п. 8)
+    assert a["status"] == "error" and "ответ не разобран" in a["error"]
+    assert a["params"] == {"provider": "fake", "model": "fake-cheap", "cost_usd": pytest.approx(row["cost_usd"])}
     rc, _, err = srv.api.run()  # CLI: тот же текст и та же строка журнала
     assert rc == 1 and "СЫРОЙ-ОТВЕТ" in err and srv.api.rows()[-1]["cost_usd"] > 0
+
+
+def test_paid_error_key_scrubbed(srv, monkeypatch):
+    """Ветка PaidError: ключ в тексте и в начале ответа вырезается — в чате, журнале трат и журнале вызовов (ревью,
+    п. 6)."""
+    class LeakyPaid(fake.FakeProvider):
+        def run(self, request, key):
+            raise PaidError(f"bad {key}", Usage(input=10), "fake-cheap", preview=f"echo {key} / {key[:12]}")
+    use(monkeypatch, LeakyPaid())
+    out = srv.run(input="x")
+    assert out.startswith("отказ: ") and out.count("<ключ скрыт>") >= 2
+    files = [srv.api.ledger_path, srv.env.state / "audit.jsonl"]
+    for part in (MARKER, MARKER[:12], MARKER[-9:]):
+        assert part not in out and all(part.encode() not in p.read_bytes() for p in files)
+    assert srv.api.rows()[-1]["cost_usd"] == pytest.approx(10 / 1e6)
 
 
 def test_paid_error_without_usage_logs_estimate(srv, monkeypatch):
@@ -367,22 +479,47 @@ def test_estimate_counts_cache_write(api):
 
 # ---------- doctor, точка входа ----------
 
-def test_doctor_api_line(api, tmp_path):
-    ctx = doctor.Ctx(config=api.env.cfg, state=api.env.state, home=tmp_path / "home", win_users=tmp_path / "none")
-    reg = api.env.hub.registry.get()
-    c = doctor.check_api(ctx, reg)
+def test_doctor_api_line(api, tmp_path, monkeypatch, capsys):
+    """doctor: запись wshub-api и ключи (как api key check, без значения); сервер — опция (ревью, п. 14–15)."""
+    home = tmp_path / "home"
+    ctx = doctor.Ctx(config=api.env.cfg, state=api.env.state, home=home, win_users=tmp_path / "none")
+
+    def check():
+        return doctor.check_api(ctx, api.env.hub.registry.get())
+    c = check()
     assert "API хаба: включён" in c["detail"] and "ключ fake: ключ есть, права верны" in c["detail"]
-    assert any("wshub setup --api" in x for x in c["detail"]) and c["status"] == "warn"
+    assert any("wshub setup --api" in x for x in c["detail"]) and c["status"] == "info"  # без записи — опция
+    desk = home / ".config/Claude/claude_desktop_config.json"
+    desk.parent.mkdir(parents=True)
+    desk.write_text(json.dumps({"mcpServers": {"wshub-api": {"command": "wshub", "args": ["api"]}}}))
+    c = check()
+    assert "запись wshub-api в Desktop: есть" in c["detail"] and c["status"] == "ok"
     kp = keys.key_path(api.env.cfg.parent, "fake")
     os.chmod(kp, 0o644)
-    c = doctor.check_api(ctx, api.env.hub.registry.get())
+    c = check()
     assert c["status"] == "fail" and any(x.startswith("ключ fake: права ключа") and "0644" in x for x in c["detail"])
     assert MARKER not in json.dumps(c, ensure_ascii=False)
     kp.unlink()
-    c = doctor.check_api(ctx, api.env.hub.registry.get())
+    c = check()
     assert any(x.startswith("ключ fake: ключа нет") for x in c["detail"]) and c["status"] == "warn"
+    set_api(api.env, "", ws="[workspace.rt.api]\nenabled = false\n")  # без секций: провайдер — по файлу ключа
+    keys.write(keys.key_path(api.env.cfg.parent, "anthropic"), "sk-ant-other-key-0000")
+    c = check()
+    assert "ключ anthropic: ключ есть, права верны" in c["detail"] and not any("fake" in x for x in c["detail"])
+    assert any("закрыты от отправки в API" in x and "rt" in x for x in c["detail"]) and c["status"] == "ok"
     assert doctor._is_wshub_cmd(["wshub", "api"]) is False
     assert doctor._is_wshub_cmd(["python", "-m", "wshub", "api"]) is False
+    monkeypatch.setattr(doctor, "check_code", lambda ctx, reg, hub: doctor._check("code", "wshub-code", "info", "x"))
+    doctor.main(api.env.cfg, api.env.state)  # строка wshub-api — в отчёте wshub doctor
+    assert "] wshub-api" in capsys.readouterr().out
+
+
+def test_stats_without_sections(api, capsys):
+    """stats: провайдер без секции — по ключу; нет ни секций, ни ключей — «провайдеров нет» (ревью, п. 14)."""
+    set_api(api.env, "", ws="")
+    assert "fake: зоны не проверяются" in api.cli("stats")[1]
+    keys.key_path(api.env.cfg.parent, "fake").unlink()
+    assert "провайдеров нет: ни секций [api.providers.<имя>] в реестре, ни ключей" in api.cli("stats")[1]
 
 
 def test_api_main_without_args_serves(env, monkeypatch):

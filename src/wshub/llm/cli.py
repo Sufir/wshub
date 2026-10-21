@@ -16,13 +16,14 @@ from ..core import Hub, Session, WsError, _is_file
 from ..policy import Policy
 from ..registry import Registry, RegistryError, RegistryFile
 from . import keys, ledger
-from .core import Api, ApiError, ddmm, now_local, usd
+from .core import Api, ApiError, Plan, ddmm, now_local, usd
 from .providers import PROVIDERS
-from .types import Request
+from .types import Request, Response
 
 OUT_MAX = 8 * 1024  # длиннее — ответ в файл, на экран путь
 ZONE_RU = {"included": "включённая", "purchased": "купленная"}
 USAGE = """\
+wshub api                         — MCP-сервер wshub-api (stdio); его запускает Claude Desktop
 wshub api key set <провайдер>     — задать ключ API (скрытый ввод), файл с правами 0600
 wshub api key check <провайдер>   — есть ли ключ и верны ли права (значение не выводится)
 wshub api run --provider P --project X (--tier T | --model M) [--system FILE] --input FILE [--schema FILE]
@@ -38,9 +39,12 @@ class _Usage(Exception):
 
 
 def api_main(rest: list[str], config: Path, state: Path, now=now_local) -> int:
-    if not rest or rest[0] in ("-h", "--help", "help"):
-        print(USAGE, file=sys.stdout if rest else sys.stderr)
-        return 0 if rest else 2
+    if not rest:  # без аргументов — MCP-сервер wshub-api, как wshub code для wshub-code (ТЗ WSH-4.4, п. 2.1.1)
+        from ..api_server import serve
+        return serve(Path(config), Path(state))
+    if rest[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
     sub, args = rest[0], rest[1:]
     handlers = {"key": _key, "run": _run, "stats": _stats, "credits": _credits, "allow": _allow}
     if sub not in handlers:
@@ -214,7 +218,7 @@ def _run(config: Path, state: Path, now, args: list[str]) -> int:
     hub = Hub(config, state)
     reg = hub.registry.get()
     api = _api(config, state, now, reg)
-    api.gate(o["project"])  # выключенный API и проект без api — отказ до чтения файлов
+    api.gate(o["project"])  # выключенный API и проект с api.enabled = false — отказ до чтения файлов
     api.provider(o["provider"])
     s = _session(hub, reg, o["project"])
     text = _read(hub, s, o["input"])
@@ -227,17 +231,11 @@ def _run(config: Path, state: Path, now, args: list[str]) -> int:
     req = Request(system, ({"role": "user", "text": text},), o["project"], tier=o.get("tier"),
                   model=o.get("model"), schema=schema, effort=o.get("effort"), max_tokens=max_tokens)
     plan = api.plan(req, o["provider"], o.get("choice"))
-    notes = _skipped(plan.skipped)
     if o.get("estimate"):
-        print(f"оценка: {plan.request.model} · вход ≈{plan.estimate.input}{' (грубо)' if plan.rough else ''} · "
-              f"выход до {plan.estimate.output} · {usd(plan.estimate_usd)}")
-        print(f"зона: {ZONE_RU[plan.zone]}" if plan.zone else f"запрос был бы отклонён: {plan.refusal}")
-        print(_cycle(plan.zones) if plan.zones is not None else NO_ZONES)
-        for n in notes + _burn(plan.zones):
-            print(n)
+        print("\n".join(estimate_lines(plan)))
         return 0
     resp = api.run(plan)
-    body = json.dumps(resp.data, ensure_ascii=False, indent=2) if resp.data is not None else resp.text
+    body = answer_body(resp)
     if "out" in o or len(body.encode("utf-8")) > OUT_MAX:
         path = Path(o["out"]) if "out" in o else _out_path(state, now())
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -245,16 +243,34 @@ def _run(config: Path, state: Path, now, args: list[str]) -> int:
         print(f"ответ: {path}")
     else:
         print(body)
-    z = api.zones(o["provider"]) if plan.zones is not None else None
+    print("\n".join(run_lines(api, plan, resp)))
+    return 0
+
+
+def answer_body(resp: Response) -> str:
+    """Ответ модели для вывода: JSON по схеме (data) с отступами или текст."""
+    return json.dumps(resp.data, ensure_ascii=False, indent=2) if resp.data is not None else resp.text
+
+
+def estimate_lines(plan: Plan) -> list[str]:
+    """Оценка без запроса: модель, вход, выход, сумма, зона или причина отказа, цикл; общий вывод CLI --estimate и
+    api_estimate сервера wshub-api."""
+    return [f"оценка: {plan.request.model} · вход ≈{plan.estimate.input}{' (грубо)' if plan.rough else ''} · "
+            f"выход до {plan.estimate.output} · {usd(plan.estimate_usd)}",
+            f"зона: {ZONE_RU[plan.zone]}" if plan.zone else f"запрос был бы отклонён: {plan.refusal}",
+            _cycle(plan.zones) if plan.zones is not None else NO_ZONES,
+            *_skipped(plan.skipped), *_burn(plan.zones)]
+
+
+def run_lines(api: Api, plan: Plan, resp: Response) -> list[str]:
+    """Строка «API: …» после запроса и предупреждения (журнал, «сгорит»); общий вывод CLI run и api_run."""
+    z = api.zones(plan.provider.name) if plan.zones is not None else None
     u = resp.usage
     line = (f"API: {resp.model} · вход {u.input + u.cache_read + u.cache_write} (из кэша {u.cache_read}) · "
             f"выход {u.output} · {usd(resp.cost_usd)}" + (f" · {_cycle(z)}" if z is not None else ""))
     if plan.zone == "purchased" and z is not None and z.allow_usd is not None:
         line += f" · купленная зона {usd(z.purchased_spent)} из ${z.allow_usd:.2f}, до {ddmm(z.allow_until)}"
-    print(line)
-    for n in notes + _burn(z):
-        print(n)
-    return 0
+    return [line, *_skipped(plan.skipped), *_burn(z)]
 
 
 # ---------- stats, credits, allow ----------
@@ -264,17 +280,24 @@ def _stats(config: Path, state: Path, now, args: list[str]) -> int:
     if pos:
         raise _Usage(f"лишние аргументы: {' '.join(pos)}")
     days = _int(o["days"], "--days") if "days" in o else None
-    api = _api(config, state, now)
-    api.check_section()
+    print("\n".join(stats_lines(_api(config, state, now), days)))
+    return 0
+
+
+def stats_lines(api: Api, days: int | None = None) -> list[str]:
+    """Траты за цикл (или за days дней) по доступным провайдерам: с секцией в реестре или с ключом (ТЗ WSH-4.4,
+    п. 2.3б); общий вывод CLI stats и api_stats."""
+    provs = api.available()
     led = api.read_ledger()
-    t = now()
+    t = api.now()
     daily = api.reg.api.daily_usd
     out = [f"Траты API хаба (оценка) {f'за {days} дн.' if days else 'за цикл'}; сегодня "
            f"{usd(ledger.spent_today(led, t))} " + (f"из ${daily:.2f} (daily_usd)" if daily is not None
                                                    else "(daily_usd не задан)")]
-    if not api.reg.api.providers:
-        out.append("провайдеры не настроены: нет секций [api.providers.<имя>] в реестре")
-    for name, conf in api.reg.api.providers.items():
+    if not provs:
+        out.append("провайдеров нет: ни секций [api.providers.<имя>] в реестре, ни ключей "
+                   "(wshub api key set <провайдер>)")
+    for name, conf in provs.items():
         z = ledger.zones(led, name, conf, t.date())
         if not ledger.zones_set(led, name, conf):
             out.append(f"{name}: {NO_ZONES}")
@@ -305,8 +328,7 @@ def _stats(config: Path, state: Path, now, args: list[str]) -> int:
             out.append(f"  {title}: " + " · ".join(parts))
         out += ["  " + b for b in _burn(z)]
     out += _skipped(led.skipped)
-    print("\n".join(out))
-    return 0
+    return out
 
 
 def _credits(config: Path, state: Path, now, args: list[str]) -> int:

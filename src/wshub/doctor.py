@@ -277,13 +277,13 @@ def check_desktop(ctx: Ctx) -> dict:
 
 # ---------- процессы ----------
 
-# подкоманды, которые не являются файловым сервером wshub: doctor и всё семейство wshub-code
-_NOT_FILE_SERVER = {"doctor", "code", "code-run", "code-hook", "code-kill"}
+# подкоманды, которые не являются файловым сервером wshub: doctor, всё семейство wshub-code и wshub api (wshub-api)
+_NOT_FILE_SERVER = {"doctor", "code", "code-run", "code-hook", "code-kill", "api"}
 
 
 def _is_wshub_cmd(argv: list[str]) -> bool:
-    """Процесс файлового сервера wshub (без аргументов). Не считаются: doctor и wshub code* — у них свои
-    процессы (сервер wshub-code, надзиратель, хук), иначе doctor и «Обзор» ушли бы в «внимание»."""
+    """Процесс файлового сервера wshub (без аргументов). Не считаются: doctor, wshub code* и wshub api — у них свои
+    процессы (серверы wshub-code и wshub-api, надзиратель, хук), иначе doctor и «Обзор» ушли бы в «внимание»."""
     if not argv:
         return False
     rest = argv[1:]
@@ -546,6 +546,49 @@ def check_code(ctx: Ctx, reg, hub) -> dict:
     return _check("code", title, status, lines + infos)
 
 
+def check_api(ctx: Ctx, reg) -> dict:
+    """wshub-api (ТЗ WSH-4.4, п. 2.1.2): секция [api], закрытые проекты, запись в Desktop, ключи провайдеров — с секцией
+    в реестре или с файлом ключа (значение не выводится)."""
+    title = "wshub-api"
+    if reg is None:
+        return _check("api", title, "info", "не проверено: реестр не прочитан", "сначала исправь реестр")
+    from .llm import keys
+    try:
+        from .llm.providers import PROVIDERS
+    except Exception as e:  # noqa: BLE001 — сломанный модуль провайдера ломает только эту проверку
+        return _check("api", title, "fail", f"провайдеры API не загрузились: {type(e).__name__}: {e}")
+    api = reg.api
+    lines, problems, infos = [], [], []
+    if api.error:
+        problems.append(f"[api]: {api.error}")
+    lines.append(f"API хаба: {'включён' if api.enabled else 'выключен ([api] enabled = false)'}")
+    closed = [n for n, on in api.projects.items() if not on]
+    if closed:
+        lines.append(f"закрыты от отправки в API ([workspace.<имя>.api] enabled = false): {', '.join(closed)}")
+    for name, err in api.project_errors.items():
+        problems.append(f"[workspace.{name}.api]: {err}")
+    entries = [c for c in desktop_candidates(ctx) if c.get("used") and "wshub-api" in (c.get("servers") or [])]
+    if entries:
+        lines.append("запись wshub-api в Desktop: есть")
+    else:
+        infos.append("записи wshub-api в Desktop нет (это опция; добавить — wshub setup --api)")
+    paths = {n: keys.key_path(ctx.config.parent, n) for n in PROVIDERS}
+    names = [n for n, p in paths.items() if n in api.providers or os.path.lexists(p)]
+    for name in names:  # как wshub api key check: нет ключа — инфо, ключ с неверными правами — ошибка
+        try:
+            keys.read(paths[name])
+            lines.append(f"ключ {name}: ключ есть, права верны")
+        except keys.KeyProblem as e:
+            (problems if os.path.lexists(paths[name]) else infos).append(f"ключ {name}: {e}")
+    if not names:
+        infos.append("ключей API нет — задать: wshub api key set <провайдер>")
+    if problems:
+        return _check("api", title, "fail", lines + problems, "исправь реестр [api] или права ключа")
+    if not entries and not names:
+        return _check("api", title, "info", lines + infos, "модели по ключу из чата не настроены — это опция")
+    return _check("api", title, "warn" if infos else "ok", lines + infos)
+
+
 def run(ctx: Ctx) -> dict:
     reg_check, reg = check_registry(ctx)
     procs = processes(ctx)
@@ -581,5 +624,6 @@ def main(config: Path, state: Path) -> int:
     res = run(ctx)
     _reg = check_registry(ctx)[1]
     res["checks"].append(check_code(ctx, _reg, hub))  # только в wshub doctor, не на вкладке «Обзор»
+    res["checks"].append(check_api(ctx, _reg))
     print(format_report(res))
     return 1 if any(c["status"] == "fail" for c in res["checks"]) else 0

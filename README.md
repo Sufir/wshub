@@ -87,6 +87,7 @@ curl -LsSf https://raw.githubusercontent.com/Sufir/wshub/main/install.sh | sh
 
 ```bash
 wshub setup --code          # добавить и запись wshub-code (запуск Claude Code из чата)
+wshub setup --api           # добавить и запись wshub-api (модели по API-ключу хаба из чата, docs/api.md)
 wshub update                # обновление; затем перезапуск Desktop из трея
 wshub uninstall             # удалить запись из конфига Desktop
 wshub uninstall --purge     # то же + реестр, журнал и копии файлов

@@ -41,6 +41,12 @@ def _error(msg: str):
     return ApiError(msg)
 
 
+def _paid(msg: str, usage: Usage | None = None, model: str | None = None, preview: str = ""):
+    """Ответ получен (запрос оплачен), но не разобран — ядро запишет стоимость по usage (ТЗ WSH-4.4, п. 2.3а.1)."""
+    from ..core import PaidError
+    return PaidError(msg, usage, model, preview)
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     """Редирект не выполняется: urllib переслал бы x-api-key по новому адресу. 3xx — ошибка HTTP."""
 
@@ -115,6 +121,19 @@ class AnthropicProvider:
         content = data.get("content")
         text = "".join(b.get("text", "") for b in content if isinstance(b, dict) and b.get("type") == "text") \
             if isinstance(content, list) else ""
+        model = str(data.get("model") or request.model or "")
+        u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
+        usage = None
+        try:  # usage — до разбора JSON: оплаченный ответ с битой схемой пишется по нему (ТЗ WSH-4.4, п. 2.3а.1)
+            usage = Usage(input=int(u.get("input_tokens") or 0), output=int(u.get("output_tokens") or 0),
+                          cache_read=int(u.get("cache_read_input_tokens") or 0),
+                          cache_write=int(u.get("cache_creation_input_tokens") or 0),
+                          cache_write_1h=int(cc.get("ephemeral_1h_input_tokens") or 0))
+        except (TypeError, ValueError):
+            pass
+        if usage is None:  # вне except: без цепочки исключений
+            raise _paid("usage ответа не разобран", None, model)
         parsed, broken = None, False
         if request.schema is not None:
             try:
@@ -122,14 +141,8 @@ class AnthropicProvider:
             except ValueError:
                 broken = True
         if broken:  # вне except: без цепочки исключений
-            raise _error(f"ответ не разобран как JSON по схеме: {text[:200]}")
-        u = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-        cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
-        usage = Usage(input=int(u.get("input_tokens") or 0), output=int(u.get("output_tokens") or 0),
-                      cache_read=int(u.get("cache_read_input_tokens") or 0),
-                      cache_write=int(u.get("cache_creation_input_tokens") or 0),
-                      cache_write_1h=int(cc.get("ephemeral_1h_input_tokens") or 0))
-        return Response(text, parsed, usage, str(data.get("model") or request.model or ""), self.name)
+            raise _paid("ответ не разобран как JSON по схеме", usage, model, text[:200])
+        return Response(text, parsed, usage, model, self.name)
 
     def _body(self, request: Request, with_max: bool = True) -> dict:
         body: dict = {"model": request.model,
@@ -188,8 +201,8 @@ class AnthropicProvider:
                 out = json.loads(raw)
             except ValueError:
                 out = None
-            if not isinstance(out, dict):
-                raise _error(f"ответ не JSON-объект: {(raw or b'').decode('utf-8', 'replace')[:200]}")
+            if not isinstance(out, dict):  # HTTP-ответ успешный — запрос мог быть оплачен (ТЗ WSH-4.4, п. 2.3а.1)
+                raise _paid("ответ не JSON-объект", preview=(raw or b"").decode("utf-8", "replace")[:200])
             return out
         raise _error("повтор не удался")  # недостижимо: вторая попытка либо отвечает, либо ошибка
 

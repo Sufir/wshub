@@ -730,30 +730,46 @@ def test_broken_provider_import_breaks_only_api(env, monkeypatch):
     assert "payload" in reg.workspaces and reg.code.error is None
 
 
-def test_api_disabled_and_project_without_api(api, monkeypatch):
+def test_api_disabled_and_project_closed(api, monkeypatch):
+    """Закрывает только явный enabled = false (ТЗ WSH-4.4, п. 2.3б): [api] и проект без секции — включены."""
     prov = use(monkeypatch, fake.FakeProvider())
     set_api(api.env, API.replace("enabled = true", "enabled = false"))
     rc, _, err = api.run(inp="missing.txt")  # отказ до чтения файлов: не «нет файла»
-    assert rc == 1 and "API хаба выключен" in err
-    set_api(api.env, "")
-    assert "API хаба выключен" in api.run(inp="missing.txt")[2]
-    set_api(api.env)
-    rc, _, err = api.run(project="rt", inp="missing.txt")
-    assert rc == 1 and "[workspace.rt.api] enabled = true" in err
+    assert rc == 1 and "API хаба выключен: в реестре [api] enabled = false" in err
     set_api(api.env, ws="[workspace.payload.api]\nenabled = false\n")
-    assert "[workspace.payload.api] enabled = true" in api.run(inp="missing.txt")[2]
+    rc, _, err = api.run(inp="missing.txt")
+    assert rc == 1 and "проект payload закрыт от отправки в API: [workspace.payload.api] enabled = false" in err
     set_api(api.env, ws='[workspace.payload.api]\nenabled = "yes"\n')
     reg = registry.RegistryFile(api.env.cfg).get()
     assert "payload" in reg.api.project_errors and reg.api.error is None
     assert "[workspace.payload.api] с ошибкой" in api.run(inp="missing.txt")[2]
     assert prov.calls == [] and api.rows() == []
+    # без [api] и без секции проекта — проходит (ключ fake есть, секции провайдера нет — умолчания модуля)
+    set_api(api.env, "", ws="")
+    rc, out, err = api.run(project="rt")
+    assert rc == 0, err
+    assert len(prov.calls) == 1 and api.rows()[-1]["project"] == "rt" and api.rows()[-1]["zone"] == "included"
+    assert registry.parse("").api.enabled is True
 
 
-def test_provider_needs_registry_section(api, monkeypatch):
+def test_provider_without_section_needs_key(api, monkeypatch):
+    """Провайдер без своей секции — по годному ключу, умолчания модуля и без зон (ТЗ WSH-4.4, п. 2.3б.1)."""
+    prov = use(monkeypatch, fake.FakeProvider())
     set_api(api.env, API.split("[api.providers.fake]")[0])
+    rc, out, err = api.run()
+    assert rc == 0, err
+    assert "цикл" not in out and len(prov.calls) == 1  # зон нет: секции с included_usd нет
+    _kp(api).unlink()
     rc, _, err = api.run()
-    assert rc == 1 and "нет секции [api.providers.fake]" in err
-    assert api.run(provider="nope")[0] == 1
+    assert rc == 1 and "нет секции [api.providers.fake] в реестре и нет годного ключа (ключа нет:" in err
+    assert len(prov.calls) == 1
+    keys.write(_kp(api), MARKER)
+    os.chmod(_kp(api), 0o644)
+    rc, _, err = api.run()
+    assert rc == 1 and "нет годного ключа (права ключа" in err and MARKER not in err
+    rc, _, err = api.run("--estimate")  # и оценка без секции требует годного ключа
+    assert rc == 1 and "нет годного ключа" in err
+    assert api.run(provider="nope")[0] == 1 and len(prov.calls) == 1
 
 
 # ---------- файлы проекта (п. 4.8) ----------

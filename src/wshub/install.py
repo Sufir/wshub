@@ -45,11 +45,12 @@ ttl_hours = 8      # срок жизни хэндла workspace_open
 """
 
 USAGE = """\
-wshub setup [--yes] [--dry-run] [--code] [--project <путь> --mode ro|rw]
+wshub setup [--yes] [--dry-run] [--code] [--api] [--project <путь> --mode ro|rw]
     подключить wshub к Claude Desktop, создать реестр, первый проект и перевалку; повторный запуск безопасен
       --yes       не задавать вопросов: всё по умолчанию, проект — только из --project
       --dry-run   показать, что изменится, ничего не меняя
       --code      добавить и запись wshub-code (запуск Claude Code из чата)
+      --api       добавить и запись wshub-api (модели по API-ключу хаба из чата)
 wshub uninstall [--purge] [--yes] [--dry-run]
     убрать запись wshub из конфига Desktop (с копией); --purge — ещё реестр и состояние (журнал, копии)
 wshub update
@@ -398,53 +399,59 @@ def setup_desktop(env: Env, ui: UI) -> tuple[bool, list[str]]:
     return ok, changed
 
 
-def code_entry(env: Env) -> dict:
-    """Запись wshub-code: тот же entry_for, к args добавляется «code» (ТЗ WSH-2, п. 2.8.1)."""
+# дополнительные серверы: подкоманда wshub (она же ключ отметки в маркере) → имя записи в Desktop
+SUBS = {"code": "wshub-code", "api": "wshub-api"}
+
+
+def sub_entry(env: Env, sub: str) -> dict:
+    """Запись wshub-code / wshub-api: тот же entry_for, к args добавляется подкоманда (ТЗ WSH-2, п. 2.8.1;
+    ТЗ WSH-4.4, п. 2.1.2)."""
     e = dict(entry_for(env))
-    e["args"] = [*e.get("args", []), "code"]
+    e["args"] = [*e.get("args", []), sub]
     return e
 
 
-def setup_desktop_code(env: Env, ui: UI) -> bool:
-    """Запись wshub-code в те же конфиги Desktop, что и wshub. Добавляется пустой записью после wshub,
+def setup_desktop_sub(env: Env, ui: UI, sub: str) -> bool:
+    """Запись wshub-code или wshub-api в те же конфиги Desktop, что и wshub. Добавляется пустой записью после wshub,
     поэтому uninstall снимает её простым удалением члена и восстанавливает файл побайтово."""
-    ui.step("Claude Desktop: wshub-code")
+    server = SUBS[sub]
+    ui.step(f"Claude Desktop: {server}")
     if not env.exe or (env.distro and not env.win_user):
         ui.note("пропущено: сначала основная запись wshub")
         return False
     targets = desktop_configs(env)
     if not targets:
         return False
-    entry = code_entry(env)
+    entry = sub_entry(env, sub)
     marker = _load_marker(env.state)
     ok = True
     for c in targets:
         path: Path = c["path"]
         try:
             text = _read_text(path)
-            new, action = jsonedit.set_server(text, "wshub-code", entry)
+            new, action = jsonedit.set_server(text, server, entry)
         except (OSError, UnicodeError, jsonedit.ConfigError) as e:
             ok = False
-            ui.note(f"{_show(path, env)}: {e} — запись wshub-code не добавлена")
+            ui.note(f"{_show(path, env)}: {e} — запись {server} не добавлена")
             continue
         if action == "unchanged":
-            ui.note(f"уже настроено (wshub-code): {_show(path, env)}")
+            ui.note(f"уже настроено ({server}): {_show(path, env)}")
             continue
         if ui.dry:
-            ui.done(f"добавлена запись wshub-code: {_show(path, env)}")
+            ui.done(f"добавлена запись {server}: {_show(path, env)}")
             continue
         try:
             _write_bytes(path, new.encode("utf-8"))
         except OSError as e:
             ok = False
-            ui.note(f"{_show(path, env)}: запись wshub-code не удалась ({e.strerror or e})")
+            ui.note(f"{_show(path, env)}: запись {server} не удалась ({e.strerror or e})")
             continue
-        marker.setdefault(str(path), {})["code"] = True
+        marker.setdefault(str(path), {})[sub] = True
         try:
             _save_marker(env.state, marker)
         except OSError:
             pass
-        ui.done(f"добавлена запись wshub-code: {_show(path, env)}")
+        ui.done(f"добавлена запись {server}: {_show(path, env)}")
         ui.note(f"  {entry['command']} {' '.join(entry.get('args', []))}")
     return ok
 
@@ -629,7 +636,7 @@ def _show(path: Path, env: Env) -> str:
     return outbox.win_path(path, env.mnt) or str(path)
 
 
-def setup(env: Env, ui: UI, project: tuple[str, str] | None = None, code: bool = False) -> int:
+def setup(env: Env, ui: UI, project: tuple[str, str] | None = None, code: bool = False, api: bool = False) -> int:
     from .core import Hub
 
     hub = Hub(env.config, env.state)
@@ -639,7 +646,8 @@ def setup(env: Env, ui: UI, project: tuple[str, str] | None = None, code: bool =
     deps = check_deps(env, ui)
     choose_win_user(env, ui)
     d_ok, changed = setup_desktop(env, ui)
-    c_ok = setup_desktop_code(env, ui) if code else True
+    c_ok = setup_desktop_sub(env, ui, "code") if code else True
+    c_ok = (setup_desktop_sub(env, ui, "api") if api else True) and c_ok
     r_ok, name = setup_registry(env, ui, hub, project)
     o_ok = setup_outbox(env, ui, hub)
     if ui.dry:
@@ -676,13 +684,14 @@ def uninstall(env: Env, ui: UI, purge: bool) -> int:
         m = marker.get(str(path)) or {}
         try:
             text = _read_text(path)
-            # wshub-code (если её добавил setup --code) снимаем первой: простое удаление члена,
-            # после него remove_server("wshub") восстанавливает файл, как без --code
-            if m.get("code"):
-                text, _ = jsonedit.remove_server(text, "wshub-code")
+            # wshub-code и wshub-api (если их добавил setup --code / --api) снимаем первыми: простое удаление члена,
+            # после него remove_server("wshub") восстанавливает файл, как без них
+            for sub, server in SUBS.items():
+                if m.get(sub):
+                    text, _ = jsonedit.remove_server(text, server)
             new, removed = jsonedit.remove_server(text, "wshub", m.get("created"), m.get("inner"), m.get("original"))
             data = None if new is None else new.encode("utf-8")
-            removed = removed or m.get("code")
+            removed = removed or any(m.get(sub) for sub in SUBS)
         except (OSError, UnicodeError, jsonedit.ConfigError) as e:
             ok = ok and not c["used"]  # нечитаемый файл, который Desktop не читает, удалению не мешает
             ui.note(f"{_show(path, env)}: {e} — файл не тронут")
@@ -833,7 +842,7 @@ def update(env: Env, ui: UI) -> int:
 # ---------- CLI ----------
 
 def cli(cmd: str, args: list[str], config: Path, state: Path, ask_fn=input, out=print) -> int:
-    flags = {"setup": {"--yes", "--dry-run", "--project", "--mode", "--code"},
+    flags = {"setup": {"--yes", "--dry-run", "--project", "--mode", "--code", "--api"},
              "uninstall": {"--yes", "--dry-run", "--purge"}, "update": set()}[cmd]
     opts: dict[str, str | bool] = {}
     i = 0
@@ -869,7 +878,7 @@ def cli(cmd: str, args: list[str], config: Path, state: Path, ask_fn=input, out=
     ui = UI(interactive=interactive, dry=dry, ask_fn=ask_fn, out=out)
     try:
         if cmd == "setup":
-            return setup(env, ui, project, code=bool(opts.get("--code")))
+            return setup(env, ui, project, code=bool(opts.get("--code")), api=bool(opts.get("--api")))
         if cmd == "uninstall":
             return uninstall(env, ui, purge=bool(opts.get("--purge")))
         return update(env, ui)

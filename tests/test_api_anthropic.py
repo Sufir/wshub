@@ -2,6 +2,7 @@
 заголовки запроса, разбор ответа, цены, count_tokens, ошибки и повтор 429/529, ключ не утекает; CLI на нём."""
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import time
@@ -387,3 +388,93 @@ def test_model_outside_tiers_needs_operator_choice(api):
     n = len(api.srv.seen)
     rc, _, err_ = api.run("--model", "claude-haiku-4-5", "--choice", "operator", tier=None, provider="anthropic")
     assert rc == 1 and "цена модели claude-haiku-4-5" in err_ and len(api.srv.seen) == n  # до count_tokens
+
+
+# ---------- хвосты 4.3 (ТЗ WSH-4.4, п. 2.3а) ----------
+
+def test_broken_json_paid_by_usage(api):
+    """Битый JSON при схеме: запрос оплачен — строка журнала по usage ответа, а не $0 (п. 2.3а.1)."""
+    (api.env.proj / "s.json").write_text('{"type": "object"}', encoding="utf-8")
+    api.srv.reply(body={"input_tokens": 10})
+    api.srv.reply(body=msg("не JSON вовсе"))
+    rc, _, err_ = api.run("--schema", "s.json", provider="anthropic")
+    assert rc == 1 and "ответ не разобран как JSON по схеме: не JSON вовсе" in err_
+    row = api.rows()[-1]
+    assert row["ok"] is False and row["model"] == HAIKU
+    assert row["cost_usd"] == pytest.approx((16 * 0.10 + 5 * 0.50 + 2018 * 0.125) / 1e6)
+    assert row["usage"] == {"input": 16, "output": 5, "cache_read": 0, "cache_write": 2018, "cache_write_1h": 0}
+
+
+def test_non_json_200_paid_by_estimate(api):
+    """Успешный HTTP-ответ, но не JSON-объект: usage нет — в журнал оценка до запроса (п. 2.3а.1)."""
+    api.srv.reply(body={"input_tokens": 10})
+    api.srv.reply(body=b"<html>oops</html>")
+    rc, _, err_ = api.run(provider="anthropic")
+    assert rc == 1 and "ответ не JSON-объект: <html>oops</html>" in err_
+    row = api.rows()[-1]
+    assert row["ok"] is False and row["cost_usd"] == pytest.approx((10 * 0.10 + 1024 * 0.50) / 1e6)
+    api.srv.reply(body={"input_tokens": 10})
+    api.srv.reply(body=msg(usage={"input_tokens": "много", "output_tokens": 5}))  # usage не разобран
+    rc, _, err_ = api.run(provider="anthropic")
+    assert rc == 1 and "usage ответа не разобран" in err_
+    assert api.rows()[-1]["cost_usd"] == pytest.approx((10 * 0.10 + 1024 * 0.50) / 1e6)
+
+
+def test_estimate_cache_write_prices(api):
+    """П. 2.3а.2 на цифрах Haiku: system «s»×400 — 100 токенов по цене записи кэша (5 мин — 0.125, 1 ч — 0.20)."""
+    eng = api.engine()
+
+    def plan(cache):
+        return eng.plan(Request("s" * 400, ({"role": "user", "text": "привет"},), "payload", tier="cheap",
+                                cache=cache), "anthropic")
+    api.srv.reply(body={"input_tokens": 500})  # с ключом — точный вход из count_tokens
+    p = plan("short")
+    assert (p.estimate.input, p.estimate.cache_write, p.estimate.cache_write_1h) == (400, 100, 0)
+    assert p.estimate_usd == pytest.approx((400 * 0.10 + 100 * 0.125 + 1024 * 0.50) / 1e6)
+    keys.key_path(api.env.cfg.parent, "anthropic").unlink()  # без ключа — грубо: 407 символов ≈ 102 токена
+    p = plan("long")
+    assert (p.estimate.input, p.estimate.cache_write, p.estimate.cache_write_1h) == (2, 100, 100)
+    assert p.estimate_usd == pytest.approx((2 * 0.10 + 100 * 0.20 + 1024 * 0.50) / 1e6)
+    p = plan("none")
+    assert p.estimate_usd == pytest.approx((102 * 0.10 + 1024 * 0.50) / 1e6)
+
+
+# ---------- без настроек реестра (ТЗ WSH-4.4, п. 2.3б) ----------
+
+def test_no_registry_settings_reaches_http(api, monkeypatch):
+    """Реестр без [api] и [api.providers.*], ключ anthropic: CLI run и api_run проходят до HTTP (п. 2.3б.4).
+    Секции с base_url нет — адрес провайдера по умолчанию подменён на локальный сервер."""
+    from wshub import api_server
+    monkeypatch.setattr(PROVIDERS["anthropic"], "BASE_URL", api.srv.url)
+    set_api(api.env, "", ws="")
+    keys.key_path(api.env.cfg.parent, "fake").unlink()  # единственный доступный провайдер — anthropic
+    api.srv.reply(body={"input_tokens": 12})
+    api.srv.reply(body=msg("Ок из CLI"))
+    rc, out, err_ = api.run(provider="anthropic")
+    assert rc == 0, err_
+    assert out.splitlines()[0] == "Ок из CLI" and "цикл" not in out
+    assert [p for p, _h, _b in api.srv.seen] == ["/v1/messages/count_tokens", "/v1/messages"]
+    assert (api.rows()[-1]["provider"], api.rows()[-1]["zone"]) == ("anthropic", "included")
+    mcp = api_server.build_api_server(api.env.hub, now=lambda: api.t)
+
+    def call(name, **args):
+        res = asyncio.run(mcp.call_tool(name, args))
+        return (res[0] if isinstance(res, tuple) else res)[0].text
+    api.srv.reply(body={"input_tokens": 12})
+    api.srv.reply(body=msg("Ок из чата"))
+    out = call("api_run", project="payload", input_file="q.txt", tier="cheap")  # provider по умолчанию
+    assert out.startswith("Ок из чата\nAPI: claude-haiku-5-5"), out
+    assert len(api.srv.seen) == 4 and api.srv.seen[-1][1]["x-api-key"] == MARKER
+    assert [p["provider"] for p in json.loads(call("api_models"))["providers"]] == ["anthropic"]
+    n = len(api.srv.seen)
+    set_api(api.env, "", ws="[workspace.payload.api]\nenabled = false\n")  # проект закрыт — отказ до HTTP
+    assert "закрыт от отправки в API" in call("api_run", project="payload", input_file="q.txt", tier="cheap")
+    assert "закрыт от отправки в API" in api.run(provider="anthropic")[2]
+    set_api(api.env, "[api]\nenabled = false\n", ws="")
+    assert "API хаба выключен" in api.run(provider="anthropic")[2]
+    set_api(api.env, "", ws="")
+    keys.key_path(api.env.cfg.parent, "anthropic").unlink()
+    rc, _, err_ = api.run(provider="anthropic")
+    assert rc == 1 and "нет секции [api.providers.anthropic] в реестре и нет годного ключа" in err_
+    assert "провайдеров нет" in call("api_run", project="payload", input_file="q.txt", tier="cheap")
+    assert len(api.srv.seen) == n

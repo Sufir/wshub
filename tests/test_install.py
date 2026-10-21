@@ -233,6 +233,29 @@ def test_setup_code_adds_and_uninstall_restores(machine):
     assert m.msix.read_text(encoding="utf-8") == before
 
 
+def test_setup_api_adds_and_uninstall_restores(machine):
+    """setup --api добавляет запись wshub-api (ТЗ WSH-4.4, п. 2.1.2); с --code — обе; uninstall снимает все и
+    возвращает конфиг побайтово."""
+    m = machine
+    before = DESKTOP_CONFIG
+    r = m.wshub("setup", "--yes", "--api", "--project", str(m.project), "--mode", "rw")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert "добавлена запись wshub-api" in r.stdout and "wshub-code" not in r.stdout
+    servers = json.loads(m.msix.read_text(encoding="utf-8"))["mcpServers"]
+    assert servers["wshub-api"] == {"command": "wsl.exe", "args": ["-d", "Ubuntu-test", "--", str(m.exe), "api"]}
+    assert "wshub-code" not in servers and "git" in servers
+    r2 = m.wshub("setup", "--yes", "--api", "--project", str(m.project), "--mode", "rw")
+    assert r2.returncode == 0 and "уже настроено (wshub-api)" in r2.stdout
+    r3 = m.wshub("setup", "--yes", "--code", "--api", "--project", str(m.project), "--mode", "rw")
+    assert r3.returncode == 0 and "добавлена запись wshub-code" in r3.stdout
+    servers = json.loads(m.msix.read_text(encoding="utf-8"))["mcpServers"]
+    assert {"wshub", "wshub-code", "wshub-api", "git"} <= set(servers)
+    u = m.wshub("uninstall", "--yes")
+    assert u.returncode == 0, u.stdout + u.stderr
+    assert m.msix.read_text(encoding="utf-8") == before
+    assert "--api" in m.wshub("setup", "--help").stdout
+
+
 def test_setup_without_code_leaves_no_code_entry(machine):
     m = machine
     m.wshub("setup", "--yes", "--project", str(m.project), "--mode", "rw")

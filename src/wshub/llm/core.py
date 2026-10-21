@@ -9,13 +9,26 @@ from pathlib import Path
 
 from ..registry import ApiProvider, Registry
 from . import keys, ledger
-from .provider import Provider
+from .provider import Provider, rough_tokens
 from .providers import PROVIDERS
 from .types import TIERS, Request, Response, Usage
 
 
 class ApiError(Exception):
     pass
+
+
+class PaidError(ApiError):
+    """HTTP-ответ получен (запрос оплачен), но не разобран: битый JSON по схеме, не JSON-объект, usage. Ядро пишет
+    в журнал стоимость по usage, а без него — оценку до запроса (ТЗ WSH-4.4, п. 2.3а.1). preview — начало ответа:
+    в тексте исключения есть, в журнал вызовов сервера не идёт (там msg)."""
+
+    def __init__(self, msg: str, usage: Usage | None = None, model: str | None = None, preview: str = ""):
+        super().__init__(msg)
+        self.msg, self.usage, self.model, self.preview = msg, usage, model, preview
+
+    def __str__(self) -> str:
+        return f"{self.msg}: {self.preview}" if self.preview else self.msg
 
 
 def now_local() -> datetime:
@@ -46,6 +59,17 @@ def ddmm(d) -> str:
     return d.strftime("%d.%m") if d else "—"
 
 
+def _cache_split(inp: Usage, req: Request) -> Usage:
+    """Оценка с записью в кэш (ТЗ WSH-4.4, п. 2.3а.2): при cache = short | long системная часть входа идёт в
+    cache_write (long — ещё и в cache_write_1h) и оценивается по цене записи. Её размер — грубо, символы / 4, не больше
+    всего входа (решение Р2)."""
+    if req.cache == "none" or not req.system:
+        return inp
+    w = min(rough_tokens(req.system), inp.input)
+    return replace(inp, input=inp.input - w, cache_write=inp.cache_write + w,
+                   cache_write_1h=inp.cache_write_1h + (w if req.cache == "long" else 0))
+
+
 @dataclass(frozen=True)
 class Plan:
     """Проверенный запрос до отправки: модель выбрана, цена оценена, зона определена."""
@@ -58,6 +82,8 @@ class Plan:
     zones: ledger.Zones | None  # None — зоны не проверяются (оператор их не задал, ledger.zones_set)
     skipped: int  # нечитаемых строк журнала
     rough: bool = False  # вход оценён грубо (символы / 4): нет ключа или нет count_tokens
+    strong: bool = False  # сильная модель (по уровню или по модели) — сервер требует reason (ТЗ WSH-4.4, Р1)
+    off_tier: bool = False  # модель вне уровней провайдера (с учётом переопределений)
 
 
 class Api:
@@ -72,27 +98,51 @@ class Api:
             raise ApiError(f"секция [api] в реестре с ошибкой: {self.reg.api.error}")
 
     def gate(self, project: str) -> None:
-        """Барьеры реестра — до чтения файлов проекта."""
+        """Барьеры реестра — до чтения файлов проекта. API и проект включены по умолчанию, закрывает их только явный
+        enabled = false (ТЗ WSH-4.4, п. 2.3б)."""
         api = self.reg.api
         self.check_section()
         if not api.enabled:
-            raise ApiError("API хаба выключен: в реестре [api] enabled = false (или секции [api] нет)")
+            raise ApiError("API хаба выключен: в реестре [api] enabled = false")
         if project not in self.reg.workspaces:
             raise ApiError(f"проекта {project} нет в реестре")
         if project in api.project_errors:
             raise ApiError(f"[workspace.{project}.api] с ошибкой: {api.project_errors[project]}")
-        if not api.projects.get(project, False):
-            raise ApiError(f"проект {project} в API не отправляется: нужен [workspace.{project}.api] enabled = true")
+        if not api.projects.get(project, True):
+            raise ApiError(f"проект {project} закрыт от отправки в API: [workspace.{project}.api] enabled = false")
+
+    def key_problem(self, name: str) -> str | None:
+        """Почему ключа провайдера нет или он негоден; None — ключ есть и права верны. Значение отбрасывается."""
+        try:
+            keys.read(keys.key_path(self.config_dir, name))
+        except keys.KeyProblem as e:
+            return str(e)
+        return None
 
     def provider(self, name: str) -> tuple[Provider, ApiProvider]:
+        """Провайдер из словаря. Без секции [api.providers.<имя>] — умолчания модуля и без зон, но только при годном
+        ключе (ТЗ WSH-4.4, п. 2.3б.1); секция нужна лишь для переопределений."""
         self.check_section()
         mod = PROVIDERS.get(name)
         if mod is None:
             raise ApiError(f"неизвестный провайдер {name}; есть: {', '.join(PROVIDERS)}")
         conf = self.reg.api.providers.get(name)
         if conf is None:
-            raise ApiError(f"провайдер {name} не настроен: нет секции [api.providers.{name}] в реестре")
+            bad = self.key_problem(name)
+            if bad:
+                raise ApiError(f"провайдер {name}: нет секции [api.providers.{name}] в реестре и нет годного ключа "
+                               f"({bad})")
+            conf = ApiProvider()
         return mod.create(conf), conf
+
+    def available(self) -> dict[str, ApiProvider]:
+        """Доступные провайдеры: с секцией в реестре — и провайдеры словаря без секции, но с годным ключом."""
+        self.check_section()
+        out = dict(self.reg.api.providers)
+        for name in PROVIDERS:
+            if name not in out and self.key_problem(name) is None:
+                out[name] = ApiProvider()
+        return out
 
     def read_ledger(self) -> ledger.Ledger:
         try:
@@ -142,12 +192,13 @@ class Api:
         except KeyError:
             raise ApiError(f"цена модели {model} у провайдера {name} неизвестна — запрос не отправлен") from None
         inp, rough = self._estimate(name, prov, req)
-        est = replace(inp, output=req.max_tokens)
+        est = replace(_cache_split(inp, req), output=req.max_tokens)
         est_usd = prov.price(model, est)
         led = self.read_ledger()
         z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
         zone, refusal = self._zone(name, est_usd, z, led)
-        return Plan(prov, req, est, est_usd, zone, refusal, z, led.skipped, rough)
+        return Plan(prov, req, est, est_usd, zone, refusal, z, led.skipped, rough, strong=strong,
+                    off_tier=model not in tiers.values())
 
     def _estimate(self, name: str, prov: Provider, req: Request) -> tuple[Usage, bool]:
         """Оценка входа (ТЗ WSH-4.3, п. 2.1.4): при count_tokens и ключе — точная, ключ передаётся провайдеру;
@@ -252,12 +303,24 @@ class Api:
             raise ApiError(str(e)) from None
         rec = {"ts": ledger.stamp(self.now()), "kind": "run", "provider": name, "model": req.model,
                "tier": req.tier, "project": req.project, "template": req.template, "zone": zone}
-        error = None
+        error, paid = None, None
         try:
             resp = plan.provider.run(req, key)
+        except PaidError as e:  # ответ получен и оплачен, но не разобран (ТЗ WSH-4.4, п. 2.3а.1)
+            error = scrub(f"{type(e).__name__}: {e}", key)
+            paid = (e.usage, e.model or req.model, scrub(f"{type(e).__name__}: {e.msg}", key), scrub(e.preview, key))
         except Exception as e:  # любой сбой провайдера — в журнал и в понятный отказ
             error = scrub(f"{type(e).__name__}: {e}", key)
         del key
+        if paid is not None:  # стоимость — по usage ответа; usage нет или модель вне таблицы — оценка до запроса
+            usage, model, msg, preview = paid
+            try:
+                cost = plan.provider.price(model, usage) if usage is not None else plan.estimate_usd
+            except KeyError:
+                cost = plan.estimate_usd
+            ledger.append(self.ledger_path, {**rec, "model": model, "usage": (usage or Usage()).as_dict(),
+                                             "cost_usd": cost, "ok": False, "error": error})
+            raise PaidError(f"провайдер {name}: {msg}", preview=preview)
         if error is not None:  # исключение поднимаем вне except: без __context__ с исходным текстом
             ledger.append(self.ledger_path, {**rec, "usage": Usage().as_dict(), "cost_usd": 0.0, "ok": False,
                                              "error": error})

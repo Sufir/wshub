@@ -218,15 +218,16 @@ class ApiProvider:
 @dataclass(frozen=True)
 class Api:
     """[api] и [workspace.<имя>.api]. Ошибка в них не ломает реестр: отказывает только API хаба
-    (error — для всех проектов, project_errors — для одного). Потолки — только если заданы (ТЗ WSH-4.3, п. 2.2.2)."""
+    (error — для всех проектов, project_errors — для одного). Потолки — только если заданы (ТЗ WSH-4.3, п. 2.2.2).
+    API и проекты включены по умолчанию: закрывает только явный enabled = false (ТЗ WSH-4.4, п. 2.3б)."""
     present: bool = False
-    enabled: bool = False
+    enabled: bool = True
     max_usd_per_call: float | None = None
     daily_usd: float | None = None
     daily_set: bool = False  # daily_usd записан в реестре: только тогда его проверяют задачи Code (ТЗ WSH-4.6, 5.2)
     providers: dict[str, ApiProvider] = field(default_factory=dict)
     error: str | None = None
-    projects: dict[str, bool] = field(default_factory=dict)  # [workspace.<имя>.api] enabled
+    projects: dict[str, bool] = field(default_factory=dict)  # [workspace.<имя>.api] enabled; нет секции — true
     project_errors: dict[str, str] = field(default_factory=dict)
 
 
@@ -691,11 +692,11 @@ def _api(t, warnings: list[str]) -> Api:
 
 
 def _ws_api(name: str, t, warnings: list[str]) -> bool:
-    """[workspace.<имя>.api]: можно ли отправлять файлы проекта в API; по умолчанию — нет."""
+    """[workspace.<имя>.api]: можно ли отправлять файлы проекта в API; по умолчанию — да (ТЗ WSH-4.4, п. 2.3б.3)."""
     where = f"[workspace.{name}.api]"
     t = _table(t, where)
     warnings += [unknown_key(f"workspace.{name}.api.{k}") for k in t if k not in WS_API_KEYS]
-    v = t.get("enabled", False)
+    v = t.get("enabled", True)
     if not isinstance(v, bool):
         raise RegistryError(f"{where} enabled: true или false")
     return v

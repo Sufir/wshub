@@ -68,9 +68,11 @@ def no_read(monkeypatch):
 
 # ---------- инструменты (п. 2.2, тест 1) ----------
 
-def test_registers_exactly_4_tools(srv):
-    assert {t.name for t in asyncio.run(srv.mcp.list_tools())} == {"api_models", "api_run", "api_estimate",
-                                                                   "api_stats"}
+def test_registers_exactly_8_tools(srv):
+    """4 инструмента 4.4 и 4 пакетных (ТЗ WSH-4.5, п. 2.3)."""
+    assert {t.name for t in asyncio.run(srv.mcp.list_tools())} == {
+        "api_models", "api_run", "api_estimate", "api_stats",
+        "api_batch_submit", "api_batch_status", "api_batch_results", "api_batch_cancel"}
 
 
 def test_run_text_file_schema(srv, monkeypatch):

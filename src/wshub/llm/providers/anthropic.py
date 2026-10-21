@@ -1,11 +1,13 @@
 """Провайдер anthropic — Claude API (ТЗ WSH-4.3): POST /v1/messages и /v1/messages/count_tokens через urllib, цены по
-таблице, кэш, effort, схема ответа. Ключ — только в заголовке x-api-key: ни он, ни заголовки запроса не попадают в
-тексты исключений; из заголовков ответа берётся только request-id — в текст ошибки, для поддержки. Ключ
+таблице, кэш, effort, схема ответа; пакеты /v1/messages/batches (ТЗ WSH-4.5). Ключ — только в заголовке x-api-key:
+ни он, ни заголовки запроса не попадают в тексты исключений; из заголовков ответа берётся только request-id — в текст
+ошибки, для поддержки. Ключ
 ~/.config/wshub/keys/anthropic берут и задачи wshub-code на ключе (ТЗ WSH-4.6)."""
 from __future__ import annotations
 
 import http.client
 import json
+import re
 import ssl
 import time
 import urllib.error
@@ -13,7 +15,7 @@ import urllib.parse
 import urllib.request
 
 from ..provider import prompt_text, rough_tokens
-from ..types import Request, Response, Usage
+from ..types import BatchItem, Request, Response, Usage
 
 # id моделей — из ответа /v1/models (PoC WSH-4.0, api/models.json)
 MODELS = {"cheap": "claude-haiku-5-5", "standard": "claude-sonnet-5-5", "strong": "claude-opus-5-5"}
@@ -34,6 +36,8 @@ RETRY = (429, 529)  # один повтор после retry-after
 RETRY_MAX_S = 60
 RETRY_DEFAULT_S = 1  # retry-after нет или он не число секунд
 CACHE_CONTROL = {"none": None, "short": {"type": "ephemeral"}, "long": {"type": "ephemeral", "ttl": "1h"}}
+BATCHES = "/v1/messages/batches"
+BATCH_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")  # id пакета идёт в путь запроса и в имя файла учёта
 
 
 def _error(msg: str):
@@ -84,7 +88,7 @@ def _http_error(e: urllib.error.HTTPError) -> str:
 
 class AnthropicProvider:
     name = "anthropic"
-    caps = frozenset({"cache", "schema", "count_tokens", "effort"})  # batch — задача WSH-4.5
+    caps = frozenset({"batch", "cache", "schema", "count_tokens", "effort"})
 
     def __init__(self, base_url: str = BASE_URL, timeout_s: int = TIMEOUT_S):
         self.base_url = base_url.rstrip("/")
@@ -117,12 +121,16 @@ class AnthropicProvider:
         return Usage(input=n)
 
     def run(self, request: Request, key: str) -> Response:
-        data = self._post("/v1/messages", self._body(request), key)
+        return self._message(self._post("/v1/messages", self._body(request), key), request)
+
+    def _message(self, data: dict, request: Request | None) -> Response:
+        """Ответ messages → Response; общий разбор run и результатов пакета (там request = None: модель — из ответа,
+        схему разбирает ядро по учёту пакета)."""
         content = data.get("content")
         # текстовый блок без строки text — пропускается: ошибка разбора не должна обнулить оплаченный запрос
         text = "".join(b["text"] for b in content if isinstance(b, dict) and b.get("type") == "text"
                        and isinstance(b.get("text"), str)) if isinstance(content, list) else ""
-        model = str(data.get("model") or request.model or "")
+        model = str(data.get("model") or (request.model if request else None) or "")
         raw_usage = data.get("usage")
         u = raw_usage if isinstance(raw_usage, dict) else {}
         cc = u.get("cache_creation") if isinstance(u.get("cache_creation"), dict) else {}
@@ -137,7 +145,7 @@ class AnthropicProvider:
         if bad_usage:  # вне except: без цепочки исключений
             raise _paid("usage ответа не разобран", None, model)
         parsed, broken = None, False
-        if request.schema is not None:
+        if request is not None and request.schema is not None:
             try:
                 parsed = json.loads(text)
             except ValueError:
@@ -146,6 +154,73 @@ class AnthropicProvider:
             raise _paid("ответ не разобран как JSON по схеме", usage if isinstance(raw_usage, dict) else None, model,
                         text[:200])
         return Response(text, parsed, usage, model, self.name)
+
+    # ---------- пакеты (ТЗ WSH-4.5; PoC WSH-4.0, п. 3.5.6) ----------
+
+    def batch_submit(self, requests: list[tuple[str, Request]], key: str) -> str:
+        body = {"requests": [{"custom_id": cid, "params": self._body(r)} for cid, r in requests]}
+        data = self._post(BATCHES, body, key, paid=False)  # создание пакета не оплачивается
+        bid = data.get("id")
+        if not isinstance(bid, str) or not BATCH_ID.fullmatch(bid):
+            raise _error("пакет: в ответе нет id")
+        return bid
+
+    def batch_status(self, batch_id: str, key: str) -> dict:
+        return self._batch_state(self._json("GET", self._batch_path(batch_id), None, key, paid=False))
+
+    def batch_cancel(self, batch_id: str, key: str) -> dict:
+        return self._batch_state(self._post(self._batch_path(batch_id) + "/cancel", None, key, paid=False))
+
+    def batch_results(self, batch_id: str, key: str):
+        """JSONL по адресу от base_url, а не по results_url ответа: ключ не уходит на чужой адрес. Порядок строк —
+        как у провайдера (не как у запросов)."""
+        raw = self._request("GET", self._batch_path(batch_id) + "/results", None, key)
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                row = None
+            if not isinstance(row, dict) or not isinstance(row.get("custom_id"), str):
+                raise _error("результаты пакета: строка без custom_id")
+            yield self._batch_item(row["custom_id"], row.get("result"))
+
+    def _batch_item(self, cid: str, result) -> BatchItem:
+        result = result if isinstance(result, dict) else {}
+        kind = result.get("type")
+        if kind == "succeeded" and isinstance(result.get("message"), dict):
+            from ..core import PaidError
+            error = None
+            try:
+                resp = self._message(result["message"], None)
+            except PaidError as e:  # usage не разобран: оплачен, ядро возьмёт оценку запроса
+                error = (e.msg, e.model)
+            if error is not None:
+                return BatchItem(cid, None, error[0], error[1] or "?")
+            return BatchItem(cid, resp)
+        if kind == "errored":
+            err = result.get("error")
+            err = err.get("error", err) if isinstance(err, dict) else {}
+            err = err if isinstance(err, dict) else {}
+            return BatchItem(cid, None, f"errored {err.get('type', '')}: {str(err.get('message', ''))[:500]}")
+        if kind in ("canceled", "expired"):  # не выполнен и не оплачен
+            return BatchItem(cid, None, kind)
+        return BatchItem(cid, None, f"результат не разобран: {str(kind)[:40]}")
+
+    @staticmethod
+    def _batch_path(batch_id: str) -> str:
+        if not BATCH_ID.fullmatch(batch_id):  # id идёт в путь запроса
+            raise _error(f"неверный id пакета: {batch_id[:80]!r}")
+        return f"{BATCHES}/{batch_id}"
+
+    @staticmethod
+    def _batch_state(data: dict) -> dict:
+        counts = data.get("request_counts")
+        counts = {k: v for k, v in counts.items() if isinstance(v, int)} if isinstance(counts, dict) else {}
+        status = data.get("processing_status")
+        return {"status": status if isinstance(status, str) else "?", "counts": counts,
+                "ended_at": data.get("ended_at"), "expires_at": data.get("expires_at")}
 
     def _body(self, request: Request, with_max: bool = True) -> dict:
         body: dict = {"model": request.model,
@@ -168,15 +243,34 @@ class AnthropicProvider:
             body["output_config"] = oc
         return body
 
-    def _post(self, path: str, body: dict, key: str, paid: bool = True) -> dict:
-        """POST с ключом в заголовке. 429 и 529 — один повтор после retry-after (не больше 60 с), остальное — без
-        повторов. Ошибка — ApiError без ключа и заголовков запроса; поднимается вне except (без цепочки). paid —
-        запрос платный (messages): успешный ответ, который не JSON-объект, — PaidError."""
-        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    def _post(self, path: str, body: dict | None, key: str, paid: bool = True) -> dict:
+        return self._json("POST", path, body, key, paid)
+
+    def _json(self, method: str, path: str, body: dict | None, key: str, paid: bool) -> dict:
+        """Запрос с ответом — JSON-объектом. paid — запрос платный (messages): успешный ответ, который не JSON-объект,
+        — PaidError."""
+        raw = self._request(method, path, body, key)
+        try:
+            out = json.loads(raw)
+        except ValueError:
+            out = None
+        if not isinstance(out, dict):
+            head = (raw or b"").decode("utf-8", "replace")[:200]
+            if paid:  # HTTP-ответ messages успешный — запрос мог быть оплачен (ТЗ WSH-4.4, п. 2.3а.1)
+                raise _paid("ответ не JSON-объект", preview=head)
+            raise _error(f"ответ не JSON-объект: {head}")  # count_tokens бесплатен — обычный отказ, как в 4.3
+        return out
+
+    def _request(self, method: str, path: str, body: dict | None, key: str) -> bytes:
+        """Запрос с ключом в заголовке; ответ — сырые байты. 429 и 529 — один повтор после retry-after (не больше
+        60 с), остальное — без повторов. Ошибка — ApiError без ключа и заголовков запроса; поднимается вне except
+        (без цепочки)."""
+        data = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {"x-api-key": key, "anthropic-version": API_VERSION}
+        if data is not None:
+            headers["content-type"] = "application/json"
         for attempt in (1, 2):
-            req = urllib.request.Request(self.base_url + path, data=data, method="POST",
-                                         headers={"x-api-key": key, "anthropic-version": API_VERSION,
-                                                  "content-type": "application/json"})
+            req = urllib.request.Request(self.base_url + path, data=data, method=method, headers=headers)
             error, wait, raw = None, None, None
             try:
                 with self._opener.open(req, timeout=self.timeout_s) as r:
@@ -201,16 +295,7 @@ class AnthropicProvider:
             if wait is not None:
                 self._sleep(wait)
                 continue
-            try:
-                out = json.loads(raw)
-            except ValueError:
-                out = None
-            if not isinstance(out, dict):
-                head = (raw or b"").decode("utf-8", "replace")[:200]
-                if paid:  # HTTP-ответ messages успешный — запрос мог быть оплачен (ТЗ WSH-4.4, п. 2.3а.1)
-                    raise _paid("ответ не JSON-объект", preview=head)
-                raise _error(f"ответ не JSON-объект: {head}")  # count_tokens бесплатен — обычный отказ, как в 4.3
-            return out
+            return raw or b""
         raise _error("повтор не удался")  # недостижимо: вторая попытка либо отвечает, либо ошибка
 
 

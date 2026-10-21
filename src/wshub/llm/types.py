@@ -43,3 +43,14 @@ class Response:
     provider: str
     cost_usd: float = 0.0  # оценка хаба по таблице цен провайдера
     raw_ref: str | None = None  # путь к сырому ответу в каталоге состояния
+
+
+@dataclass(frozen=True)
+class BatchItem:
+    """Результат одного запроса пакета (ТЗ WSH-4.5): ответ — или ошибка. data ответа — None: схему разбирает ядро
+    по учёту пакета. model при ошибке — ответ получен (оплачен), но не разобран (usage): ядро считает его по оценке
+    запроса; None — результат не оплачен (errored, canceled, expired)."""
+    custom_id: str
+    response: Response | None
+    error: str | None = None
+    model: str | None = None

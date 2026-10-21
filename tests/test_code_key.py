@@ -555,7 +555,8 @@ def test_anthropic_provider(code):
     """Провайдер рабочий с WSH-4.3 (запросы — tests/test_api_anthropic.py): caps, уровни, оценка без ключа — грубо."""
     mod = PROVIDERS["anthropic"]
     prov = mod.create(None)
-    assert (prov.name, prov.caps) == ("anthropic", frozenset({"cache", "schema", "count_tokens", "effort"}))
+    assert (prov.name, prov.caps) == ("anthropic", frozenset({"batch", "cache", "schema", "count_tokens",
+                                                              "effort"}))  # batch — ТЗ WSH-4.5
     assert prov.models() == {"cheap": "claude-haiku-5-5", "standard": "claude-sonnet-5-5",
                              "strong": "claude-opus-5-5"}
     _registry(code, api=API.replace("[api]\n", "[api]\nenabled = true\n") + "[workspace.proj.api]\nenabled = true\n")

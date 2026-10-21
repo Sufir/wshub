@@ -27,6 +27,7 @@
 | `price(model, usage)` | оценка в USD по таблице провайдера; неизвестная модель — `KeyError` |
 | `estimate(request, key=None)` | оценка входа: точная при `count_tokens` (ядро передаёт ключ, если он есть), иначе символы / 4 |
 | `run(request, key)` | один запрос; модель уже выбрана ядром |
+| `batch_submit` / `batch_status` / `batch_results` / `batch_cancel` | пакеты (только при `batch` в `caps`), раздел «Пакеты» |
 
 Запрос и ответ — нейтральные типы `Request`, `Usage`, `Response` (`llm/types.py`): провайдер сводит к ним свои поля.
 Чего у провайдера нет в `caps` (схема ответа, effort, кэш), ядро отклоняет до запроса.
@@ -48,7 +49,7 @@ Claude API напрямую: `POST https://api.anthropic.com/v1/messages`, за�
 
 - **Уровни:** `cheap` — `claude-haiku-5-5`, `standard` — `claude-sonnet-5-5`, `strong` — `claude-opus-5-5`;
   переопределяются `models` в `[api.providers.anthropic]`.
-- **`caps`:** `cache`, `schema`, `count_tokens`, `effort`. Пакетных запросов (`batch`) пока нет.
+- **`caps`:** `batch`, `cache`, `schema`, `count_tokens`, `effort`. Пакеты — раздел «Пакеты».
 - **Кэш:** `system` уходит одним блоком; подсказка `cache` запроса: `none` — без `cache_control`, `short` —
   `{"type": "ephemeral"}` (5 минут), `long` — `{"type": "ephemeral", "ttl": "1h"}`. Пустой `system` не отправляется.
 - **Схема ответа:** `--schema` → `output_config.format = {"type": "json_schema", "schema": …}`; ответ — JSON в
@@ -188,6 +189,7 @@ wshub api key set <провайдер>
 wshub api key check <провайдер>
 wshub api run --provider P --project X (--tier T | --model M) [--system FILE] --input FILE [--schema FILE]
               [--max-tokens N] [--effort E] [--choice operator] [--estimate] [--out FILE]
+wshub api batch submit|status|results|cancel …     # раздел «Пакеты»
 wshub api stats [--days N]
 wshub api credits <провайдер> --left USD --until ДД.ММ[.ГГГГ]
 wshub api allow <провайдер> --usd USD --until ДД.ММ[.ГГГГ]
@@ -229,6 +231,10 @@ Desktop, `[api]`, закрытые проекты, ключи провайдер
 | `api_run(project, …)` | один запрос; ответ — текст или JSON по схеме, строка `API: …`, предупреждения |
 | `api_estimate(project, …)` | те же входы, что у `api_run` (без `out_file`), — оценка без запроса к модели |
 | `api_stats(days=None)` | как `wshub api stats` |
+| `api_batch_submit(project, …)` | пакет запросов, раздел «Пакеты» |
+| `api_batch_status(id="")` | состояние пакета; без `id` — список |
+| `api_batch_results(id)` | ответы законченного пакета — файлами; в чат — сводка и пути |
+| `api_batch_cancel(id)` | отмена пакета |
 
 Параметры `api_run`:
 
@@ -269,6 +275,71 @@ api_run(project="payload", input_file="data/review-17.txt", schema={"type": "obj
 
 `api_estimate` пишет вход целиком; при `cache = short | long` в скобках — его часть, оцененная по цене записи в кэш:
 `вход ≈102 (запись в кэш 100)`.
+
+## Пакеты
+
+Batch API провайдера (`caps` `batch`; сейчас — `anthropic`): много запросов одним пакетом **вдвое дешевле** — −50 % ко
+входу и выходу (pricing, 2026-10-20). Скидку к записи и чтению кэша хаб тоже считает −50 % — это допущение PoC WSH-4.0,
+отдельно не сверено. Расплата — время: пакет обрабатывается **до 24 ч** (в PoC три коротких запроса — 4 минуты).
+
+**Когда выгодно:** много однотипных запросов (классификация, извлечение полей, сводки по десяткам файлов), ответ не
+нужен сразу. Один срочный вопрос — `run` / `api_run`.
+
+**Кэш общего `system`:** с `--cache long` (`cache="long"`) `system` уходит с `cache_control` на 1 час; первый запрос
+пакета сам записывает его в кэш, остальные читают. Отдельный прогрев не нужен (в PoC прогрев без схемы ответа пакет со
+схемой не покрыл).
+
+```sh
+wshub api batch submit --provider anthropic --project payload --tier cheap --system prompts/classify.md \
+    --inputs-glob 'reviews/*.txt' --schema schemas/label.json --cache long --out-dir out/labels
+wshub api batch status msgbatch_01…       # in_progress → ended; без ID — список пакетов
+wshub api batch results msgbatch_01…      # ответы в out/labels/<имя входа>.json, сводка, траты
+wshub api batch cancel msgbatch_01…
+```
+
+Из чата:
+
+```
+api_batch_submit(project="payload", inputs_glob="reviews/*.txt", system_file="prompts/classify.md", tier="cheap",
+                 schema_file="schemas/label.json", cache="long", out_dir="out/labels")
+api_batch_status(id="msgbatch_01…")
+api_batch_results(id="msgbatch_01…")
+```
+
+- **Вход** — один запрос на вход, до 1000 в пакете (больше — отказ). CLI: `--inputs ФАЙЛ…` (значения до следующего
+  `--…`) или `--inputs-glob 'МАСКА'` (как `find`: без `/` — по имени, с `/` — по пути от корня; deny и `.git`
+  пропускаются). Сервер: `input_files` (список путей), `inputs_glob` или `inputs` (список текстов) — ровно одно.
+  Файлы — по политике проекта, как `--input`. Остальные параметры — как у `run` / `api_run`, `--cache none|short|long`.
+- **`custom_id`** — по имени входа без расширения: латиница, цифры, `_`, `-` (прочее — `_`), до 64 символов; дубли —
+  `-2`, `-3`; без латиницы и цифр (и у текстов) — `r<номер>`. Файл ответа — имя входа без расширения (кириллица
+  сохраняется) + `.json` при схеме, иначе `.md`. Результаты провайдер отдаёт в своём порядке — хаб раскладывает их
+  только по `custom_id`.
+- **Проверки до отправки** — для каждого запроса те же, что у `run`: барьеры реестра, выбор модели, strong и модель
+  вне уровней — только `--choice operator` (из чата — ещё и `reason`). Деньги — только заданные оператором: оценка
+  каждого запроса — со скидкой; `max_usd_per_call` — на каждый запрос, `daily_usd` и зоны — на сумму пакета, заново
+  под `ledger.lock` перед отправкой. Точная оценка входа (`count_tokens` на каждый запрос) — только если задана хоть
+  одна денежная проверка; иначе вход — грубо (символы / 4), без запросов к провайдеру. Резерва в журнале нет: траты
+  попадают в журнал при `results`, поэтому несколько пакетов до `results` проверяются на одном остатке.
+- **`--out-dir` / `out_dir`** — каталог в проекте с теми же проверками, что `out_file` (только `rw`, не `.git`, не под
+  deny, не наружу); файл ответа, который уже есть, — отказ до отправки. Без него ответы — в
+  `~/.local/state/wshub/api/out/<id>/`.
+- **Учёт** — `~/.local/state/wshub/api/batches/<id>.json` (0600): провайдер, проект, модель, число запросов,
+  `custom_id` → вход (путь или первые 80 символов текста), имя файла ответа и оценка, время, состояние, `out_dir`, зона.
+  Ключа там нет. `status` без ID — список пакетов учёта; незаконченные хаб переспрашивает у провайдера.
+- **`results`** — только у законченного пакета (`ended`), иначе отказ со счётчиками. Успешные ответы — файлами, без
+  перезаписи: перед записью проверка `out_dir` повторяется (сервер — и блокировку из панели); файл с тем же ответом —
+  «записан ранее», с другим или запись не прошла — ответ в `~/.local/state/wshub/api/out/<id>/`. Сводка: успешно,
+  с ошибкой (по `custom_id` с причиной), сумма со скидкой. В чат — сводка и пути; тексты — только если ответов ≤ 5 и
+  каждый ≤ 2 КБ.
+- **Журнал трат** — строка на каждый результат: `batch` (id) и `custom_id` вместо `template`, `usage`, `cost_usd` со
+  скидкой, зона — та, что определена при отправке. `errored` / `canceled` / `expired` — `ok: false`, $0 (не оплачены).
+  Ответ получен, но JSON по схеме не разобран — `ok: false`, цена по `usage`, файла нет; не разобран `usage` — по
+  оценке запроса. **Повторный `results` строк не дублирует:** пишутся только `custom_id`, которых в журнале у этого
+  пакета ещё нет (под `ledger.lock`). Строки ложатся в сутки выборки результатов.
+- **`cancel`** — отмена у провайдера; уже выполненные запросы оплачены, их ответы — через `results`.
+- `[api] enabled = false` и закрытый проект запрещают отправку (`submit`); `status`, `results`, `cancel` работают —
+  данные уже у провайдера. Ключ — только в заголовке: ни в учёте, ни в выводе, ни в журналах; ID пакета — только
+  `[A-Za-z0-9_-]`. Результаты хаб берёт по адресу `base_url`, а не по `results_url` ответа.
 
 ## Что ядро гарантирует и чего нет
 

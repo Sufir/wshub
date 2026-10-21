@@ -63,6 +63,8 @@ class Server:
                 except OSError:  # клиент уже ушёл по таймауту
                     pass
 
+            do_GET = do_POST  # состояние и результаты пакета (ТЗ WSH-4.5): тела нет, content-length 0
+
             def log_message(self, *a):
                 pass
 

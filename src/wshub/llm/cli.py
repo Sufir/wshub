@@ -4,6 +4,7 @@ from __future__ import annotations
 import getpass
 import json
 import math
+import os
 import re
 import secrets
 import sys
@@ -12,13 +13,13 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from ..core import Hub, Session, WsError, _is_file
-from ..policy import Policy
+from ..core import Hub, Session, Skipped, WsError, _is_file
+from ..policy import Policy, glob_match
 from ..registry import Registry, RegistryError, RegistryFile
-from . import keys, ledger
-from .core import Api, ApiError, Plan, ddmm, now_local, usd
+from . import batches, keys, ledger
+from .core import Api, ApiError, Plan, batch_counts, check_batch_size, ddmm, now_local, usd
 from .providers import PROVIDERS
-from .types import Request, Response
+from .types import CACHE, Request, Response
 
 OUT_MAX = 8 * 1024  # длиннее — ответ в файл, на экран путь
 ZONE_RU = {"included": "включённая", "purchased": "купленная"}
@@ -28,6 +29,12 @@ wshub api key set <провайдер>     — задать ключ API (скр
 wshub api key check <провайдер>   — есть ли ключ и верны ли права (значение не выводится)
 wshub api run --provider P --project X (--tier T | --model M) [--system FILE] --input FILE [--schema FILE]
               [--max-tokens N] [--effort E] [--choice operator] [--estimate] [--out FILE]
+wshub api batch submit --provider P --project X (--tier T | --model M) [--system FILE]
+              (--inputs FILE… | --inputs-glob 'МАСКА') [--schema FILE] [--max-tokens N] [--effort E]
+              [--cache none|short|long] [--choice operator] [--out-dir DIR]   — пакет: −50 %, ответ до 24 ч
+wshub api batch status [ID]       — состояние пакета; без ID — список пакетов
+wshub api batch results ID        — ответы законченного пакета: файлы, сводка, траты
+wshub api batch cancel ID         — отменить пакет
 wshub api stats [--days N]        — траты за цикл (или за N дней): провайдеры, зоны, модели, проекты
 wshub api credits <провайдер> --left USD --until ДД.ММ[.ГГГГ]   — остаток включённых кредитов, новый цикл
 wshub api allow <провайдер> --usd USD --until ДД.ММ[.ГГГГ]      — разрешить купленную зону
@@ -46,7 +53,7 @@ def api_main(rest: list[str], config: Path, state: Path, now=now_local) -> int:
         print(USAGE)
         return 0
     sub, args = rest[0], rest[1:]
-    handlers = {"key": _key, "run": _run, "stats": _stats, "credits": _credits, "allow": _allow}
+    handlers = {"key": _key, "run": _run, "batch": _batch, "stats": _stats, "credits": _credits, "allow": _allow}
     if sub not in handlers:
         print(USAGE, file=sys.stderr)
         return 2
@@ -273,6 +280,237 @@ def run_lines(api: Api, plan: Plan, resp: Response) -> list[str]:
     if plan.zone == "purchased" and z is not None and z.allow_usd is not None:
         line += f" · купленная зона {usd(z.purchased_spent)} из ${z.allow_usd:.2f}, до {ddmm(z.allow_until)}"
     return [line, *_skipped(plan.skipped), *_burn(z)]
+
+
+# ---------- batch (ТЗ WSH-4.5) ----------
+
+BATCH_VALUED = {"--provider", "--project", "--tier", "--model", "--system", "--inputs-glob", "--schema",
+                "--max-tokens", "--effort", "--cache", "--out-dir", "--choice"}
+BATCH_OPS = ("submit", "status", "results", "cancel")
+
+
+def _split_inputs(args: list[str]) -> tuple[list[str], list[str] | None]:
+    """--inputs берёт значения до следующего параметра «--…»."""
+    rest, inputs, i = [], None, 0
+    while i < len(args):
+        if args[i] == "--inputs":
+            if inputs is not None:
+                raise _Usage("--inputs — один раз, файлы через пробел")
+            inputs, i = [], i + 1
+            while i < len(args) and not args[i].startswith("--"):
+                inputs.append(args[i])
+                i += 1
+            if not inputs:
+                raise _Usage("после --inputs нужны файлы")
+        else:
+            rest.append(args[i])
+            i += 1
+    return rest, inputs
+
+
+def _batch(config: Path, state: Path, now, args: list[str]) -> int:
+    if not args or args[0] not in BATCH_OPS:
+        raise _Usage("batch submit … | batch status [ID] | batch results ID | batch cancel ID")
+    op, args = args[0], args[1:]
+    if op != "submit":
+        pos, _o = _parse(args, set())
+        if len(pos) > 1 or (op != "status" and len(pos) != 1):
+            raise _Usage(f"batch {op} {'[ID]' if op == 'status' else 'ID'}")
+        hub = Hub(config, state)
+        api = _api(config, state, now, hub.registry.get())
+        if op == "status":
+            print("\n".join(batch_status_lines(api, pos[0] if pos else None)))
+        elif op == "cancel":
+            print(f"отмена запрошена: {batch_line(api.batch_cancel(pos[0]))}")
+        else:
+            rec, items = api.batch_results(pos[0])
+            print("\n".join(batch_result_lines(rec, items) + write_answers(hub, rec, items, state)))
+        return 0
+    rest, inputs = _split_inputs(args)
+    pos, o = _parse(rest, BATCH_VALUED)
+    if pos:
+        raise _Usage(f"лишние аргументы: {' '.join(pos)}")
+    for k in ("provider", "project"):
+        if k not in o:
+            raise _Usage(f"нужен --{k}")
+    if (inputs is None) == ("inputs-glob" not in o):
+        raise _Usage("вход пакета — --inputs ФАЙЛ… или --inputs-glob 'МАСКА', что-то одно")
+    if "choice" in o and o["choice"] != "operator":
+        raise _Usage("--choice: только operator")
+    if o.get("cache", "none") not in CACHE:
+        raise _Usage(f"--cache: одно из {', '.join(CACHE)}")
+    max_tokens = _int(o.get("max-tokens", "1024"), "--max-tokens")
+    hub = Hub(config, state)
+    reg = hub.registry.get()
+    api = _api(config, state, now, reg)
+    api.gate(o["project"])  # выключенный API и закрытый проект — отказ до чтения файлов
+    api.batch_provider(o["provider"])
+    s = _session(hub, reg, o["project"])
+    system = _read(hub, s, o["system"]) if "system" in o else ""
+    schema = None
+    if "schema" in o:
+        schema = json.loads(_read(hub, s, o["schema"]))
+        if not isinstance(schema, dict):
+            raise ApiError("--schema: ожидается JSON-объект схемы")
+    plans, ids, meta = batch_prepare(api, hub, reg, o["project"], o["provider"], inputs, o.get("inputs-glob", ""),
+                                     None, system, schema, o.get("tier"), o.get("model"), o.get("effort"),
+                                     max_tokens, o.get("cache", "none"), o.get("choice"), o.get("out-dir", ""))
+    print("\n".join(batch_submit_lines(api.submit(plans, ids, meta))))
+    return 0
+
+
+def _glob_files(hub: Hub, s: Session, pattern: str) -> list[str]:
+    """Файлы проекта по маске (как find): без .git, deny и симлинков-каталогов; не больше BATCH_MAX."""
+    hits = []
+    for base, _dirs, files in hub._walk(s, s.root, Skipped(s)):
+        for f in files:
+            rel = hub._rel(s, base / f)
+            if glob_match(pattern, rel) and not s.policy.denied(rel):
+                hits.append(rel)
+                check_batch_size(len(hits))
+    if not hits:
+        raise ApiError(f"по маске {pattern} в проекте нет файлов")
+    return sorted(hits)
+
+
+def _out_dir_check(hub: Hub, reg: Registry, project: str, out_dir: str, names: list[str]) -> None:
+    """out_dir пакета — проверки out_file сервера для каждого файла ответа до отправки (решение Р3)."""
+    from ..api_server import _out_target
+    for n in names:
+        try:
+            _out_target(hub, reg, project, f"{out_dir.rstrip('/')}/{n}")
+        except WsError as e:
+            raise WsError("out_dir: " + str(e).removeprefix("out_file: ")) from None
+
+
+def batch_prepare(api: Api, hub: Hub, reg: Registry, project: str, provider: str, files: list[str] | None,
+                  glob: str, texts: list[str] | None, system: str, schema: dict | None, tier: str | None,
+                  model: str | None, effort: str | None, max_tokens: int, cache: str, choice: str | None,
+                  out_dir: str) -> tuple[list[Plan], list[str], dict]:
+    """Общий путь CLI batch submit и api_batch_submit: входы (файлы по политике проекта, маска или тексты), имена
+    custom_id и файлов ответа (Р4, Р5), out_dir — до чтения входов, проверки ядра для каждого запроса."""
+    api.batch_provider(provider)
+    if sum(bool(x) for x in (files, glob, texts)) != 1:
+        raise ApiError("вход пакета — ровно одно из: список файлов, маска файлов или (из чата) список текстов")
+    s = _session(hub, reg, project)
+    if texts:
+        check_batch_size(len(texts))
+        names, briefs, paths = [f"r{i}" for i in range(1, len(texts) + 1)], [t[:batches.BRIEF] for t in texts], []
+    else:
+        if files:
+            check_batch_size(len(files))
+        rels = [hub._resolve(s, p)[1] for p in files] if files else _glob_files(hub, s, glob)
+        names, briefs, paths = [Path(r).stem for r in rels], rels, rels
+    ids, fnames = batches.custom_ids(names), batches.file_names(names)
+    if out_dir:
+        ext = ".json" if schema is not None else ".md"
+        _out_dir_check(hub, reg, project, out_dir, [f + ext for f in fnames])
+    bodies = texts or [_read(hub, s, p) for p in paths]
+    reqs = [Request(system, ({"role": "user", "text": t},), project, tier=tier or None, model=model or None,
+                    schema=schema, effort=effort or None, max_tokens=max_tokens, cache=cache) for t in bodies]
+    plans = api.batch_plan(reqs, provider, choice or None)
+    inputs = {cid: {"input": b, "file": f} for cid, b, f in zip(ids, briefs, fnames, strict=True)}
+    return plans, ids, {"project": project, "out_dir": out_dir or None, "inputs": inputs}
+
+
+def batch_submit_lines(rec: dict) -> list[str]:
+    where = (f"в {rec['out_dir']} проекта {rec['project']}" if rec.get("out_dir")
+             else f"в ~/.local/state/wshub/api/out/{rec['id']}/")
+    return [f"пакет {rec['id']} отправлен: запросов {rec['requests']} · {rec['model']} · оценка "
+            f"{usd(rec['estimate_usd'])} со скидкой 50 %" + (" (вход грубо)" if rec.get("rough") else ""),
+            f"ответы — {where}; ожидание до 24 ч",
+            f"состояние — batch status {rec['id']}; результаты — batch results {rec['id']}"]
+
+
+def batch_line(rec: dict) -> str:
+    line = (f"{rec['id']} · {rec.get('status')} ({batch_counts(rec)}) · {rec.get('provider')}/{rec.get('model')} · "
+            f"проект {rec.get('project')} · запросов {rec.get('requests')} · создан {str(rec.get('created'))[:16]}")
+    if rec.get("status") != "ended" and rec.get("expires_at"):
+        line += f" · истекает {str(rec['expires_at'])[:16]}"
+    return line + (f" · не обновлён: {rec['error']}" if rec.get("error") else "")
+
+
+def batch_status_lines(api: Api, batch_id: str | None) -> list[str]:
+    """Один пакет (состояние от провайдера) или список учёта; общий вывод CLI batch status и api_batch_status."""
+    if batch_id:
+        return [batch_line(api.batch_status(batch_id))]
+    recs, bad = api.batch_list()
+    out = [batch_line(r) for r in recs] or ["пакетов нет"]
+    return out + ([f"учёт пакетов: нечитаемых файлов {bad}"] if bad else [])
+
+
+def batch_result_lines(rec: dict, items: list[dict]) -> list[str]:
+    """Сводка results: сколько успешно, с ошибкой, цена со скидкой, строки журнала; ошибки — по custom_id."""
+    ok = sum(1 for i in items if i["ok"])
+    new = sum(1 for i in items if i["logged"])
+    out = [f"пакет {rec['id']}: успешно {ok}, с ошибкой {len(items) - ok} · "
+           f"{usd(sum(i['cost_usd'] for i in items))} со скидкой 50 %",
+           f"журнал трат: записано строк {new}" + (f", уже были {len(items) - new} — не дублируются"
+                                                   if new < len(items) else "")]
+    for i in items:
+        if not i["ok"]:
+            src = (rec["inputs"].get(i["custom_id"]) or {}).get("input", "")
+            out.append(f"  ✗ {i['custom_id']}" + (f" ({src})" if src else "") + f": {i['error']}")
+    return out
+
+
+def _same(p: Path, data: bytes) -> bool:
+    try:
+        return p.is_file() and not p.is_symlink() and p.stat().st_size == len(data) and p.read_bytes() == data
+    except OSError:
+        return False
+
+
+def _save_new(path: Path, data: bytes) -> str:
+    """Ответ — в каталог состояния без перезаписи: тот же ответ уже лежит — «записан ранее», другой — рядом под новым
+    именем."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if _same(path, data):
+            return f"записан ранее: {path}"
+        p = path if not os.path.lexists(path) else path.with_name(f"{path.stem}.{secrets.token_hex(3)}{path.suffix}")
+        with open(p, "xb") as fh:
+            fh.write(data)
+    except OSError as e:
+        return f"не сохранён — ошибка записи в {path.parent}: {e.strerror or type(e).__name__}"
+    return f"сохранён: {p}"
+
+
+def write_answers(hub: Hub, rec: dict, items: list[dict], state: Path, check=None) -> list[str]:
+    """Успешные ответы — по файлу на custom_id (п. 2.2.3): в out_dir проекта (проверка out_file заново по свежему
+    реестру, без перезаписи) или в ~/.local/state/wshub/api/out/<id>/. Тот же ответ уже записан — «записан ранее»
+    (решение Р6); файл другой или запись в проект не прошла — ответ в каталог состояния. check — проверка перед
+    записью в проект (блокировка из панели — у сервера)."""
+    from ..api_server import _out_target, _write_new
+    ext = ".json" if rec.get("schema") else ".md"
+    fallback = Path(state) / "api" / "out" / rec["id"]
+    oks = [i for i in items if i["ok"]]
+    if not oks:
+        return []
+    out = [f"ответы: {rec['out_dir']} в проекте {rec['project']}" if rec.get("out_dir") else f"ответы: {fallback}"]
+    for it in oks:
+        cid = it["custom_id"]
+        name = ((rec["inputs"].get(cid) or {}).get("file") or cid) + ext
+        data = answer_body(it["response"]).encode("utf-8")
+        if not rec.get("out_dir"):
+            out.append(f"  {cid}: {_save_new(fallback / name, data)}")
+            continue
+        rel = f"{rec['out_dir'].rstrip('/')}/{name}"
+        try:
+            if check is not None:
+                check()
+            target, rel = _out_target(hub, hub.registry.get(), rec["project"], rel, exist_ok=True)
+            if _same(target, data):
+                out.append(f"  {cid} → {rel} (записан ранее)")
+                continue
+            _write_new(target, data)
+            out.append(f"  {cid} → {rel}")
+            continue
+        except (WsError, RegistryError, OSError) as e:
+            why = ("файл уже есть — перезапись запрещена" if isinstance(e, FileExistsError)
+                   else str(e).removeprefix("out_file: "))
+        out.append(f"  {cid} → {rel} не записан: {why}; ответ {_save_new(fallback / name, data)}")
+    return out
 
 
 # ---------- stats, credits, allow ----------

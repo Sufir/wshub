@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from ..provider import prompt_text, rough_tokens
-from ..types import CAPS, Request, Response, Usage
+from ..types import CAPS, BatchItem, Request, Response, Usage
 
 MODELS = {"cheap": "fake-cheap", "standard": "fake-standard", "strong": "fake-strong"}
 # USD за миллион токенов: вход, выход, чтение кэша, запись кэша
@@ -34,6 +35,9 @@ class FakeProvider:
         self.reply = reply  # ответ: строка, или JSON при schema; None — эхо последнего сообщения
         self.fail = fail  # шаблон исключения с {key} — для проверки, что ключ не утекает
         self.calls: list[Request] = []
+        self.batches: dict[str, list] = {}
+        self.batch_state = "ended"
+        self.batch_errors: dict[str, str] = {}  # custom_id → ошибка результата
 
     def models(self) -> dict[str, str]:
         return dict(self._models)
@@ -49,6 +53,9 @@ class FakeProvider:
         self.calls.append(request)
         if self.fail is not None:
             raise RuntimeError(self.fail.format(key=key))
+        return self._answer(request)
+
+    def _answer(self, request: Request) -> Response:
         data = None
         if request.schema is not None:
             data = self.reply if self.reply is not None else sample(request.schema)
@@ -61,6 +68,33 @@ class FakeProvider:
         cached = inp // 2 if request.cache != "none" else 0
         usage = Usage(input=inp - cached, output=min(rough_tokens(text), request.max_tokens), cache_read=cached)
         return Response(text, data, usage, request.model or "", self.name)
+
+    # пакеты (ТЗ WSH-4.5): в памяти экземпляра, сразу ended; результаты — в обратном порядке, как перемешанные
+    def batch_submit(self, requests: list[tuple[str, Request]], key: str) -> str:
+        if self.fail is not None:
+            raise RuntimeError(self.fail.format(key=key))
+        bid = f"fakebatch_{len(self.batches) + 1}"
+        self.batches[bid] = list(requests)
+        return bid
+
+    def batch_status(self, batch_id: str, key: str) -> dict:
+        if self.fail is not None:
+            raise RuntimeError(self.fail.format(key=key))
+        n = len(self.batches.get(batch_id, ()))
+        return {"status": self.batch_state, "counts": {"succeeded": n}, "ended_at": None, "expires_at": None}
+
+    def batch_cancel(self, batch_id: str, key: str) -> dict:
+        self.batch_state = "canceling"
+        return self.batch_status(batch_id, key)
+
+    def batch_results(self, batch_id: str, key: str):
+        if self.fail is not None:
+            raise RuntimeError(self.fail.format(key=key))
+        for cid, request in reversed(self.batches.get(batch_id, [])):
+            if cid in self.batch_errors:
+                yield BatchItem(cid, None, self.batch_errors[cid])
+            else:
+                yield BatchItem(cid, replace(self._answer(request), data=None))  # схему разбирает ядро
 
 
 def create(conf) -> FakeProvider:

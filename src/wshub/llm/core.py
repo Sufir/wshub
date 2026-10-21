@@ -3,15 +3,16 @@
 Форматов конкретного API ядро не знает."""
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 
 from ..registry import ApiProvider, Registry
-from . import keys, ledger
+from . import batches, keys, ledger
 from .provider import Provider, rough_tokens
 from .providers import PROVIDERS
-from .types import TIERS, Request, Response, Usage
+from .types import TIERS, BatchItem, Request, Response, Usage
 
 
 class ApiError(Exception):
@@ -43,6 +44,8 @@ def usd(v: float) -> str:
 
 
 CENT = 0.01  # задача Code на ключе без бюджета проходит проверку зон и дня, если остался хотя бы цент (ТЗ WSH-4.6)
+BATCH_PRICE = 0.5  # пакет: −50 % ко входу и выходу (pricing, 2026-10-20); к кэшу — допущение PoC WSH-4.0 (ТЗ WSH-4.5)
+BATCH_MAX = 1000  # запросов в пакете хаба
 HIDDEN = "<ключ скрыт>"
 SCRUB_MIN = 8  # куски ключа от стольких символов вырезаются из текста ошибки
 
@@ -92,6 +95,7 @@ class Api:
     def __init__(self, reg: Registry, config_dir: Path, state_dir: Path, now=now_local):
         self.reg = reg
         self.config_dir = Path(config_dir)
+        self.state_dir = Path(state_dir)
         self.ledger_path = ledger.ledger_path(state_dir)
         self.now = now
 
@@ -158,7 +162,9 @@ class Api:
         _prov, conf = self.provider(name)
         return ledger.zones(led or self.read_ledger(), name, conf, self.now().date())
 
-    def plan(self, req: Request, name: str, choice: str | None = None) -> Plan:
+    def plan(self, req: Request, name: str, choice: str | None = None, batch: bool = False,
+             exact: bool = True) -> Plan:
+        """batch — запрос пакета: оценка со скидкой BATCH_PRICE; exact=False — вход грубо, без count_tokens."""
         self.gate(req.project)
         prov, conf = self.provider(name)
         need = [c for c, used in (("schema", req.schema is not None), ("effort", req.effort is not None),
@@ -195,9 +201,9 @@ class Api:
             prov.price(model, Usage())  # цена неизвестна — отказ до оценки входа (count_tokens — запрос с ключом)
         except KeyError:
             raise ApiError(f"цена модели {model} у провайдера {name} неизвестна — запрос не отправлен") from None
-        inp, rough = self._estimate(name, prov, req)
+        inp, rough = self._estimate(name, prov, req) if exact else (prov.estimate(req), True)
         est = replace(_cache_split(inp, req), output=req.max_tokens)
-        est_usd = prov.price(model, est)
+        est_usd = prov.price(model, est) * (BATCH_PRICE if batch else 1.0)
         led = self.read_ledger()
         z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
         zone, refusal = self._zone(name, est_usd, z, led)
@@ -337,3 +343,178 @@ class Api:
         ledger.append(self.ledger_path, {**rec, "model": resp.model, "usage": resp.usage.as_dict(),
                                          "cost_usd": cost, "ok": True})
         return replace(resp, cost_usd=cost)
+
+    # ---------- пакеты (ТЗ WSH-4.5) ----------
+
+    def batch_provider(self, name: str) -> Provider:
+        prov, _conf = self.provider(name)
+        if "batch" not in prov.caps:
+            raise ApiError(f"провайдер {name} не поддерживает batch — пакет не отправлен")
+        return prov
+
+    def money_checks(self, name: str) -> bool:
+        """Задана ли хоть одна денежная проверка: max_usd_per_call, daily_usd или зоны провайдера (решение Р2)."""
+        _prov, conf = self.provider(name)
+        api = self.reg.api
+        return (api.max_usd_per_call is not None or api.daily_usd is not None
+                or ledger.zones_set(self.read_ledger(), name, conf))
+
+    def batch_plan(self, requests: list[Request], name: str, choice: str | None = None) -> list[Plan]:
+        """Каждый запрос пакета — те же проверки, что у run (выбор модели, choice для strong, потолок одного запроса —
+        по оценке со скидкой). count_tokens — только при денежной проверке (решение Р2), иначе вход грубо, без сети."""
+        self.batch_provider(name)
+        if not requests:
+            raise ApiError("пакет пуст: нет входов")
+        check_batch_size(len(requests))
+        exact = self.money_checks(name)
+        return [self.plan(r, name, choice, batch=True, exact=exact) for r in requests]
+
+    def _keyed(self, name: str, what: str, call):
+        """Вызов провайдера с ключом: ключ — только здесь; ошибка — ApiError без ключа и без цепочки исключений."""
+        try:
+            key = keys.read(keys.key_path(self.config_dir, name))
+        except keys.KeyProblem as e:
+            raise ApiError(str(e)) from None
+        error = None
+        try:
+            out = call(key)
+        except Exception as e:
+            error = scrub(f"{type(e).__name__}: {e}", key)
+        del key
+        if error is not None:
+            raise ApiError(f"провайдер {name}: {what}: {error}")
+        return out
+
+    def submit(self, plans: list[Plan], ids: list[str], meta: dict) -> dict:
+        """Отправка пакета по проверенным планам (ТЗ WSH-4.5, п. 2.1.2; решение Р1): потолок дня и зоны — на сумму
+        оценок, заново под блокировкой журнала до отправки. Резерва в журнале нет: траты — строками results. Ответ —
+        запись учёта; meta — project, out_dir, inputs {custom_id: {input, file}}."""
+        for cid, p in zip(ids, plans, strict=True):
+            if p.zone is None:
+                raise ApiError(f"{cid}: {p.refusal} — пакет не отправлен")
+        prov, first = plans[0].provider, plans[0].request
+        name, total = prov.name, sum(p.estimate_usd for p in plans)
+        with ledger.locked(self.ledger_path):
+            _prov, conf = self.provider(name)
+            led = self.read_ledger()
+            z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
+            zone, refusal = self._zone(name, total, z, led, per_call=False)
+            if zone is None:
+                raise ApiError(f"пакет: {refusal} — пакет не отправлен")
+            pairs = [(cid, p.request) for cid, p in zip(ids, plans, strict=True)]
+            bid = self._keyed(name, "пакет", lambda key: prov.batch_submit(pairs, key))
+        try:
+            batches.check_id(bid)
+        except batches.BatchError:
+            raise ApiError(f"провайдер {name}: пакет создан, но id не годится для учёта: {str(bid)[:80]!r}") from None
+        inputs = {cid: {**meta["inputs"][cid], "estimate_usd": p.estimate_usd}
+                  for cid, p in zip(ids, plans, strict=True)}
+        rec = {"id": bid, "provider": name, "project": first.project, "model": first.model, "tier": first.tier,
+               "schema": first.schema is not None, "requests": len(plans), "inputs": inputs,
+               "created": ledger.stamp(self.now()), "status": "in_progress", "counts": {}, "ended_at": None,
+               "expires_at": None, "out_dir": meta.get("out_dir"), "zone": zone, "estimate_usd": total,
+               "rough": any(p.rough for p in plans)}
+        try:
+            batches.save(self.state_dir, rec)
+        except OSError as e:
+            raise ApiError(f"пакет {bid} создан у провайдера, но учёт не записан ({e.strerror or type(e).__name__}); "
+                           "результаты хаб не разложит — отмени пакет в консоли провайдера") from None
+        return rec
+
+    def _refresh(self, rec: dict, state: dict) -> dict:
+        rec.update(status=state.get("status", "?"), counts=state.get("counts", {}), ended_at=state.get("ended_at"),
+                   expires_at=state.get("expires_at"), checked=ledger.stamp(self.now()))
+        batches.save(self.state_dir, rec)
+        return rec
+
+    def batch_status(self, batch_id: str) -> dict:
+        rec = batches.load(self.state_dir, batch_id)
+        prov = self.batch_provider(rec["provider"])
+        return self._refresh(rec, self._keyed(rec["provider"], "состояние пакета",
+                                              lambda key: prov.batch_status(batch_id, key)))
+
+    def batch_list(self) -> tuple[list[dict], int]:
+        """Пакеты учёта; незаконченные — с состоянием от провайдера, сбой — в поле error записи."""
+        recs, bad = batches.listing(self.state_dir)
+        for rec in recs:
+            if rec.get("status") != "ended":
+                try:
+                    rec.update(self.batch_status(rec["id"]))
+                except (ApiError, keys.KeyProblem, OSError, ValueError) as e:
+                    rec["error"] = str(e)
+        return recs, bad
+
+    def batch_cancel(self, batch_id: str) -> dict:
+        rec = batches.load(self.state_dir, batch_id)
+        prov = self.batch_provider(rec["provider"])
+        return self._refresh(rec, self._keyed(rec["provider"], "отмена пакета",
+                                              lambda key: prov.batch_cancel(batch_id, key)))
+
+    def batch_results(self, batch_id: str) -> tuple[dict, list[dict]]:
+        """Результаты законченного пакета (п. 2.1.4): разбор по custom_id, цена со скидкой, строка журнала на каждый
+        результат. Журнал — источник истины (решение Р6): под блокировкой пишутся только custom_id, которых в строках
+        этого пакета ещё нет, — повторная выборка строк не дублирует. Ответ — (учёт, результаты: custom_id, ok,
+        response, error, cost_usd, logged)."""
+        rec = batches.load(self.state_dir, batch_id)
+        name = rec["provider"]
+        prov = self.batch_provider(name)
+        rec = self._refresh(rec, self._keyed(name, "состояние пакета", lambda key: prov.batch_status(batch_id, key)))
+        if rec["status"] != "ended":
+            raise ApiError(f"пакет {batch_id} ещё не закончен ({rec['status']}, {batch_counts(rec)}); "
+                           "результаты — после ended, ожидание до 24 ч")
+
+        def fetch(key: str) -> list[BatchItem]:
+            return [replace(i, error=scrub(i.error, key)) if i.error else i
+                    for i in prov.batch_results(batch_id, key)]
+        items = [self._batch_item(prov, rec, i) for i in self._keyed(name, "результаты пакета", fetch)]
+        with ledger.locked(self.ledger_path):
+            done = {r.get("custom_id") for r in self.read_ledger().rows if r.get("batch") == batch_id}
+            base = {"kind": "run", "provider": name, "tier": rec.get("tier"), "project": rec["project"],
+                    "template": None, "batch": batch_id, "zone": rec.get("zone") or "included"}
+            for it in items:
+                it["logged"] = it["custom_id"] not in done
+                if not it["logged"]:
+                    continue
+                row = {"ts": ledger.stamp(self.now()), **base, "custom_id": it["custom_id"], "model": it["model"],
+                       "usage": it["usage"].as_dict(), "cost_usd": it["cost_usd"], "ok": it["ok"]}
+                if it["error"]:
+                    row["error"] = it["error"]
+                ledger.append(self.ledger_path, row)
+                done.add(it["custom_id"])
+        return rec, items
+
+    def _batch_item(self, prov: Provider, rec: dict, item: BatchItem) -> dict:
+        """Результат → ok, ответ, цена со скидкой (решение Р7): ответ по схеме не разобран — ошибка, цена по usage;
+        оплачен, но usage не разобран — оценка запроса из учёта; не оплачен (errored, canceled, expired) — $0."""
+        est = (rec["inputs"].get(item.custom_id) or {}).get("estimate_usd", 0.0)
+        resp, error, usage = item.response, item.error, Usage()
+        model = resp.model if resp else (item.model or rec.get("model"))
+        if resp is not None:
+            usage = resp.usage
+            if rec.get("schema"):
+                try:
+                    resp = replace(resp, data=json.loads(resp.text))
+                except ValueError:
+                    resp, error = None, "ответ не разобран как JSON по схеме"
+            try:
+                cost = prov.price(model, usage) * BATCH_PRICE
+            except KeyError:  # модель ответа не из таблицы цен — оценка запроса
+                cost = est
+        else:
+            cost = est if item.model is not None else 0.0
+        if resp is not None:
+            resp = replace(resp, cost_usd=cost)
+        return {"custom_id": item.custom_id, "ok": resp is not None, "response": resp, "error": error,
+                "model": model, "usage": usage, "cost_usd": float(cost)}
+
+
+def check_batch_size(n: int) -> None:
+    if n > BATCH_MAX:
+        raise ApiError(f"пакет — до {BATCH_MAX} запросов, а входов больше ({n}): раздели на несколько пакетов")
+
+
+def batch_counts(rec: dict) -> str:
+    c = rec.get("counts") or {}
+    names = (("succeeded", "успешно"), ("errored", "с ошибкой"), ("processing", "в работе"),
+             ("canceled", "отменено"), ("expired", "истекло"))
+    return ", ".join(f"{ru} {c[k]}" for k, ru in names if c.get(k)) or "счётчиков нет"

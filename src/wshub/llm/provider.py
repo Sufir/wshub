@@ -2,9 +2,10 @@
 его секция [api.providers.<имя>] (registry.ApiProvider). Чего нет в caps, ядро отклоняет до запроса."""
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Protocol
 
-from .types import Request, Response, Usage
+from .types import BatchItem, Request, Response, Usage
 
 
 class Provider(Protocol):
@@ -23,6 +24,19 @@ class Provider(Protocol):
 
     def run(self, request: Request, key: str) -> Response:
         """Один запрос. request.model уже выбран ядром."""
+
+    # пакеты (ТЗ WSH-4.5) — только у провайдера с batch в caps
+    def batch_submit(self, requests: list[tuple[str, Request]], key: str) -> str:
+        """Пакет из (custom_id, запрос): тела — тем же кодом, что у run. Ответ — id пакета."""
+
+    def batch_status(self, batch_id: str, key: str) -> dict:
+        """{"status": in_progress | canceling | ended, "counts": {…}, "ended_at", "expires_at"}."""
+
+    def batch_results(self, batch_id: str, key: str) -> Iterator[BatchItem]:
+        """Результаты законченного пакета — в порядке ответа провайдера, сопоставлять по custom_id."""
+
+    def batch_cancel(self, batch_id: str, key: str) -> dict:
+        """Отмена пакета; ответ — как у batch_status."""
 
 
 def rough_tokens(text: str) -> int:

@@ -333,7 +333,7 @@ def test_budget_only_if_set(code, monkeypatch):
     assert effective_limits(ProjectCode(), "key") == effective_limits(ProjectCode(), "subscription")
     assert effective_limits(ProjectCode(), "key").max_budget_usd is None
     assert effective_limits(ProjectCode(max_budget_usd=3), "key").max_budget_usd == 3
-    _registry(code, **NO_LIMITS)
+    _registry(code, api="[api]\ndaily_usd = 50\n", **NO_LIMITS)  # без зоны (ТЗ WSH-4.8, п. 2.1.2: с зоной — флаг)
     p = _plan(code, code.taskfile(extra="budget_usd: 4\n"), channel="mcp", reason=REASON)
     assert p.budget_usd is None and LIMIT_IGNORED in p.warnings  # из шапки без потолка — не применяется
     jid, d = _run(code, monkeypatch)

@@ -132,11 +132,16 @@ def key_view(jobs: Jobs, d: dict) -> dict:
     """Данные строки оплаты задачи на ключе: сумма звеньев цепочки (None — итогов ещё нет) и цикл включённых
     кредитов провайдера по журналу трат (None — журнал или секция провайдера не читаются)."""
     costs = [phase_cost(x) for x in jobs.chain(d.get("chain_root") or d["id"])]
-    out: dict = {"cost": _sum(costs) if any(c is not None for c in costs) else None, "cycle": None}
+    out: dict = {"cost": _sum(costs) if any(c is not None for c in costs) else None, "cycle": None, "warn": []}
+    provider = (d.get("billing") or {}).get("provider") or KEY_PROVIDER
+    try:  # [api.warn]: траты за сутки и остаток зоны — только показ (ТЗ WSH-4.8, п. 2.2)
+        out["warn"] = jobs._key_api().warnings([provider])
+    except Exception:  # noqa: BLE001 — строка оплаты не должна ронять ответ
+        pass
     if not (d.get("billing") or {}).get("zone"):  # зоны не проверялись — цикла в строке нет
         return out
     try:
-        z = jobs._key_api().zones((d.get("billing") or {}).get("provider") or KEY_PROVIDER)
+        z = jobs._key_api().zones(provider)
         out["cycle"] = (z.included_spent, z.included_total, z.until)
     except Exception:  # noqa: BLE001 — строка оплаты не должна ронять ответ
         pass
@@ -166,7 +171,7 @@ def _key_line(b: dict, reason: str | None, key: dict) -> str:
         r = b.get("rejected") if isinstance(b.get("rejected"), dict) else {}
         what = " ".join(str(r[k]) for k in ("error_status", "error") if r.get(k) is not None)
         line += f" · ключ отклонён{f' ({what})' if what else ''} · задача остановлена"
-    return line
+    return "".join([line, *(f" · {w}" for w in key.get("warn") or ())])
 
 
 def billing_line(billing: dict | None, reason: str | None = None, key: dict | None = None) -> str:
@@ -328,7 +333,24 @@ def _tail_result(events_path: Path) -> dict | None:
     return last
 
 
-PLAN_TOOLS = ("Write", "Edit", "MultiEdit")
+def _last_cost(events_path: Path) -> float | None:
+    """Последний числовой total_cost_usd в потоке событий (любое событие); нет — None (ТЗ WSH-4.8, п. 2.1.3)."""
+    last = None
+    try:
+        for line in events_path.read_text(encoding="utf-8").splitlines():
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue
+            v = e.get("total_cost_usd") if isinstance(e, dict) else None
+            if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v):
+                last = float(v)
+    except OSError:
+        return None
+    return last
+
+
+PLAN_TOOLS =("Write", "Edit", "MultiEdit")
 
 
 def _plan_source(events_path: Path, plans_dir: Path, since: float | None = None) -> Path | None:
@@ -814,12 +836,17 @@ class Supervisor:
         b = self.d.get("billing") or {}
         rec = b.get("ledger")
         cost = 0.0 if reason == "key_rejected" else result.get("phase_cost_usd")
+        note = None
+        if cost is None and state in ("cancelled", "timeout"):
+            # отмена или таймаут без итога: оценка по последнему total_cost_usd потока, если он был (ТЗ WSH-4.8,
+            # п. 2.1.3); не было — резерв остаётся
+            cost, note = self._phase_cost(_last_cost(self.jdir / "events.jsonl")), "оценка, итога нет"
         if not isinstance(rec, dict) or not isinstance(cost, (int, float)) or isinstance(cost, bool) \
                 or not math.isfinite(cost) or cost < 0:
             return
         try:
             self.jobs._key_api().code_settle({**rec, "model": b.get("model") or rec.get("model")}, cost,
-                                             state in ("completed", "plan_ready"))
+                                             state in ("completed", "plan_ready"), note)
             b["settled_usd"] = float(cost)
         except Exception as e:  # noqa: BLE001 — журнал трат не должен ронять итог звена
             self.d.setdefault("warnings", []).append(f"факт звена в журнал трат не записан: {e}"[:500])

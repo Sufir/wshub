@@ -370,7 +370,8 @@ def test_results_before_ended_refused(api, monkeypatch):
     prov.batch_state = "in_progress"
     rc, _, err = api.cli("batch", "results", "fakebatch_1")
     assert rc == 1 and "пакет fakebatch_1 ещё не закончен (in_progress" in err
-    assert batch_rows(api, "fakebatch_1") == [] and not (api.env.proj / "out").exists()
+    # строк результатов нет — только резерв пакета на submit (ТЗ WSH-4.8, п. 2.1.4)
+    assert [r["reserve"] for r in batch_rows(api, "fakebatch_1")] == [True] and not (api.env.proj / "out").exists()
     out = Srv(api).call("api_batch_results", id="fakebatch_1")
     assert out.startswith("отказ: ") and "ещё не закончен" in out
 
@@ -423,7 +424,8 @@ def test_closed_and_blocked_project(api, monkeypatch):
     out = s.call("api_batch_submit", project="payload", input_files=["q.txt"], tier="cheap")
     assert out == f"отказ: {BLOCKED}"
     out = s.call("api_batch_results", id="fakebatch_1")
-    assert out == f"отказ: {BLOCKED}" and batch_rows(api, "fakebatch_1") == []
+    # строк результатов нет — только резерв пакета на submit (ТЗ WSH-4.8, п. 2.1.4)
+    assert out == f"отказ: {BLOCKED}" and [r["reserve"] for r in batch_rows(api, "fakebatch_1")] == [True]
     assert list(prov.batches) == ["fakebatch_1"]
     api.env.hub.runtime.unblock("payload")
     assert "успешно 1, с ошибкой 0" in s.call("api_batch_results", id="fakebatch_1")

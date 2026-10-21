@@ -43,6 +43,7 @@ class Response:
     provider: str
     cost_usd: float = 0.0  # оценка хаба по таблице цен провайдера
     raw_ref: str | None = None  # путь к сырому ответу в каталоге состояния
+    warnings: tuple[str, ...] = ()  # «⚠ журнал трат: …» — ответ оплачен, строка журнала не записана (ТЗ WSH-4.8)
 
 
 @dataclass(frozen=True)

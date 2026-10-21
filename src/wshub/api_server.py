@@ -22,7 +22,7 @@ from .llm.cli import (
     _read,
     _session,
     answer_body,
-    batch_line,
+    batch_cancel_lines,
     batch_prepare,
     batch_result_lines,
     batch_status_lines,
@@ -360,7 +360,7 @@ def build_api_server(hub: Hub, now=now_local) -> FastMCP:
             return f"отказ: {e}"
         audit("api_batch_submit", project, {"provider": rec["provider"], "model": rec["model"], "batch": rec["id"],
                                             "requests": rec["requests"], "estimate_usd": rec["estimate_usd"]})
-        return "\n".join(batch_submit_lines(rec))
+        return "\n".join(batch_submit_lines(api, rec))
 
     @tool
     def api_batch_status(id: str = "") -> str:
@@ -385,7 +385,7 @@ def build_api_server(hub: Hub, now=now_local) -> FastMCP:
             project = batches.load(hub.state_dir, id)["project"]
             _blocked(hub, project)
             rec, items = api.batch_results(id)
-            out = batch_result_lines(rec, items) + write_answers(hub, rec, items, hub.state_dir,
+            out = batch_result_lines(api, rec, items) + write_answers(hub, rec, items, hub.state_dir,
                                                                  check=lambda: _blocked(hub, project))
         except USER_ERR as e:
             audit("api_batch_results", project, {"batch": id}, error=_audit_text(e))
@@ -414,7 +414,7 @@ def build_api_server(hub: Hub, now=now_local) -> FastMCP:
             audit("api_batch_cancel", params={"batch": id}, error=_audit_text(e))
             return f"отказ: {e}"
         audit("api_batch_cancel", rec.get("project"), {"batch": id})
-        return f"отмена запрошена: {batch_line(rec)}"
+        return "\n".join(batch_cancel_lines(api, rec))
 
     return mcp
 

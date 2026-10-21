@@ -72,7 +72,8 @@ SECRET_ENV_RE = re.compile(r"TOKEN|SECRET|PASSWORD|KEY", re.IGNORECASE)
 # ловятся сами. В задачу не идут (claude_cli.environment), в .claude/settings*.json проекта — отказ до старта
 BILLING_ENV_RE = re.compile(r"^(ANTHROPIC_|CLAUDE_CODE_USE_|CLAUDE_CODE_OAUTH_)|^AWS_BEARER_TOKEN_BEDROCK$")
 # [api], [api.providers.<имя>] и [workspace.<имя>.api] — доступ хаба к моделям по ключу (ТЗ WSH-4.2, п. 2.4)
-API_KEYS = {"enabled", "max_usd_per_call", "daily_usd", "providers"}
+API_KEYS = {"enabled", "max_usd_per_call", "daily_usd", "providers", "warn"}
+API_WARN_KEYS = ("day_usd", "left_usd", "call_usd")  # [api.warn]: пороги предупреждений (ТЗ WSH-4.8, п. 2.2)
 API_PROVIDER_KEYS = {"included_usd", "credits_until", "models", "strong_requires_choice", "base_url", "timeout_s"}
 # base_url провайдера (ТЗ WSH-4.3, п. 2.1.8): только https; http — лишь для 127.0.0.1 и localhost (тесты)
 API_BASE_URL_RE = re.compile(r"^(https://[^/\s?#@]+|http://(127\.0\.0\.1|localhost)(:\d+)?)(/[^\s?#]*)?$")
@@ -216,6 +217,15 @@ class ApiProvider:
 
 
 @dataclass(frozen=True)
+class ApiWarn:
+    """[api.warn]: пороги предупреждений; None — порога нет. Только показывают, ничего не останавливают
+    (ТЗ WSH-4.8, п. 2.2)."""
+    day_usd: float | None = None  # траты за сутки (все провайдеры, Code на ключе тоже) выше порога
+    left_usd: float | None = None  # остаток включённой зоны ниже порога — только если зона включена
+    call_usd: float | None = None  # оценка одного запроса или пакета выше порога
+
+
+@dataclass(frozen=True)
 class Api:
     """[api] и [workspace.<имя>.api]. Ошибка в них не ломает реестр: отказывает только API хаба
     (error — для всех проектов, project_errors — для одного). Потолки — только если заданы (ТЗ WSH-4.3, п. 2.2.2).
@@ -225,6 +235,7 @@ class Api:
     max_usd_per_call: float | None = None
     daily_usd: float | None = None
     daily_set: bool = False  # daily_usd записан в реестре: только тогда его проверяют задачи Code (ТЗ WSH-4.6, 5.2)
+    warn: ApiWarn = ApiWarn()
     providers: dict[str, ApiProvider] = field(default_factory=dict)
     error: str | None = None
     projects: dict[str, bool] = field(default_factory=dict)  # [workspace.<имя>.api] enabled; нет секции — true
@@ -651,6 +662,10 @@ def _api(t, warnings: list[str]) -> Api:
         if k in t:
             vals[k] = _usd(t[k], f"api.{k}")
     vals["daily_set"] = "daily_usd" in t
+    if "warn" in t:
+        w = _table(t["warn"], "[api.warn]")
+        warnings += [unknown_key(f"api.warn.{k}") for k in w if k not in API_WARN_KEYS]
+        vals["warn"] = ApiWarn(**{k: _usd(w[k], f"api.warn.{k}") for k in API_WARN_KEYS if k in w})
     provs: dict[str, ApiProvider] = {}
     for name, p in _table(t.get("providers", {}), "[api.providers]").items():
         where = f"[api.providers.{name}]"

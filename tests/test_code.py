@@ -23,7 +23,7 @@ FAKE_ENV = ["FAKE_REC", "FAKE_SLEEP", "FAKE_SIGINT", "FAKE_TOUCH", "FAKE_COST", 
             "FAKE_SLEEP_PLAN", "FAKE_SELF_CANCEL", "FAKE_DOCKER", "FAKE_GIT_META", "FAKE_COMMIT",
             "FAKE_SWITCH", "FAKE_RESET", "FAKE_SOURCE", "FAKE_INIT_MODEL", "FAKE_RATE", "FAKE_RATE_AT",
             "FAKE_RATE_COUNT", "FAKE_LIMIT_ERROR", "FAKE_NO_INIT", "FAKE_WRITE_SETTINGS", "FAKE_HELPER_OUT",
-            "FAKE_API_RETRY", "FAKE_API_ERROR"]
+            "FAKE_API_RETRY", "FAKE_API_ERROR", "FAKE_RUN_COST"]
 TERMINAL = ("completed", "failed", "max_turns", "max_budget", "timeout", "cancelled", "lost", "plan_ready")
 
 

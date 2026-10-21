@@ -268,18 +268,22 @@ def estimate_lines(plan: Plan) -> list[str]:
             f"{' (грубо)' if plan.rough else ''} · выход до {e.output} · {usd(plan.estimate_usd)}",
             f"зона: {ZONE_RU[plan.zone]}" if plan.zone else f"запрос был бы отклонён: {plan.refusal}",
             _cycle(plan.zones) if plan.zones is not None else NO_ZONES,
-            *_skipped(plan.skipped), *_burn(plan.zones)]
+            *_skipped(plan.skipped), *_burn(plan.zones), *([plan.unread] if plan.unread else []), *plan.warnings]
 
 
 def run_lines(api: Api, plan: Plan, resp: Response) -> list[str]:
-    """Строка «API: …» после запроса и предупреждения (журнал, «сгорит»); общий вывод CLI run и api_run."""
+    """Строка «API: …» после запроса и предупреждения (журнал, «сгорит», [api.warn]); общий вывод CLI run и
+    api_run."""
     z = api.zones(plan.provider.name) if plan.zones is not None else None
     u = resp.usage
     line = (f"API: {resp.model} · вход {u.input + u.cache_read + u.cache_write} (из кэша {u.cache_read}) · "
             f"выход {u.output} · {usd(resp.cost_usd)}" + (f" · {_cycle(z)}" if z is not None else ""))
     if plan.zone == "purchased" and z is not None and z.allow_usd is not None:
         line += f" · купленная зона {usd(z.purchased_spent)} из ${z.allow_usd:.2f}, до {ddmm(z.allow_until)}"
-    return [line, *_skipped(plan.skipped), *_burn(z)]
+    warn = api.warnings([plan.provider.name], plan.estimate_usd)
+    if plan.unread and plan.unread not in warn:  # журнал не читался на оценке — запись после ответа могла его починить
+        warn.insert(0, plan.unread)
+    return [line, *_skipped(plan.skipped), *_burn(z), *resp.warnings, *warn]
 
 
 # ---------- batch (ТЗ WSH-4.5) ----------
@@ -321,10 +325,10 @@ def _batch(config: Path, state: Path, now, args: list[str]) -> int:
         if op == "status":
             print("\n".join(batch_status_lines(api, pos[0] if pos else None)))
         elif op == "cancel":
-            print(f"отмена запрошена: {batch_line(api.batch_cancel(pos[0]))}")
+            print("\n".join(batch_cancel_lines(api, api.batch_cancel(pos[0]))))
         else:
             rec, items = api.batch_results(pos[0])
-            print("\n".join(batch_result_lines(rec, items) + write_answers(hub, rec, items, state)))
+            print("\n".join(batch_result_lines(api, rec, items) + write_answers(hub, rec, items, state)))
         return 0
     rest, inputs = _split_inputs(args)
     pos, o = _parse(rest, BATCH_VALUED)
@@ -355,7 +359,7 @@ def _batch(config: Path, state: Path, now, args: list[str]) -> int:
     plans, ids, meta = batch_prepare(api, hub, reg, o["project"], o["provider"], inputs, o.get("inputs-glob", ""),
                                      None, system, schema, o.get("tier"), o.get("model"), o.get("effort"),
                                      max_tokens, o.get("cache", "none"), o.get("choice"), o.get("out-dir", ""))
-    print("\n".join(batch_submit_lines(api.submit(plans, ids, meta))))
+    print("\n".join(batch_submit_lines(api, api.submit(plans, ids, meta))))
     return 0
 
 
@@ -418,13 +422,23 @@ def batch_prepare(api: Api, hub: Hub, reg: Registry, project: str, provider: str
     return plans, ids, {"project": project, "out_dir": out_dir or None, "inputs": inputs}
 
 
-def batch_submit_lines(rec: dict) -> list[str]:
+def _batch_warn(api: Api, rec: dict, est: float | None = None) -> list[str]:
+    """Предупреждения пакета: журнал (резерв или строки results не записаны) и [api.warn] (ТЗ WSH-4.8)."""
+    return [*rec.get("warnings", ()), *api.warnings([rec.get("provider")], est, "пакета")]
+
+
+def batch_submit_lines(api: Api, rec: dict) -> list[str]:
     where = (f"в {rec['out_dir']} проекта {rec['project']}" if rec.get("out_dir")
              else f"в ~/.local/state/wshub/api/out/{rec['id']}/")
     return [f"пакет {rec['id']} отправлен: запросов {rec['requests']} · {rec['model']} · оценка "
             f"{usd(rec['estimate_usd'])} со скидкой 50 %" + (" (вход грубо)" if rec.get("rough") else ""),
             f"ответы — {where}; ожидание до 24 ч",
-            f"состояние — batch status {rec['id']}; результаты — batch results {rec['id']}"]
+            f"состояние — batch status {rec['id']}; результаты — batch results {rec['id']}",
+            *_batch_warn(api, rec, rec["estimate_usd"])]
+
+
+def batch_cancel_lines(api: Api, rec: dict) -> list[str]:
+    return [f"отмена запрошена: {batch_line(rec)}", *_batch_warn(api, rec)]
 
 
 def batch_line(rec: dict) -> str:
@@ -438,25 +452,29 @@ def batch_line(rec: dict) -> str:
 def batch_status_lines(api: Api, batch_id: str | None) -> list[str]:
     """Один пакет (состояние от провайдера) или список учёта; общий вывод CLI batch status и api_batch_status."""
     if batch_id:
-        return [batch_line(api.batch_status(batch_id))]
+        rec = api.batch_status(batch_id)
+        return [batch_line(rec), *_batch_warn(api, rec)]
     recs, bad = api.batch_list()
     out = [batch_line(r) for r in recs] or ["пакетов нет"]
-    return out + ([f"учёт пакетов: нечитаемых файлов {bad}"] if bad else [])
+    names = sorted({r["provider"] for r in recs if isinstance(r.get("provider"), str)})
+    return out + ([f"учёт пакетов: нечитаемых файлов {bad}"] if bad else []) + api.warnings(names)
 
 
-def batch_result_lines(rec: dict, items: list[dict]) -> list[str]:
+def batch_result_lines(api: Api, rec: dict, items: list[dict]) -> list[str]:
     """Сводка results: сколько успешно, с ошибкой, цена со скидкой, строки журнала; ошибки — по custom_id."""
     ok = sum(1 for i in items if i["ok"])
     new = sum(1 for i in items if i["logged"])
-    own = sum(1 for i in items if not i.get("foreign"))
+    failed = sum(1 for i in items if i.get("ledger_failed"))
+    old = sum(1 for i in items if not i.get("foreign")) - new - failed
     out = [f"пакет {rec['id']}: успешно {ok}, с ошибкой {len(items) - ok} · "
            f"{usd(sum(i['cost_usd'] for i in items))} со скидкой 50 %",
-           f"журнал трат: записано строк {new}" + (f", уже были {own - new} — не дублируются" if new < own else "")]
+           f"журнал трат: записано строк {new}" + (f", уже были {old} — не дублируются" if old else "")
+           + (f", не записано {failed}" if failed else "")]
     for i in items:
         if not i["ok"]:
             src = (rec["inputs"].get(i["custom_id"]) or {}).get("input", "")
             out.append(f"  ✗ {i['custom_id']}" + (f" ({src})" if src else "") + f": {i['error']}")
-    return out
+    return out + _batch_warn(api, rec)
 
 
 def _same(p: Path, data: bytes) -> bool:
@@ -573,7 +591,7 @@ def stats_lines(api: Api, days: int | None = None) -> list[str]:
             out.append(f"  {title}: " + " · ".join(parts))
         out += ["  " + b for b in _burn(z)]
     out += _skipped(led.skipped)
-    return out
+    return out + api.warn_lines(led, provs, None)
 
 
 def _credits(config: Path, state: Path, now, args: list[str]) -> int:

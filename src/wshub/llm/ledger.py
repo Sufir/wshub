@@ -14,6 +14,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 ZONES = ("included", "purchased")
+NO_SPEND = "; до тех пор API хаба не тратит"  # хвост отказа — только когда журнал нужен проверкам (ТЗ WSH-4.8, 5.1.3)
 BURN_DAYS = 7  # до credits_until меньше стольких дней …
 BURN_USD = 10.0  # … а включённый остаток больше — «сгорит»
 
@@ -71,12 +72,15 @@ def read(path: Path) -> Ledger:
         else:
             skipped += 1
     if data.strip() and not rows:
-        raise LedgerError(f"журнал трат {path}: не разбирается ни одна строка — исправь или перенеси файл; "
-                          "до тех пор API хаба не тратит")
+        raise LedgerError(f"журнал трат {path}: не разбирается ни одна строка — исправь или перенеси файл{NO_SPEND}")
     # звено задачи Code пишет резерв на старте и факт по итогу (ТЗ WSH-4.6, п. 2.5.4): из строк одного job
     # действует последняя — прежние в зоны, потолок дня и stats не входят
     last = {r["job"]: i for i, r in enumerate(rows) if isinstance(r.get("job"), str)}
     rows = [r for i, r in enumerate(rows) if not isinstance(r.get("job"), str) or last[r["job"]] == i]
+    # резерв пакета на submit (ТЗ WSH-4.8, п. 2.1.4) действует, пока в журнале нет строк факта этого пакета (results)
+    facts = {r["batch"] for r in rows if isinstance(r.get("batch"), str) and r.get("reserve") is not True}
+    rows = [r for r in rows if not (r.get("reserve") is True and isinstance(r.get("batch"), str)
+                                    and r["batch"] in facts)]
     return Ledger(tuple(rows), skipped)
 
 

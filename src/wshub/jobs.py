@@ -679,19 +679,21 @@ class Jobs:
                    "WSHUB_STATE": str(self.hub.state_dir)}
             if grants.get("push") and os.environ.get("SSH_AUTH_SOCK"):
                 atomic_write_text(jdir / "ssh_auth_sock", os.environ["SSH_AUTH_SOCK"])
-            argv = claude_cli.argv(claude, plan.prompt, job_dir=jdir, model=plan.model, effort=plan.effort,
-                                   max_turns=plan.max_turns, budget_usd=plan.budget_usd, flags=flags,
-                                   session_id=None if resume else sid, resume=resume,
-                                   permission_mode=plan.permission_mode, name=plan.session_name())
-            atomic_write_text(jdir / "argv.json", json.dumps(argv, ensure_ascii=False))
-            atomic_write_text(jdir / "env.json", json.dumps(env, ensure_ascii=False))
-            atomic_write_text(jdir / GIT_START, json.dumps(git_start, ensure_ascii=False, indent=1))
-            rec = self._key_reserve(plan, jid, jdir, data["billing"]) if plan.billing == "key" else None
+            # резерв — до argv: при включённой зоне без бюджета звена бюджет claude — остаток зоны (ТЗ WSH-4.8, 2.1.2)
+            rec = self._key_reserve(plan, jid, jdir, data) if plan.billing == "key" else None
+            budget = plan.budget_usd if plan.budget_usd is not None else data["billing"].get("cap_usd")
             try:
-                write_exclude(plan.dir)
-            except OSError as e:
-                data["warnings"] = [*data["warnings"], f".git/info/exclude не записан: {e}"]
-            try:
+                argv = claude_cli.argv(claude, plan.prompt, job_dir=jdir, model=plan.model, effort=plan.effort,
+                                       max_turns=plan.max_turns, budget_usd=budget, flags=flags,
+                                       session_id=None if resume else sid, resume=resume,
+                                       permission_mode=plan.permission_mode, name=plan.session_name())
+                atomic_write_text(jdir / "argv.json", json.dumps(argv, ensure_ascii=False))
+                atomic_write_text(jdir / "env.json", json.dumps(env, ensure_ascii=False))
+                atomic_write_text(jdir / GIT_START, json.dumps(git_start, ensure_ascii=False, indent=1))
+                try:
+                    write_exclude(plan.dir)
+                except OSError as e:
+                    data["warnings"] = [*data["warnings"], f".git/info/exclude не записан: {e}"]
                 self.write(jid, data)
 
                 sup = self._spawn_supervisor(jid)
@@ -736,13 +738,17 @@ class Jobs:
         except keys.KeyProblem as e:
             raise JobError(f"задача на ключе: {e}") from None
 
-    def _key_reserve(self, plan: Plan, jid: str, jdir: Path, billing: dict) -> dict:
-        """Потолок дня и зона — если их задал оператор — под блокировкой журнала трат, резерв звена — строкой с job
-        (ТЗ WSH-4.6, п. 2.5.2–2.5.4, упрощение 5.2). Отказ — JobError с текстом 4.2, каталог звена удаляется: отказ
-        не оставляет файлов. Ответ — строка звена для факта по итогу (code_settle)."""
+    def _key_reserve(self, plan: Plan, jid: str, jdir: Path, data: dict) -> dict:
+        """Потолок дня и зона — если их включил оператор (зона — included_usd или команда credits) — под блокировкой
+        журнала трат, резерв звена — строкой с job (ТЗ WSH-4.6, п. 2.5.2–2.5.4, упрощение 5.2; ТЗ WSH-4.8, п. 2.1).
+        Отказ — JobError с текстом 4.2, каталог звена удаляется: отказ не оставляет файлов. Бюджет по остатку зоны —
+        billing.cap_usd; журнал не читается без денежных настроек — предупреждение задачи. Ответ — строка звена для
+        факта по итогу (code_settle)."""
         from .llm.core import ApiError
+        billing = data["billing"]
         try:
-            rec, by_zone = self._key_api().code_reserve(KEY_PROVIDER, plan.project, plan.model, plan.budget_usd, jid)
+            rec, by_zone, cap, warn = self._key_api().code_reserve(KEY_PROVIDER, plan.project, plan.model,
+                                                                   plan.budget_usd, jid)
         except (ApiError, OSError) as e:
             shutil.rmtree(jdir, ignore_errors=True)
             raise JobError(f"задача на ключе: {e}") from None
@@ -751,6 +757,10 @@ class Jobs:
             billing["zone"] = rec["zone"]
         if rec["reserve"]:
             billing["reserve_usd"] = rec["cost_usd"]
+        if cap is not None:
+            billing["cap_usd"] = cap
+        if warn:
+            data["warnings"] = [*data["warnings"], warn]
         return rec
 
     def _root_notify(self, root: str | None) -> str | None:

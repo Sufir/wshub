@@ -40,9 +40,12 @@ BATCHES = "/v1/messages/batches"
 BATCH_ID = re.compile(r"[A-Za-z0-9_-]{1,128}")  # id пакета идёт в путь запроса и в имя файла учёта
 
 
-def _error(msg: str):
+def _error(msg: str, no_answer: bool = False):
+    """no_answer — ответа нет за таймаут: запрос мог дойти до провайдера (ТЗ WSH-4.8, п. 2.3.2)."""
     from ..core import ApiError  # не на уровне модуля: ядро само импортирует словарь провайдеров
-    return ApiError(msg)
+    e = ApiError(msg)
+    e.no_answer = no_answer
+    return e
 
 
 def _paid(msg: str, usage: Usage | None = None, model: str | None = None, preview: str = ""):
@@ -277,7 +280,7 @@ class AnthropicProvider:
             headers["content-type"] = "application/json"
         for attempt in (1, 2):
             req = urllib.request.Request(self.base_url + path, data=data, method=method, headers=headers)
-            error, wait, raw = None, None, None
+            error, wait, raw, no_answer = None, None, None, False
             try:
                 with self._opener.open(req, timeout=self.timeout_s) as r:
                     raw = r.read()
@@ -288,16 +291,16 @@ class AnthropicProvider:
                     error = _http_error(e)
                 e.close()
             except urllib.error.URLError as e:
-                error = (f"нет ответа за {self.timeout_s} с" if isinstance(e.reason, TimeoutError)
-                         else f"соединение: {e.reason}")
+                no_answer = isinstance(e.reason, TimeoutError)
+                error = f"нет ответа за {self.timeout_s} с" if no_answer else f"соединение: {e.reason}"
             except TimeoutError:
-                error = f"нет ответа за {self.timeout_s} с"
+                error, no_answer = f"нет ответа за {self.timeout_s} с", True
             except (ValueError, http.client.HTTPException) as e:  # текст ValueError заголовка содержал бы ключ
                 error = f"запрос не прошёл: {type(e).__name__}"
             except OSError as e:
                 error = f"соединение: {type(e).__name__}"
             if error is not None:
-                raise _error(error)
+                raise _error(error, no_answer)
             if wait is not None:
                 self._sleep(wait)
                 continue

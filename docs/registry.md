@@ -93,8 +93,45 @@ check = { cmd = ["scripts/check.sh"], timeout_s = 1500 }   # cmd строкой 
 
 Задача на ключе `~/.config/wshub/keys/anthropic` (`code_start(billing="key", reason=…)` или `wshub code start
 --billing key`) отдельного ключа в реестре не требует. Деньги — только заданные оператором: бюджет `max_budget_usd`,
-дневной потолок `[api] daily_usd`, зоны — при `included_usd` в `[api.providers.anthropic]`. Подробно — раздел
-«Задачи на ключе» в [docs/code.md](code.md).
+дневной потолок `[api] daily_usd`, зоны — при `included_usd` в `[api.providers.anthropic]` или после команды
+`wshub api credits anthropic`. Подробно — раздел «Задачи на ключе» в [docs/code.md](code.md).
+
+## API хаба `[api]`
+
+Секции `[api]`, `[api.providers.<имя>]`, `[api.warn]` и `[workspace.<имя>.api]` настраивают доступ хаба к моделям по
+ключу: `wshub api run`, пакеты, сервер `wshub-api`, деньги задач wshub-code на ключе. **Все необязательны**: без них
+API включён, провайдер работает по ключу `~/.config/wshub/keys/<имя>` с умолчаниями модуля, денежных ограничений и
+предупреждений нет. Полностью — в [docs/api.md](api.md), денежные настройки одной таблицей — раздел «Деньги».
+
+```toml
+[api]
+# enabled = true             # общий выключатель; false — API хаба выключен целиком
+# max_usd_per_call = 1.0     # потолок оценки одного запроса; не задан — нет
+# daily_usd = 10.0           # потолок трат за сутки (все провайдеры и задачи Code на ключе); не задан — нет
+
+[api.warn]                   # пороги «⚠» — только показ, ничего не останавливают; не задан — порога нет
+# day_usd = 5                # траты за сутки выше
+# left_usd = 10              # остаток включённой зоны ниже (только при включённой зоне)
+# call_usd = 0.5             # оценка одного запроса или пакета выше
+
+[api.providers.anthropic]    # только для переопределений; имя — из словаря провайдеров (anthropic, fake)
+# included_usd = 100         # включает зоны; при included_usd > 0 нужен credits_until
+# credits_until = "2026-10-23"
+# models = { cheap = "…", standard = "…", strong = "…" }
+# strong_requires_choice = true
+# timeout_s = 300
+# base_url = "https://api.anthropic.com"
+
+[workspace.payload.api]
+enabled = false              # закрыть проект от отправки файлов в API; по умолчанию — открыт
+```
+
+1. Ошибка в `[api]`, `[api.warn]` или `[api.providers.*]` ломает только API хаба (файловый сервер и `wshub-code`
+   работают); ошибка в `[workspace.<имя>.api]` — только этот проект. doctor (строка «wshub-api») показывает её
+   проблемой.
+2. Суммы — конечные числа больше 0 (`included_usd` — ≥ 0); `nan` и `inf` — ошибка. Неизвестный провайдер и
+   неизвестные ключи — предупреждение, пропускаются.
+3. doctor пишет включённые денежные настройки одной строкой `деньги: …` или `деньги: ограничений нет`.
 
 ## Состояние `~/.local/state/wshub`
 

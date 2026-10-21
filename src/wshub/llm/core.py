@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,11 @@ from .types import TIERS, BatchItem, Request, Response, Usage
 
 
 class ApiError(Exception):
-    pass
+    no_answer = False  # ответа нет за таймаут: запрос мог дойти до провайдера (ТЗ WSH-4.8, п. 2.3.2)
+
+
+BATCH_MAYBE = ("пакет мог создаться у провайдера — проверь `wshub api batch status` или консоль, прежде чем "
+               "повторять")
 
 
 class PaidError(ApiError):
@@ -64,6 +69,22 @@ def ddmm(d) -> str:
     return d.strftime("%d.%m") if d else "—"
 
 
+def cents(v: float) -> float:
+    """Вниз до цента: --max-budget-usd задачи Code не превышает остаток зоны."""
+    return math.floor(round(v * 100, 6)) / 100
+
+
+def unreadable(e: Exception) -> str:
+    """Предупреждение о нечитаемом журнале, когда проверять по нему нечего (ТЗ WSH-4.8, решение 5.1.3)."""
+    return f"⚠ журнал трат не читается: {str(e).removesuffix(ledger.NO_SPEND)}"
+
+
+def ledger_failed(e: Exception, what: str = "строка не записана") -> str:
+    """Ответ оплачен, строка журнала не записана (ТЗ WSH-4.8, п. 2.3.1): предупреждение вместо отказа."""
+    why = (e.strerror or type(e).__name__) if isinstance(e, OSError) else str(e)
+    return f"⚠ журнал трат: {what} ({why}) — сумма не учтена"
+
+
 def _cache_split(inp: Usage, req: Request) -> Usage:
     """Оценка с записью в кэш (ТЗ WSH-4.4, п. 2.3а.2): при cache = short | long системная часть входа идёт в
     cache_write (long — ещё и в cache_write_1h) и оценивается по цене записи. Её размер — грубо, символы / 4, не больше
@@ -89,6 +110,8 @@ class Plan:
     rough: bool = False  # вход оценён грубо (символы / 4): нет ключа или нет count_tokens
     strong: bool = False  # сильная модель (по уровню или по модели) — сервер требует reason (ТЗ WSH-4.4, Р1)
     off_tier: bool = False  # модель вне уровней провайдера (с учётом переопределений)
+    warnings: tuple[str, ...] = ()  # «⚠ …» [api.warn] на момент оценки (ТЗ WSH-4.8, п. 2.2)
+    unread: str | None = None  # «⚠ журнал трат не читается» — проверок нет, настроек в реестре нет (решение 5.1.3)
 
 
 class Api:
@@ -158,9 +181,59 @@ class Api:
         except ledger.LedgerError as e:
             raise ApiError(str(e)) from None
 
+    def _ledger(self, strict: bool) -> tuple[ledger.Ledger, str | None]:
+        """Журнал для проверок (ТЗ WSH-4.8, решение 5.1.3): не читается, а денежной настройки в реестре нет (strict
+        ложно) — проверять нечего: пустой журнал и «⚠ журнал трат не читается». Настройка задана — отказ: проверить
+        её нечем."""
+        try:
+            return ledger.read(self.ledger_path), None
+        except ledger.LedgerError as e:
+            if strict:
+                raise ApiError(str(e)) from None
+            return ledger.Ledger((), 0), unreadable(e)
+
+    def money_set(self, conf: ApiProvider) -> bool:
+        """Задана ли в реестре денежная настройка запроса API: max_usd_per_call, daily_usd или included_usd."""
+        api = self.reg.api
+        return api.max_usd_per_call is not None or api.daily_usd is not None or conf.included_set
+
     def zones(self, name: str, led: ledger.Ledger | None = None) -> ledger.Zones:
         _prov, conf = self.provider(name)
         return ledger.zones(led or self.read_ledger(), name, conf, self.now().date())
+
+    def warnings(self, names=(), est: float | None = None, what: str = "запроса") -> list[str]:
+        """Предупреждения [api.warn] по журналу (ТЗ WSH-4.8, п. 2.2): только показывают. names — провайдеры для
+        left_usd, est — оценка запроса или пакета для call_usd. Журнал не читается — одна строка об этом."""
+        try:
+            led = ledger.read(self.ledger_path)
+        except ledger.LedgerError as e:
+            return [unreadable(e)]
+        provs = {}
+        for n in names:
+            try:
+                provs[n] = self.provider(n)[1]
+            except ApiError:
+                continue
+        return self.warn_lines(led, provs, est, what)
+
+    def warn_lines(self, led: ledger.Ledger, provs: dict[str, ApiProvider], est: float | None,
+                   what: str = "запроса") -> list[str]:
+        """Предупреждения [api.warn] по прочитанному журналу; provs — провайдеры (с секцией) для left_usd."""
+        w, out = self.reg.api.warn, []
+        if w.call_usd is not None and est is not None and est > w.call_usd:
+            out.append(f"⚠ оценка {what} {usd(est)} выше порога call_usd = ${w.call_usd:.2f} — только предупреждение")
+        if w.day_usd is not None:
+            today = ledger.spent_today(led, self.now())
+            if today > w.day_usd:
+                out.append(f"⚠ траты за сутки {usd(today)} выше порога day_usd = ${w.day_usd:.2f}")
+        if w.left_usd is not None:
+            for n, conf in provs.items():
+                if ledger.zones_set(led, n, conf):
+                    left = ledger.zones(led, n, conf, self.now().date()).included_left
+                    if left < w.left_usd:
+                        out.append(f"⚠ остаток включённой зоны {n} {usd(left)} ниже порога left_usd = "
+                                   f"${w.left_usd:.2f}")
+        return out
 
     def plan(self, req: Request, name: str, choice: str | None = None, batch: bool = False,
              exact: bool = True) -> Plan:
@@ -204,11 +277,12 @@ class Api:
         inp, rough = self._estimate(name, prov, req) if exact else (prov.estimate(req), True)
         est = replace(_cache_split(inp, req), output=req.max_tokens)
         est_usd = prov.price(model, est) * (BATCH_PRICE if batch else 1.0)
-        led = self.read_ledger()
+        led, bad = self._ledger(self.money_set(conf))
         z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
         zone, refusal = self._zone(name, est_usd, z, led)
+        warn = tuple(self.warn_lines(led, {name: conf}, est_usd))
         return Plan(prov, req, est, est_usd, zone, refusal, z, led.skipped, rough, strong=strong,
-                    off_tier=model not in tiers.values())
+                    off_tier=model not in tiers.values(), warnings=warn, unread=bad)
 
     def _estimate(self, name: str, prov: Provider, req: Request) -> tuple[Usage, bool]:
         """Оценка входа (ТЗ WSH-4.3, п. 2.1.4): при count_tokens и ключе — точная, ключ передаётся провайдеру;
@@ -268,42 +342,55 @@ class Api:
         name = plan.provider.name
         with ledger.locked(self.ledger_path):
             _prov, conf = self.provider(name)
-            led = self.read_ledger()
+            # зоны включила команда credits, а журнал между plan и run перестал читаться — проверить их нечем: отказ
+            led, _bad = self._ledger(self.money_set(conf) or plan.zones is not None)
             z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
             zone, refusal = self._zone(name, plan.estimate_usd, z, led)
             if zone is None:
                 raise ApiError(f"{refusal} — запрос не отправлен")
             return self._send(plan, zone)
 
-    def code_reserve(self, name: str, project: str, model: str, budget: float | None, job: str) -> tuple[dict, bool]:
+    def code_reserve(self, name: str, project: str, model: str, budget: float | None,
+                     job: str) -> tuple[dict, bool, float | None, str | None]:
         """Старт звена задачи Code на ключе (ТЗ WSH-4.6, п. 2.5.2–2.5.4 и упрощение 5.2): проверяется только то, что
-        оператор записал в реестр, — потолок дня, если задан [api] daily_usd, и зоны, если у провайдера задан
-        included_usd. Проверка и строка-резерв с job — под блокировкой журнала; не помещается — ApiError с текстом 4.2.
-        Нечего проверять — резерва нет. Ответ — (строка звена, проверялись ли зоны); reserve в строке — записан ли
-        резерв; по итогу её заменит или дополнит строка с фактом (code_settle). Без бюджета звена проверка требует
-        хотя бы цента остатка."""
+        оператор включил явно, — потолок дня, если задан [api] daily_usd, и зоны, если у провайдера задан included_usd
+        или введена команда credits (ТЗ WSH-4.8, п. 2.1.1). Проверка и строка-резерв с job — под блокировкой журнала;
+        не помещается — ApiError с текстом 4.2. Нечего проверять — резерва нет. Без бюджета звена проверка требует
+        хотя бы цента остатка, а при включённой зоне бюджет звена — остаток зоны (или разрешения allow) вниз до цента:
+        он идёт claude флагом --max-budget-usd и он же резерв (п. 2.1.2, решение 5.1.1). Журнал не читается, а в
+        реестре нет ни daily_usd, ни included_usd — без проверок, с предупреждением (решение 5.1.3). Ответ — (строка
+        звена, проверялись ли зоны, бюджет по остатку зоны или None, предупреждение или None); reserve в строке —
+        записан ли резерв; по итогу её заменит или дополнит строка с фактом (code_settle)."""
         self.check_section()
-        conf = self.reg.api.providers.get(name)
-        by_zone, day = conf is not None and conf.included_set, self.reg.api.daily_set
+        conf = self.reg.api.providers.get(name) or ApiProvider()
+        day = self.reg.api.daily_set
         rec = {"kind": "run", "provider": name, "model": model, "tier": None, "project": project, "template": "code",
                "zone": "included", "job": job, "usage": Usage().as_dict()}
+        led, bad = self._ledger(day or conf.included_set)
+        by_zone = ledger.zones_set(led, name, conf)
         if not by_zone and not day:
-            return {**rec, "ts": ledger.stamp(self.now()), "cost_usd": 0.0, "reserve": False}, False
+            return {**rec, "ts": ledger.stamp(self.now()), "cost_usd": 0.0, "reserve": False}, False, None, bad
         with ledger.locked(self.ledger_path):
-            led = self.read_ledger()
+            led = self.read_ledger()  # проверки включены — без журнала их не проверить: отказ
             z = ledger.zones(led, name, conf, self.now().date()) if by_zone else None
             zone, refusal = self._zone(name, CENT if budget is None else budget, z, led, per_call=False, day=day)
             if zone is None:
                 raise ApiError(f"{refusal} — задача не запущена")
-            rec.update(ts=ledger.stamp(self.now()), zone=zone, cost_usd=float(budget or 0.0), reserve=True)
+            cap = None
+            if z is not None and budget is None:
+                cap = cents(z.included_left if zone == "included" else z.purchased_left)
+            rec.update(ts=ledger.stamp(self.now()), zone=zone, cost_usd=float(cap or budget or 0.0), reserve=True)
             ledger.append(self.ledger_path, rec)
-            return rec, by_zone
+            return rec, by_zone, cap, None
 
-    def code_settle(self, rec: dict, cost: float, ok: bool | None) -> None:
-        """Факт звена вместо резерва: строка того же job (ТЗ WSH-4.6, п. 2.5.4)."""
+    def code_settle(self, rec: dict, cost: float, ok: bool | None, note: str | None = None) -> None:
+        """Факт звена вместо резерва: строка того же job (ТЗ WSH-4.6, п. 2.5.4); note — пометка строки (оценка без
+        итога, ТЗ WSH-4.8, п. 2.1.3)."""
+        row = {**rec, "ts": ledger.stamp(self.now()), "cost_usd": float(cost), "reserve": False, "ok": ok}
+        if note:
+            row["note"] = note
         with ledger.locked(self.ledger_path):
-            ledger.append(self.ledger_path, {**rec, "ts": ledger.stamp(self.now()), "cost_usd": float(cost),
-                                             "reserve": False, "ok": ok})
+            ledger.append(self.ledger_path, row)
 
     def _send(self, plan: Plan, zone: str) -> Response:
         name, req = plan.provider.name, plan.request
@@ -340,9 +427,13 @@ class Api:
             cost = plan.provider.price(resp.model, resp.usage)
         except KeyError:  # модель ответа не из таблицы цен — считаем по оценке до запроса
             cost = plan.estimate_usd
-        ledger.append(self.ledger_path, {**rec, "model": resp.model, "usage": resp.usage.as_dict(),
-                                         "cost_usd": cost, "ok": True})
-        return replace(resp, cost_usd=cost)
+        warn: tuple[str, ...] = ()
+        try:
+            ledger.append(self.ledger_path, {**rec, "model": resp.model, "usage": resp.usage.as_dict(),
+                                             "cost_usd": cost, "ok": True})
+        except (ledger.LedgerError, OSError) as e:  # ответ оплачен — отдаём его, сбой журнала — предупреждением
+            warn = (ledger_failed(e),)
+        return replace(resp, cost_usd=cost, warnings=warn)
 
     # ---------- пакеты (ТЗ WSH-4.5) ----------
 
@@ -352,12 +443,11 @@ class Api:
             raise ApiError(f"провайдер {name} не поддерживает batch — пакет не отправлен")
         return prov
 
-    def money_checks(self, name: str) -> bool:
-        """Задана ли хоть одна денежная проверка: max_usd_per_call, daily_usd или зоны провайдера (решение Р2)."""
+    def money_checks(self, name: str, led: ledger.Ledger | None = None) -> bool:
+        """Задана ли хоть одна денежная проверка: max_usd_per_call, daily_usd или зоны провайдера (решение Р2).
+        Журнал не читается без настроек в реестре — проверок нет (ТЗ WSH-4.8, решение 5.1.3)."""
         _prov, conf = self.provider(name)
-        api = self.reg.api
-        return (api.max_usd_per_call is not None or api.daily_usd is not None
-                or ledger.zones_set(self.read_ledger(), name, conf))
+        return self.money_set(conf) or ledger.zones_set(led or self._ledger(False)[0], name, conf)
 
     def batch_plan(self, requests: list[Request], name: str, choice: str | None = None, check=None) -> list[Plan]:
         """Каждый запрос пакета — те же проверки, что у run (выбор модели, choice для strong, потолок одного запроса —
@@ -379,8 +469,9 @@ class Api:
             plans.append(p)
         return plans
 
-    def _keyed(self, name: str, what: str, call):
-        """Вызов провайдера с ключом: ключ — только здесь; ошибка — ApiError без ключа и без цепочки исключений."""
+    def _keyed(self, name: str, what: str, call, no_answer: str = ""):
+        """Вызов провайдера с ключом: ключ — только здесь; ошибка — ApiError без ключа и без цепочки исключений.
+        no_answer — хвост текста, если ответа нет за таймаут (запрос мог дойти до провайдера)."""
         try:
             key = keys.read(keys.key_path(self.config_dir, name))
         except keys.KeyProblem as e:
@@ -390,6 +481,8 @@ class Api:
             out = call(key)
         except Exception as e:
             error = scrub(f"{type(e).__name__}: {e}", key)
+            if no_answer and (getattr(e, "no_answer", False) or isinstance(e, TimeoutError)):
+                error += f"; {no_answer}"
         del key
         if error is not None:
             raise ApiError(f"провайдер {name}: {what}: {error}")
@@ -397,22 +490,33 @@ class Api:
 
     def submit(self, plans: list[Plan], ids: list[str], meta: dict) -> dict:
         """Отправка пакета по проверенным планам (ТЗ WSH-4.5, п. 2.1.2; решение Р1): потолок дня и зоны — на сумму
-        оценок, заново под блокировкой журнала до отправки. Резерва в журнале нет: траты — строками results. Ответ —
-        запись учёта; meta — project, out_dir, inputs {custom_id: {input, file}}."""
+        оценок, заново под блокировкой журнала до отправки. При денежной проверке — резерв на сумму оценок строкой с
+        batch и reserve: true под той же блокировкой; строки results его заменяют (ТЗ WSH-4.8, п. 2.1.4). Без проверок
+        резерва нет: траты — строками results. Ответ — запись учёта (warnings — если резерв не записан); meta —
+        project, out_dir, inputs {custom_id: {input, file}}."""
         for cid, p in zip(ids, plans, strict=True):
             if p.zone is None:
                 raise ApiError(f"{cid}: {p.refusal} — пакет не отправлен")
         prov, first = plans[0].provider, plans[0].request
         name, total = prov.name, sum(p.estimate_usd for p in plans)
+        warn = []
         with ledger.locked(self.ledger_path):
             _prov, conf = self.provider(name)
-            led = self.read_ledger()
+            led, _bad = self._ledger(self.money_set(conf) or any(p.zones is not None for p in plans))
             z = ledger.zones(led, name, conf, self.now().date()) if ledger.zones_set(led, name, conf) else None
             zone, refusal = self._zone(name, total, z, led, per_call=False)
             if zone is None:
                 raise ApiError(f"пакет: {refusal} — пакет не отправлен")
             pairs = [(cid, p.request) for cid, p in zip(ids, plans, strict=True)]
-            bid = self._keyed(name, "пакет", lambda key: prov.batch_submit(pairs, key))
+            bid = self._keyed(name, "пакет", lambda key: prov.batch_submit(pairs, key), no_answer=BATCH_MAYBE)
+            if self.money_checks(name, led):
+                try:
+                    ledger.append(self.ledger_path, {
+                        "ts": ledger.stamp(self.now()), "kind": "run", "provider": name, "model": first.model,
+                        "tier": first.tier, "project": first.project, "template": None, "batch": str(bid)[:200],
+                        "zone": zone, "usage": Usage().as_dict(), "cost_usd": total, "reserve": True})
+                except (ledger.LedgerError, OSError) as e:  # пакет уже создан — учёт важнее резерва
+                    warn.append(ledger_failed(e, "резерв пакета не записан"))
         try:
             batches.check_id(bid)
         except batches.BatchError:
@@ -429,7 +533,7 @@ class Api:
         except OSError as e:
             raise ApiError(f"пакет {bid} создан у провайдера, но учёт не записан ({e.strerror or type(e).__name__}); "
                            "результаты хаб не разложит — отмени пакет в консоли провайдера") from None
-        return rec
+        return {**rec, "warnings": warn} if warn else rec
 
     def _refresh(self, rec: dict, state: dict) -> dict:
         rec.update(status=state.get("status", "?"), counts=state.get("counts", {}), ended_at=state.get("ended_at"),
@@ -498,7 +602,12 @@ class Api:
                        "usage": it["usage"].as_dict(), "cost_usd": it["cost_usd"], "ok": it["ok"]}
                 if it["error"]:
                     row["error"] = it["error"]
-                ledger.append(self.ledger_path, row)
+                try:
+                    ledger.append(self.ledger_path, row)
+                except (ledger.LedgerError, OSError) as e:  # ответы оплачены — их раскладываем, следующая выборка
+                    it.update(logged=False, ledger_failed=True)  # допишет строку (ТЗ WSH-4.8, п. 2.3.1)
+                    rec["warnings"] = [ledger_failed(e, "строки результатов не записаны")]
+                    continue
                 done.add(it["custom_id"])
         return rec, items
 

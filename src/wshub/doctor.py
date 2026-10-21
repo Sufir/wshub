@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import housekeeping, outbox
-from .registry import LIMITS, OUTBOX, Limits, Outbox, RegistryError, parse
+from .registry import LIMITS, OUTBOX, ApiProvider, Limits, Outbox, RegistryError, parse
 from .runtime import code_head, live_processes, pid_alive, proc_start, repo_dir
 
 BACKUP_WARN = 1024 * 1024 * 1024
@@ -582,11 +582,62 @@ def check_api(ctx: Ctx, reg) -> dict:
             (problems if os.path.lexists(paths[name]) else infos).append(f"ключ {name}: {e}")
     if not names:
         infos.append("ключей API нет — задать: wshub api key set <провайдер>")
+    if not api.error:
+        money, bad, warn = _money(ctx, reg)
+        lines.append(money)
+        problems += bad
+        infos += warn
     if problems:
         return _check("api", title, "fail", lines + problems, "исправь реестр [api] или права ключа")
     if not entries:  # сервер — опция: без записи в Desktop это не «внимание» (ключ может быть только для задач Code)
         return _check("api", title, "info", lines + infos, "сервер wshub-api не подключён — это опция")
     return _check("api", title, "warn" if infos else "ok", lines + infos)
+
+
+def _money(ctx: Ctx, reg) -> tuple[str, list[str], list[str]]:
+    """Включённые денежные настройки одной строкой «деньги: …» (ТЗ WSH-4.8, п. 2.4.3), проблема журнала трат и
+    предупреждения [api.warn]. Зоны по команде credits и разрешения allow — по журналу трат."""
+    from .llm import ledger
+    from .llm.core import Api, ddmm, unreadable
+    api, eng = reg.api, Api(reg, ctx.config.parent, ctx.state)
+    parts, problems, warn = [], [], []
+    for k in ("max_usd_per_call", "daily_usd"):
+        if getattr(api, k) is not None:
+            parts.append(f"{k} ${getattr(api, k):.2f}")
+    provs = eng.available()
+    try:
+        led = ledger.read(eng.ledger_path)
+    except ledger.LedgerError as e:
+        # денежная настройка в реестре — проверить её нечем (проблема); без настроек — только ⚠ (решение 5.1.3)
+        led = ledger.Ledger((), 0)
+        if eng.money_set(ApiProvider()) or any(c.included_set for c in provs.values()):
+            problems.append(f"журнал трат: {str(e).removesuffix(ledger.NO_SPEND)}")
+        else:
+            warn.append(unreadable(e))
+    t = eng.now()
+    zones, allows = [], []
+    for name, conf in provs.items():
+        if conf.included_set:
+            zones.append(f"{name} (included_usd)")
+        elif ledger.zones_set(led, name, conf):
+            zones.append(f"{name} (credits)")
+        z = ledger.zones(led, name, conf, t.date())
+        if z.allow_usd is not None:
+            allows.append(f"{name} ${z.allow_usd:.2f} до {ddmm(z.allow_until)}")
+    if zones:
+        parts.append("зоны: " + ", ".join(zones))
+    if allows:
+        parts.append("allow: " + ", ".join(allows))
+    budgets = [f"{n} ${p.max_budget_usd:g}" for n, p in sorted(reg.code.projects.items())
+               if p.max_budget_usd is not None]
+    if budgets:
+        parts.append("max_budget_usd (Code): " + ", ".join(budgets))
+    w = [f"{k} ${getattr(api.warn, k):.2f}" for k in ("day_usd", "left_usd", "call_usd")
+         if getattr(api.warn, k) is not None]
+    if w:
+        parts.append("[api.warn] " + ", ".join(w))
+    line = "деньги: " + (" · ".join(parts) if parts else "ограничений нет")
+    return line, problems, warn + eng.warn_lines(led, provs, None)
 
 
 def run(ctx: Ctx) -> dict:

@@ -588,7 +588,8 @@ def check_api(ctx: Ctx, reg) -> dict:
         problems += bad
         infos += warn
     if problems:
-        return _check("api", title, "fail", lines + problems, "исправь реестр [api] или права ключа")
+        return _check("api", title, "fail", lines + problems,
+                      "исправь реестр [api], права ключа или журнал трат (исправь или перенеси файл)")
     if not entries:  # сервер — опция: без записи в Desktop это не «внимание» (ключ может быть только для задач Code)
         return _check("api", title, "info", lines + infos, "сервер wshub-api не подключён — это опция")
     return _check("api", title, "warn" if infos else "ok", lines + infos)

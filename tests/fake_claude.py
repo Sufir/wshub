@@ -33,7 +33,7 @@
   FAKE_NO_INIT — не печатать init (источник оплаты не подтверждён)
   FAKE_WRITE_SETTINGS — на середине FAKE_SLEEP записать этот текст в .claude/settings.local.json cwd (настройки,
                  изменённые посреди звена мимо deny)
-  FAKE_RUN_COST — до сна событие system с этим total_cost_usd (стоимость на ходу, до итога)
+  FAKE_RUN_COST — до сна события system с total_cost_usd 0.01, затем с этим (стоимость на ходу, до итога)
 В режиме plan фейк, как настоящий claude 2.1.291 (PoC WSH-3, 0.3.1), пишет план инструментом Write
 в $HOME/.claude/plans/<slug>.md и завершается success.
 """
@@ -149,8 +149,8 @@ def main() -> int:
     emit({"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "Read",
           "input": {"file_path": "x"}}]}})
     if os.environ.get("FAKE_RUN_COST"):  # стоимость на ходу, до итога (отмена без итога, ТЗ WSH-4.8, п. 2.1.3)
-        emit({"type": "system", "subtype": "status", "session_id": sid,
-              "total_cost_usd": float(os.environ["FAKE_RUN_COST"])})
+        for v in (0.01, float(os.environ["FAKE_RUN_COST"])):  # две суммы: действует последняя
+            emit({"type": "system", "subtype": "status", "session_id": sid, "total_cost_usd": v})
 
     if os.environ.get("FAKE_DOCKER"):
         hook_err = "PreToolUse:Bash hook error: [python -m wshub.hook]: wshub: docker: отказ"

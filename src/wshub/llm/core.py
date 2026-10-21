@@ -224,8 +224,10 @@ class Api:
             out.append(f"⚠ оценка {what} {usd(est)} выше порога call_usd = ${w.call_usd:.2f} — только предупреждение")
         if w.day_usd is not None:
             today = ledger.spent_today(led, self.now())
-            if today > w.day_usd:
-                out.append(f"⚠ траты за сутки {usd(today)} выше порога day_usd = ${w.day_usd:.2f}")
+            if today > w.day_usd:  # резервы — в тратах, как у потолка daily_usd; их доля — в скобках
+                held = ledger.reserved_today(led, self.now())
+                out.append(f"⚠ траты за сутки {usd(today)}" + (f" (из них резерв {usd(held)})" if held else "")
+                           + f" выше порога day_usd = ${w.day_usd:.2f}")
         if w.left_usd is not None:
             for n, conf in provs.items():
                 if ledger.zones_set(led, n, conf):
@@ -372,6 +374,7 @@ class Api:
             return {**rec, "ts": ledger.stamp(self.now()), "cost_usd": 0.0, "reserve": False}, False, None, bad
         with ledger.locked(self.ledger_path):
             led = self.read_ledger()  # проверки включены — без журнала их не проверить: отказ
+            by_zone = ledger.zones_set(led, name, conf)  # заново под блокировкой: credits мог прийти между чтениями
             z = ledger.zones(led, name, conf, self.now().date()) if by_zone else None
             zone, refusal = self._zone(name, CENT if budget is None else budget, z, led, per_call=False, day=day)
             if zone is None:
@@ -591,11 +594,18 @@ class Api:
             seen.add(i.custom_id)
             items.append(self._batch_item(prov, rec, i))
         with ledger.locked(self.ledger_path):
-            done = {r.get("custom_id") for r in self.read_ledger().rows if r.get("batch") == batch_id}
+            # журнал не читается, денежных настроек нет (решение 5.1.3) — ответы раскладываем, строки не пишем: без
+            # журнала не видно, какие уже записаны; следующая выборка их допишет
+            led, bad = self._ledger(self.money_set(self.provider(name)[1]))
+            done = {r.get("custom_id") for r in led.rows if r.get("batch") == batch_id}
+            if bad:
+                rec["warnings"] = [bad + " — строки результатов не записаны"]
             base = {"kind": "run", "provider": name, "tier": rec.get("tier"), "project": rec["project"],
                     "template": None, "batch": batch_id, "zone": rec.get("zone") or "included"}
             for it in items:
                 it["logged"] = not it.get("foreign") and it["custom_id"] not in done
+                if bad and it["logged"]:
+                    it.update(logged=False, ledger_failed=True)
                 if not it["logged"]:
                     continue
                 row = {"ts": ledger.stamp(self.now()), **base, "custom_id": it["custom_id"], "model": it["model"],

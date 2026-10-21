@@ -350,7 +350,7 @@ def _last_cost(events_path: Path) -> float | None:
     return last
 
 
-PLAN_TOOLS =("Write", "Edit", "MultiEdit")
+PLAN_TOOLS = ("Write", "Edit", "MultiEdit")
 
 
 def _plan_source(events_path: Path, plans_dir: Path, since: float | None = None) -> Path | None:

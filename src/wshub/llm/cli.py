@@ -274,7 +274,10 @@ def estimate_lines(plan: Plan) -> list[str]:
 def run_lines(api: Api, plan: Plan, resp: Response) -> list[str]:
     """Строка «API: …» после запроса и предупреждения (журнал, «сгорит», [api.warn]); общий вывод CLI run и
     api_run."""
-    z = api.zones(plan.provider.name) if plan.zones is not None else None
+    try:  # ответ уже оплачен: журнал перестал читаться — строка без цикла, предупреждения всё равно выводятся
+        z = api.zones(plan.provider.name) if plan.zones is not None else None
+    except ApiError:
+        z = None
     u = resp.usage
     line = (f"API: {resp.model} · вход {u.input + u.cache_read + u.cache_write} (из кэша {u.cache_read}) · "
             f"выход {u.output} · {usd(resp.cost_usd)}" + (f" · {_cycle(z)}" if z is not None else ""))
@@ -424,7 +427,9 @@ def batch_prepare(api: Api, hub: Hub, reg: Registry, project: str, provider: str
 
 def _batch_warn(api: Api, rec: dict, est: float | None = None) -> list[str]:
     """Предупреждения пакета: журнал (резерв или строки results не записаны) и [api.warn] (ТЗ WSH-4.8)."""
-    return [*rec.get("warnings", ()), *api.warnings([rec.get("provider")], est, "пакета")]
+    own = list(rec.get("warnings", ()))
+    warn = api.warnings([rec.get("provider")], est, "пакета")
+    return own + [w for w in warn if not any(x.startswith(w) for x in own)]  # «журнал не читается» — один раз
 
 
 def batch_submit_lines(api: Api, rec: dict) -> list[str]:

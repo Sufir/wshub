@@ -8,7 +8,7 @@ import time
 from datetime import datetime
 
 import pytest
-from test_api import ApiEnv, req, set_api, use
+from test_api import NOW, ApiEnv, req, set_api, use
 from test_api_anthropic import Server
 from test_api_batch import created
 from test_api_server import Srv
@@ -22,6 +22,7 @@ from test_code_plan import _opt
 from wshub import claude_cli, doctor, registry
 from wshub.jobs import JobError
 from wshub.llm import batches, keys, ledger
+from wshub.llm import core as api_core
 from wshub.llm.cli import api_main
 from wshub.llm.core import BATCH_MAYBE, ApiError
 from wshub.llm.providers import fake
@@ -181,8 +182,8 @@ def _wait_text(path, text: str, timeout: float = 15) -> None:
 @pytest.mark.parametrize("how", ["cancel", "timeout"])
 @pytest.mark.parametrize("cost", ["0.42", None])
 def test_cancel_or_timeout_without_result(code, monkeypatch, how, cost):
-    """П. 2.1.3: итога нет (claude убит SIGKILL) — в журнал оценка по последнему total_cost_usd потока с пометкой
-    «оценка, итога нет»; суммы в потоке не было — резерв остаётся."""
+    """П. 2.1.3: итога нет (claude убит SIGKILL) — в журнал оценка по последнему total_cost_usd потока (фейк пишет
+    0.01, затем 0.42) с пометкой «оценка, итога нет»; суммы в потоке не было — резерв остаётся."""
     over = {**NO_LIMITS, "max_hours": f"{3 / 3600}"} if how == "timeout" else NO_LIMITS
     _registry(code, api=KEY_API, **over)
     for k, v in {"FAKE_SLEEP": "60", "FAKE_SIGINT": "ignore-all", "WSHUB_CODE_CANCEL_SIGTERM_S": "0.5",
@@ -193,7 +194,7 @@ def test_cancel_or_timeout_without_result(code, monkeypatch, how, cost):
     jid = code.jobs.start(_plan(code))["id"]
     _wait_running(code.jobs, jid)
     if how == "cancel":
-        _wait_text(code.jobs.job_dir(jid) / "events.jsonl", "total_cost_usd" if cost else '"Read"')
+        _wait_text(code.jobs.job_dir(jid) / "events.jsonl", f'"total_cost_usd": {cost}' if cost else '"Read"')
         code.jobs.cancel(jid)
     snap = wait_terminal(code.jobs, jid, timeout=60)
     assert snap["state"] == ("cancelled" if how == "cancel" else "timeout")
@@ -209,7 +210,7 @@ def test_cancel_with_result_has_no_note(code, monkeypatch):
     monkeypatch.setenv("FAKE_RUN_COST", "0.42")
     jid = code.jobs.start(_plan(code))["id"]
     _wait_running(code.jobs, jid)
-    _wait_text(code.jobs.job_dir(jid) / "events.jsonl", "total_cost_usd")
+    _wait_text(code.jobs.job_dir(jid) / "events.jsonl", '"total_cost_usd": 0.42')
     code.jobs.cancel(jid)
     assert wait_terminal(code.jobs, jid)["state"] == "cancelled"
     assert [(r["reserve"], r.get("note")) for r in _raw(code) if r.get("job") == jid] == [(True, None), (False, None)]
@@ -297,16 +298,20 @@ def test_warn_in_code_billing_line(code, monkeypatch):
     assert "⚠ траты за сутки ≈$1.10 выше порога day_usd = $1.00" in line
 
 
-@pytest.mark.parametrize("text,err", [
-    ("[api]\nwarn = 5\n", "[api.warn]"),
-    ("[api.warn]\nday_usd = 0\n", "api.warn.day_usd"),
-    ("[api.warn]\nleft_usd = -1\n", "api.warn.left_usd"),
-    ("[api.warn]\ncall_usd = nan\n", "api.warn.call_usd"),
-    ('[api.warn]\ncall_usd = "1"\n', "api.warn.call_usd"),
+@pytest.mark.parametrize("text,warn", [
+    ("[api]\nwarn = 5\n", "[api.warn]: ожидается таблица — пороги предупреждений пропущены"),
+    ("[api.warn]\nday_usd = 0\n", "api.warn.day_usd: число больше 0 — порог пропущен"),
+    ("[api.warn]\nleft_usd = -1\n", "api.warn.left_usd: число больше 0 — порог пропущен"),
+    ("[api.warn]\ncall_usd = nan\n", "api.warn.call_usd: число больше 0 — порог пропущен"),
+    ('[api.warn]\ncall_usd = "1"\n', "api.warn.call_usd: число больше 0 — порог пропущен"),
 ])
-def test_warn_registry_errors(text, err):
+def test_warn_registry_errors_only_warn(text, warn):
+    """Ревью, п. 9: неверный порог — предупреждение реестра, порог пропущен; API не ломается (пороги ничего не
+    останавливают, и их ошибка тоже)."""
     reg = registry.parse(text)
-    assert reg.api.error and err in reg.api.error
+    assert not reg.api.error and warn in reg.warnings and reg.api.warn == registry.ApiWarn()
+    reg = registry.parse("[api.warn]\nday_usd = 0\ncall_usd = 1\n")
+    assert not reg.api.error and reg.api.warn == registry.ApiWarn(call_usd=1.0)
 
 
 def test_warn_registry_values():
@@ -381,6 +386,8 @@ def test_unreadable_ledger_without_settings_warns(api, monkeypatch, broken):
         api.ledger_path.write_text("garbage\n")
     rc, _, err = api.run()
     assert rc == 1 and "журнал трат" in err and len(prov.calls) == 2
+    rc, _, err = api.run("--estimate")  # оценка с настройкой — тоже отказ: проверить её нечем (ревью)
+    assert rc == 1 and "журнал трат" in err
 
 
 def test_unreadable_ledger_code_key(code, monkeypatch, tmp_path):
@@ -476,3 +483,110 @@ def test_doctor_code_budget_in_money_line(code, tmp_path):
     _registry(code, api="")  # max_budget_usd = 10 у проекта proj
     c = doctor.check_api(ctx(code, tmp_path), code.hub.registry.get())
     assert money_line(c) == "деньги: max_budget_usd (Code): proj $10"
+
+
+# ---------- по ревью субагента ----------
+
+def _row(cost: float) -> dict:
+    return {"ts": ledger.stamp(NOW), "kind": "run", "provider": "fake", "zone": "included", "cost_usd": cost}
+
+
+def test_warn_boundaries_strict(tmp_path):
+    """Порог — строго «выше» / «ниже»: ровно на пороге предупреждения нет (мутации > → >=, < → <=)."""
+    reg = registry.parse("[api.warn]\nday_usd = 2\nleft_usd = 3\ncall_usd = 0.5\n" + FAKE_ZONE)
+    eng = api_core.Api(reg, tmp_path, tmp_path, lambda: NOW)
+    provs = {"fake": reg.api.providers["fake"]}
+    assert eng.warn_lines(ledger.Ledger((_row(2.0),), 0), provs, 0.5) == []  # сутки ровно 2, остаток ровно 3
+    out = eng.warn_lines(ledger.Ledger((_row(2.0), _row(0.01)), 0), provs, 0.51)
+    assert [x.split(" ")[1] for x in out] == ["оценка", "траты", "остаток"]
+
+
+def test_warn_in_all_batch_outputs(api, monkeypatch, tmp_path):
+    """⚠ — во всех командах batch и во всех инструментах api_batch_* (ревью: cancel, status ID, сервер); doctor
+    считает сутки по настоящей дате."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    set_api(api.env, "[api.warn]\nday_usd = 1\n", ws="")
+    api.spend(1.5, provider="other")
+    s = Srv(api)
+    outs = [api.cli(*SUBMIT, "--inputs", "in/one.txt")[1], api.cli("batch", "status", "fakebatch_1")[1],
+            api.cli("batch", "status")[1], api.cli("batch", "results", "fakebatch_1")[1],
+            api.cli("batch", "cancel", "fakebatch_1")[1]]
+    prov.batch_state = "ended"
+    outs += [s.call("api_batch_submit", project="payload", inputs=["а"], tier="cheap"),
+             s.call("api_batch_status", id="fakebatch_2"), s.call("api_batch_status"),
+             s.call("api_batch_results", id="fakebatch_2"), s.call("api_batch_cancel", id="fakebatch_2")]
+    for o in outs:
+        assert "⚠ траты за сутки ≈$1.50 выше порога day_usd = $1.00" in o, o
+    spend_now(api.ledger_path, 1.5, provider="other")
+    c = doctor.check_api(ctx(api.env, tmp_path), registry.RegistryFile(api.env.cfg).get())
+    assert any(x.startswith("⚠ траты за сутки ≈$1.50 выше порога day_usd") for x in c["detail"])
+
+
+def test_day_warn_shows_reserve_part(code, monkeypatch):
+    """Ревью, п. 7: траты за сутки для day_usd — с резервами, как для daily_usd; их доля — в скобках."""
+    _registry(code, api=KEY_API + "\n[api.warn]\nday_usd = 5\n", **NO_LIMITS)
+    monkeypatch.setenv("FAKE_SLEEP", "3")
+    jid = code.jobs.start(_plan(code))["id"]  # резерв = остаток зоны 100
+    line = apply_billing(code.jobs, code.jobs.snapshot(jid))["billing"]
+    assert "⚠ траты за сутки ≈$100.00 (из них резерв ≈$100.00) выше порога day_usd = $5.00" in line
+    wait_terminal(code.jobs, jid)
+    assert "⚠" not in apply_billing(code.jobs, code.jobs.snapshot(jid))["billing"]  # факт 0.5 < 5
+
+
+def test_batch_reserve_write_failure_keeps_batch(api, monkeypatch):
+    """Ревью, п. 5: резерв пакета не записался — пакет уже создан, учёт пакета записан, ⚠ в выводе."""
+    use(monkeypatch, fake.FakeProvider())
+    set_api(api.env, "[api]\ndaily_usd = 1\n", ws="")
+
+    def boom(path, rec):
+        raise OSError(28, "No space left on device")
+    monkeypatch.setattr(ledger, "append", boom)
+    rc, out, err = api.cli(*SUBMIT, "--inputs", "in/one.txt")
+    assert rc == 0, err
+    assert "пакет fakebatch_1 отправлен" in out
+    assert "⚠ журнал трат: резерв пакета не записан (No space left on device) — сумма не учтена" in out
+    rec = batches.load(api.env.state, "fakebatch_1")
+    assert rec["provider"] == "fake" and "warnings" not in rec  # предупреждение — в ответе, не в учёте
+
+
+def test_batch_reserve_with_credits_only_zone(api, monkeypatch):
+    """Ревью: зона только по команде credits — тоже денежная проверка, резерв есть; у пакета из двух входов results
+    оставляют обе строки факта (не «последняя строка пакета»)."""
+    use(monkeypatch, fake.FakeProvider())
+    assert api.cli("credits", "fake", "--left", "1", "--until", "31.10")[0] == 0
+    assert api.cli(*SUBMIT, "--inputs", "in/one.txt", "in/two.txt")[0] == 0
+    [res] = [r for r in api.rows() if r.get("reserve")]
+    assert (res["batch"], res["zone"]) == ("fakebatch_1", "included")
+    assert api.cli("batch", "results", "fakebatch_1")[0] == 0
+    rows = [r for r in api.rows() if r.get("batch") == "fakebatch_1"]
+    assert sorted(r["custom_id"] for r in rows) == ["one", "two"] and not any(r.get("reserve") for r in rows)
+
+
+def test_run_refuses_when_ledger_breaks_after_credits_plan(api, monkeypatch):
+    """Ревью: зоны включила команда credits, журнал перестал читаться между plan и run — проверить нечем, отказ."""
+    prov = use(monkeypatch, fake.FakeProvider())
+    assert api.cli("credits", "fake", "--left", "1", "--until", "31.10")[0] == 0
+    eng = api.engine()
+    plan = eng.plan(req(), "fake")
+    assert plan.zones is not None
+    api.ledger_path.write_text("garbage\n")
+    with pytest.raises(ApiError, match="не разбирается ни одна строка"):
+        eng.run(plan)
+    assert prov.calls == []
+
+
+def test_results_with_unreadable_ledger_without_settings(api, monkeypatch):
+    """Ревью, п. 6 и решение 5.1.3: журнал не читается, настроек нет — results раскладывает ответы, строки журнала
+    откладывает до следующей выборки."""
+    use(monkeypatch, fake.FakeProvider())
+    assert api.cli(*SUBMIT, "--inputs", "in/one.txt")[0] == 0
+    api.ledger_path.parent.mkdir(parents=True, exist_ok=True)
+    api.ledger_path.write_text("garbage\n")
+    rc, out, err = api.cli("batch", "results", "fakebatch_1")
+    assert rc == 0, err
+    assert "журнал трат: записано строк 0, не записано 1" in out
+    assert out.count("⚠ журнал трат не читается: ") == 1 and "— строки результатов не записаны" in out
+    assert (api.env.state / "api" / "out" / "fakebatch_1" / "one.md").exists()
+    api.ledger_path.unlink()
+    rc, out, _ = api.cli("batch", "results", "fakebatch_1")
+    assert rc == 0 and "журнал трат: записано строк 1" in out

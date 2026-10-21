@@ -663,9 +663,7 @@ def _api(t, warnings: list[str]) -> Api:
             vals[k] = _usd(t[k], f"api.{k}")
     vals["daily_set"] = "daily_usd" in t
     if "warn" in t:
-        w = _table(t["warn"], "[api.warn]")
-        warnings += [unknown_key(f"api.warn.{k}") for k in w if k not in API_WARN_KEYS]
-        vals["warn"] = ApiWarn(**{k: _usd(w[k], f"api.warn.{k}") for k in API_WARN_KEYS if k in w})
+        vals["warn"] = _api_warn(t["warn"], warnings)
     provs: dict[str, ApiProvider] = {}
     for name, p in _table(t.get("providers", {}), "[api.providers]").items():
         where = f"[api.providers.{name}]"
@@ -704,6 +702,23 @@ def _api(t, warnings: list[str]) -> Api:
             raise RegistryError(f"{where}: при included_usd > 0 нужен credits_until = \"ГГГГ-ММ-ДД\"")
         provs[name] = ApiProvider(**pv)
     return Api(present=True, providers=provs, **vals)
+
+
+def _api_warn(t, warnings: list[str]) -> ApiWarn:
+    """[api.warn]: пороги только показывают, поэтому неверное значение не ломает API — порог пропускается с
+    предупреждением реестра (doctor его покажет), а не останавливает траты (ТЗ WSH-4.8, п. 2.2)."""
+    if not isinstance(t, dict):
+        warnings.append("[api.warn]: ожидается таблица — пороги предупреждений пропущены")
+        return ApiWarn()
+    warnings += [unknown_key(f"api.warn.{k}") for k in t if k not in API_WARN_KEYS]
+    vals = {}
+    for k in API_WARN_KEYS:
+        if k in t:
+            try:
+                vals[k] = _usd(t[k], f"api.warn.{k}")
+            except RegistryError as e:
+                warnings.append(f"{e} — порог пропущен")
+    return ApiWarn(**vals)
 
 
 def _ws_api(name: str, t, warnings: list[str]) -> bool:

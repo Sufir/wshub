@@ -183,6 +183,13 @@ def spent_today(led: Ledger, now: datetime) -> float:
                if r["kind"] == "run" and _local_date(r["ts"], now) == today)
 
 
+def reserved_today(led: Ledger, now: datetime) -> float:
+    """Из трат текущих суток — действующие резервы (задачи Code и пакеты до итога, ТЗ WSH-4.8): для текста ⚠."""
+    today = now.date()
+    return sum(r["cost_usd"] for r in led.rows
+               if r["kind"] == "run" and r.get("reserve") is True and _local_date(r["ts"], now) == today)
+
+
 def _local_date(ts: str, now: datetime) -> date:
     t = datetime.fromisoformat(ts)
     return (t.astimezone(now.tzinfo) if t.tzinfo and now.tzinfo else t).date()

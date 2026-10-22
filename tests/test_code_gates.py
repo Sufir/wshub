@@ -445,18 +445,26 @@ def test_gate_sigterm_to_helper(code):
     assert _external(code, jid)[-1]["exit"] == 130
 
 
-def test_gate_one_per_project(code, tmp_path):
-    _gates(code, slow='{ cmd = ["sleep", "30"], timeout_s = 60 }', ok='"true"')
-    # второй проект со своим гейтом: лок — на проект, а не общий (круг 2, Т2)
+def _move(code, jid: str, **over) -> None:
+    d = code.jobs.read(jid)
+    d.update(over)
+    code.jobs.write(jid, d)
+
+
+def test_gate_one_per_dir(code, tmp_path):
+    """Один гейт на каталог задачи (ТЗ WSH-3.8, Л): в том же каталоге — отказ; другой каталог того же проекта и другой
+    проект (круг 2, Т2) — свой лок, гейты идут одновременно."""
+    sub = make_repo(code.root / "sub")
+    code.write(dirs='[".", "sub"]', gates='{ slow = { cmd = ["sleep", "30"], timeout_s = 60 }, ok = "true" }')
     other = make_repo(tmp_path / "other")
     code.cfg.write_text(code.cfg.read_text() + f'\n[workspace.other]\npath = "{other}"\nmode = "rw"\n\n'
                         '[workspace.other.code]\nenabled = true\ndirs = ["."]\nprompts = "prompts"\n'
                         'gates = { ok = "true" }\n', encoding="utf-8")
     jid = _gate_job(code)
     jid_b = _gate_job(code)
-    d = code.jobs.read(jid_b)
-    d.update(project="other", dir=str(other))
-    code.jobs.write(jid_b, d)
+    _move(code, jid_b, project="other", dir=str(other))
+    jid_s = _gate_job(code)
+    _move(code, jid_s, dir=str(sub))
     env = {**os.environ, "WSHUB_JOB": jid, "WSHUB_CONFIG": str(code.cfg), "WSHUB_STATE": str(code.state)}
     proc = subprocess.Popen([sys.executable, "-m", "wshub", "gate", "slow"], cwd=code.root, env=env,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -466,12 +474,17 @@ def test_gate_one_per_project(code, tmp_path):
         jid2 = _gate_job(code)
         r = subprocess.run([sys.executable, "-m", "wshub", "gate", "ok"], cwd=code.root, capture_output=True,
                            text=True, env={**env, "WSHUB_JOB": jid2}, timeout=30)
-        assert r.returncode == 1 and f"у проекта уже идёт гейт slow задачи {jid}" in r.stderr
+        assert r.returncode == 1 and f"в каталоге {code.root} уже идёт гейт slow задачи {jid}" in r.stderr
         assert _external(code, jid2)[-1]["exit"] == 1
+        assert read_json(_holder(code))["dir"] == str(code.root)
+        # другой каталог того же проекта — свой лок: гейт идёт, пока в корне идёт slow
+        r = subprocess.run([sys.executable, "-m", "wshub", "gate", "ok"], cwd=sub, capture_output=True,
+                           text=True, env={**env, "WSHUB_JOB": jid_s}, timeout=30)
+        assert r.returncode == 0, r.stderr
         r = subprocess.run([sys.executable, "-m", "wshub", "gate", "ok"], cwd=other, capture_output=True,
                            text=True, env={**env, "WSHUB_JOB": jid_b}, timeout=30)
         assert r.returncode == 0, r.stderr  # другой проект — свой лок
-        assert proc.poll() is None  # гейт проекта proc всё ещё идёт
+        assert proc.poll() is None  # гейт в корне всё ещё идёт
     finally:
         proc.send_signal(signal.SIGTERM)
         proc.wait(timeout=20)
@@ -522,8 +535,9 @@ def test_gate_killed_by_signal_code(code, capsys):
 
 # ---------- круг 2: помощник ----------
 
-def _holder(code) -> Path:
-    return code.state / "code" / "gates" / "proj.holder"
+def _holder(code, workdir=None) -> Path:
+    """.holder лока гейтов каталога задачи (ТЗ WSH-3.8, Л): по умолчанию — корень проекта."""
+    return helper.gate_lock_paths(code.state, "proj", workdir or code.root)[1]
 
 
 def test_gate_orphan_killed(code, capsys):
@@ -546,6 +560,33 @@ def test_gate_orphan_killed(code, capsys):
         assert row["exit"] == 0 and row["orphan_killed"] == {"job": "20261019-000000-aaaaaa", "gate": "slow"}
         h = json.loads(_holder(code).read_text())
         assert h["job"] == jid and "pgid" not in h  # гейт кончился — группы в .holder нет
+    finally:
+        if orphan.poll() is None:
+            os.killpg(orphan.pid, signal.SIGKILL)
+
+
+def test_gate_orphan_found_by_own_dir_holder(code, capsys):
+    """ТЗ WSH-3.8, Л: сирота ищется по .holder своего каталога — гейт в корне не трогает сироту каталога sub, гейт
+    в sub гасит её."""
+    sub = make_repo(code.root / "sub")
+    code.write(dirs='[".", "sub"]', gates='{ ok = "true" }')
+    jid = _gate_job(code)
+    jid_s = _gate_job(code)
+    _move(code, jid_s, dir=str(sub))
+    orphan = _spawn_group()
+    try:
+        assert _wait(lambda: len(_group_live(orphan.pid)) >= 2)
+        h = _holder(code, sub)
+        assert h != _holder(code)
+        h.parent.mkdir(parents=True, exist_ok=True)
+        h.write_text(json.dumps({"job": "20261019-000000-aaaaaa", "gate": "slow", "dir": str(sub), "helper": 999999,
+                                 "pid": orphan.pid, "pgid": orphan.pid, "proc_start": proc_start(orphan.pid)}))
+        rc, out = _helper(code, "gate", ["ok"], jid, capsys=capsys)
+        assert rc == 0 and "осиротевший" not in out.out and orphan.poll() is None
+        rc, out = _helper(code, "gate", ["ok"], jid_s, cwd=sub, capsys=capsys)
+        assert rc == 0 and out.out.startswith("погашен осиротевший гейт slow задачи 20261019-000000-aaaaaa\n")
+        orphan.wait(timeout=15)
+        assert read_json(h)["job"] == jid_s and read_json(h)["dir"] == str(sub)
     finally:
         if orphan.poll() is None:
             os.killpg(orphan.pid, signal.SIGKILL)

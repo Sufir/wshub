@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import contextlib
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -581,30 +582,42 @@ def _gate_argv(ctx: Ctx, g, env: dict) -> list[str]:
     return [exe, *g.cmd[1:]]
 
 
+def gate_lock_paths(state: Path, project: str, workdir: Path) -> tuple[Path, Path]:
+    """(лок, .holder) гейтов рабочего каталога (ТЗ WSH-3.8, Л): <state>/code/gates/<проект>/<ключ>.lock и .holder,
+    ключ — первые 16 знаков sha256 от realpath каталога задачи."""
+    key = hashlib.sha256(os.path.realpath(workdir).encode()).hexdigest()[:16]
+    d = state / "code" / "gates" / project
+    return d / f"{key}.lock", d / f"{key}.holder"
+
+
 def _gate_lock(ctx: Ctx, name: str) -> tuple[int, Path, dict | None]:
-    """Один гейт на проект за раз (Г3.2): неблокирующий flock в каталоге состояния хаба; кто держит — в файле рядом
-    (.holder: задача, гейт, помощник и группа гейта). Лок взят, а в .holder — живая группа гейта (защита proc_start):
-    прежний помощник умер, не погасив гейт, — у сироты нет ни таймаута, ни учёта, её гасим (круг 2, Р1). Ответ —
-    (fd лока, путь .holder, {job, gate} погашенной сироты или None)."""
+    """Один гейт на каталог задачи за раз (Г3.2; ТЗ WSH-3.8, Л): неблокирующий flock в каталоге состояния хаба, свой
+    у каждого рабочего каталога проекта; кто держит — в файле рядом (.holder: задача, гейт, каталог, помощник и группа
+    гейта). Лок взят, а в .holder — живая группа гейта (защита proc_start): прежний помощник умер, не погасив гейт, —
+    у сироты нет ни таймаута, ни учёта, её гасим (круг 2, Р1). Ответ — (fd лока, путь .holder, {job, gate}
+    погашенной сироты или None)."""
     import fcntl
-    d = ctx.hub.state_dir / "code" / "gates"
-    proj = ctx.d["project"]
-    holder = d / f"{proj}.holder"
+    lock, holder = gate_lock_paths(ctx.hub.state_dir, ctx.d["project"], ctx.dir)
     try:
-        d.mkdir(parents=True, exist_ok=True)
-        fd = os.open(d / f"{proj}.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError as e:
-        raise HelperError(f"лок гейтов проекта не открывается: {e}") from None
+        raise HelperError(f"лок гейтов каталога не открывается: {e}") from None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         os.close(fd)
         h = read_json(holder)
-        raise HelperError(f"у проекта уже идёт гейт {h.get('gate', '?')} задачи {h.get('job', '?')}") from None
+        raise HelperError(f"в каталоге {h.get('dir') or ctx.dir} уже идёт гейт {h.get('gate', '?')} задачи "
+                          f"{h.get('job', '?')}") from None
     old = read_json(holder)
     orphan = {"job": old.get("job"), "gate": old.get("gate")} if old and kill_gate_group(old) else None
-    _write_holder(holder, {"job": ctx.jid, "gate": name, "helper": os.getpid()})
+    _write_holder(holder, _holder_rec(ctx, name))
     return fd, holder, orphan
+
+
+def _holder_rec(ctx: Ctx, name: str) -> dict:
+    return {"job": ctx.jid, "gate": name, "dir": str(ctx.dir), "helper": os.getpid()}
 
 
 def _write_holder(holder: Path, data: dict) -> None:
@@ -705,7 +718,7 @@ def gate(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
             _say(f"погашен осиротевший гейт {orphan['gate']} задачи {orphan['job']}\n")
         return _run_gate(ctx, g, argv, env, out_path, out_arg, shown, holder, orphan)
     finally:
-        _write_holder(holder, {"job": ctx.jid, "gate": name, "helper": os.getpid()})  # гейт кончился — группы нет
+        _write_holder(holder, _holder_rec(ctx, name))  # гейт кончился — группы нет
         os.close(lock)
 
 
@@ -776,7 +789,7 @@ def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, ou
                 reader.join(GATE_JOIN)
                 sink.close()
                 return _refuse(ctx, "gate", shown, f"gate.pid не записан ({e.strerror or e}) — гейт погашен", base)
-            _write_holder(holder, {"job": ctx.jid, "gate": g.name, "helper": os.getpid(), **group})  # для сироты (Р1)
+            _write_holder(holder, {**_holder_rec(ctx, g.name), **group})  # для сироты (Р1)
             # отмена пришла между check() и запуском: надзиратель уже искал gate.pid и не нашёл (Р6) — как сигнал
             interrupted = None if _job_running(ctx) else "signal"
             deadline = t0 + g.timeout_s

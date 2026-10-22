@@ -230,12 +230,14 @@ def test_start_reading_profiles_no_gates(code, profile):
     s = json.loads((code.jobs.job_dir(jid) / "settings.json").read_text())
     env = json.loads((code.jobs.job_dir(jid) / "env.json").read_text())
     assert "Bash(wshub gate *)" not in s["permissions"]["allow"] and "env" not in s
-    assert env["PATH"] == os.environ["PATH"]  # helper_env — только при гейтах, push или forge
+    # helper_env — только при гейтах, push, forge или wshub switch (у review — switch, ТЗ WSH-3.8, В4.2)
+    assert (env["PATH"] == os.environ["PATH"]) is (profile == "recon")
     wait_terminal(code.jobs, jid)
 
 
 def test_start_without_gates_no_helper_env(code):
-    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    # recon: ни гейтов, ни push/forge, ни wshub switch (у task и review он есть всегда — ТЗ WSH-3.8, В4)
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile(profile="recon")))["id"]
     env = json.loads((code.jobs.job_dir(jid) / "env.json").read_text())
     assert env["PATH"] == os.environ["PATH"]
     wait_terminal(code.jobs, jid)

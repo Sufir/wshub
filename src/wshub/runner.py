@@ -32,15 +32,22 @@ from .jobs import (
     _sum,
     billing_mode,
     billing_settings_problem,
+    branch_exists,
     cancel_timers,
     clip_list,
     config_keys,
     cost_shown,
     git_meta,
+    head_label,
     head_state,
     kill_gate,
     meta_changes,
+    parse_switch,
     phase_cost,
+    start_snapshot,
+    switch_commit,
+    switch_prepare,
+    switch_run,
 )
 from .runtime import atomic_write_text, proc_start, read_json
 
@@ -607,6 +614,10 @@ class Supervisor:
             git = self._git()
             if not self._prefetch(git, cwd, environ):
                 return
+        if (self.d.get("switch") or {}).get("spec"):  # после prefetch, до claude (ТЗ WSH-3.8, В2.2)
+            git = git or self._git()
+            if not self._switch(git, cwd, environ):
+                return
         self._run_code(cwd, environ)
         self._finish(git or self._git(), cwd, environ)
 
@@ -628,6 +639,42 @@ class Supervisor:
         except (OSError, subprocess.TimeoutExpired) as e:
             self._fail("prefetch", str(e))
             return False
+        return True
+
+    def _switch(self, git: str, cwd: Path, environ: dict) -> bool:
+        """Ключ switch: шапки (ТЗ WSH-3.8, В2): уже на месте — ничего не делать (звено исполнения после плана и
+        code_resume не переключают второй раз); иначе проверки и git switch по форме В1 через gitsafe. Сбой — звено
+        failed с reason switch и текстом git, claude не запускается. После переключения снимок git на старте
+        снимается заново: «Вне кода» считает коммиты от HEAD после switch."""
+        spec = self.d["switch"]["spec"]
+        try:
+            sw = parse_switch(spec.split(), self.d.get("profile"))
+            now = head_state(git, cwd, environ)
+            frm = head_label(now)
+            here = now.get("branch") == sw.name if sw.kind != "detach" else \
+                now.get("branch") is None and now.get("head") is not None \
+                and now.get("head") == switch_commit(git, cwd, sw.name, environ)
+            if here:
+                self._save(switch={"spec": spec, "from": frm, "to": frm, "done": False})
+                return True
+            if sw.kind == "create" and branch_exists(git, cwd, sw.name, environ):
+                raise JobError(f"ветка {sw.name} уже есть, HEAD на {frm} — поправь switch в шапке")
+            _ws, proj, _glob = self.jobs._project(self.d["project"])
+            switch_prepare(git, cwd, sw, environ, proj.push_protect)
+            r = switch_run(git, cwd, sw, environ)
+            if r.returncode != 0:
+                raise JobError(f"git {' '.join(sw.argv())} вернул {r.returncode}: "
+                               f"{(r.stderr.strip() or r.stdout.strip())[:500]}")
+            to = head_label(head_state(git, cwd, environ))
+            atomic_write_text(self.jdir / GIT_START, json.dumps(start_snapshot(cwd, environ), ensure_ascii=False,
+                                                                indent=1))
+        except gitsafe.GitUnsafe as e:
+            self._fail("switch", f"{e.reason}: {e}")
+            return False
+        except Exception as e:  # noqa: BLE001 — JobError, реестр, OSError, таймаут: звено не стартует
+            self._fail("switch", str(e) or type(e).__name__)
+            return False
+        self._save(switch={"spec": spec, "from": frm, "to": to, "done": True})
         return True
 
     def _fail(self, reason: str, message: str) -> None:

@@ -1,4 +1,5 @@
-"""Помощник хаба для задач Claude Code: `wshub push` и `wshub forge` (ТЗ WSH-3.4, А3), `wshub gate` (ТЗ WSH-3.5, Г3).
+"""Помощник хаба для задач Claude Code: `wshub push` и `wshub forge` (ТЗ WSH-3.4, А3), `wshub gate` (ТЗ WSH-3.5, Г3),
+`wshub switch` (ТЗ WSH-3.8, В3: смена ветки вне песочницы — в ней git switch падает на смонтированных файлах).
 
 Code вызывает его из Bash; помощник идёт вне песочницы (sandbox.excludedCommands) и для git и API хостинга —
 единственный путь в сеть. Форму команды держит хук (одно звено, без обёрток), регламент и разрешение задачи —
@@ -30,7 +31,22 @@ from datetime import datetime
 from pathlib import Path
 
 from . import gitsafe
-from .jobs import GATE_PID, SANDBOX_MOUNTS, deny_read_hit, gate_group_alive, kill_gate_group, stop_gate_group
+from .jobs import (
+    GATE_PID,
+    SANDBOX_MOUNTS,
+    SWITCH_PROFILES,
+    SWITCH_TIMEOUT,
+    JobError,
+    deny_read_hit,
+    gate_group_alive,
+    head_label,
+    head_state,
+    kill_gate_group,
+    parse_switch,
+    stop_gate_group,
+    switch_prepare,
+    switch_run,
+)
 from .registry import forge_url
 from .runtime import atomic_write_text, proc_start, read_json
 
@@ -52,7 +68,8 @@ LINK_RE = re.compile(r"https?://[^\s'\"<>]+/(?:merge_requests|pull|pulls)/(?:new
 JOB_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z2-7]{6}$")
 USAGE = {"push": "wshub push <remote> <ветка> [-o ключ=значение]…",
          "forge": "wshub forge <GET|POST|PUT|PATCH> <путь> [--data <json-файл>] [--out <файл>]",
-         "gate": "wshub gate <имя> [--out <файл>]"}
+         "gate": "wshub gate <имя> [--out <файл>]",
+         "switch": "wshub switch <ветка> | wshub switch -c <ветка> <база> | wshub switch --detach <ссылка>"}
 # гейт (ТЗ WSH-3.5, Г3.6): полный лог и --out — не больше GATE_LOG_MAX байт; в stdout — хвост GATE_TAIL символов.
 # Claude показывает модели около 10000 символов вывода неуспешной команды и около 30000 успешной: хвост с итогом
 # виден целиком в обоих случаях
@@ -137,7 +154,8 @@ def context(hub, environ: dict, cwd: str) -> Ctx:
 
 def check(ctx: Ctx, cwd: str, kind: str) -> None:
     """Задача идёт, cwd внутри её каталога, разрешение kind (push | forge) есть и регламент его не закрыл; gate —
-    профиль task в фазе исполнения (гейты проекта — из перечитанного реестра, ctx.proj)."""
+    профиль task в фазе исполнения (гейты проекта — из перечитанного реестра, ctx.proj); switch — профиль task или
+    review в фазе исполнения."""
     from .jobs import JobError
     state = ctx.jobs.effective_state(ctx.d)
     if state != "running":
@@ -159,6 +177,9 @@ def check(ctx: Ctx, cwd: str, kind: str) -> None:
         if ctx.d.get("profile") != "task" or ctx.d.get("phase") == "plan":
             raise HelperError("гейт — только задаче профиля task в фазе исполнения: он запускает код рабочего "
                               "каталога вне песочницы")
+    elif kind == "switch":  # профиль и фаза, без разрешений задачи (ТЗ WSH-3.8, В3.2; раздел 5, п. 6)
+        if ctx.d.get("profile") not in SWITCH_PROFILES or ctx.d.get("phase") == "plan":
+            raise HelperError("смена ветки — только задаче профиля task или review в фазе исполнения")
     elif kind == "push":
         if ctx.proj.push == "no":
             raise HelperError(f"в проекте {name} пуш закрыт реестром (push = no)")
@@ -835,6 +856,41 @@ def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, ou
     return code
 
 
+# ---------- wshub switch ----------
+
+def switch(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
+    """wshub switch <ветка> | -c <ветка> <база> | --detach <ссылка> (ТЗ WSH-3.8, В3): git switch вне песочницы в
+    рабочем каталоге задачи — в песочнице он падает на смонтированных файлах. Проверки — те же, что у ключа switch:
+    шапки (jobs.switch_prepare); stdout и stderr git — в stdout помощника как есть, код выхода — код git."""
+    shown = [a[:200] for a in args[:4]]
+    try:
+        check(ctx, cwd, "switch")
+        try:
+            sw = parse_switch(args, ctx.d.get("profile"))
+        except JobError as e:
+            raise HelperError(str(e)) from None
+        git = shutil.which("git", path=environ.get("PATH")) or "git"
+        before = head_label(head_state(git, ctx.dir, environ))
+        switch_prepare(git, ctx.dir, sw, environ, ctx.proj.push_protect)
+        r = switch_run(git, ctx.dir, sw, environ)
+    except (HelperError, JobError, gitsafe.GitUnsafe) as e:
+        return _refuse(ctx, "switch", shown, str(e))
+    except subprocess.TimeoutExpired:
+        return _refuse(ctx, "switch", shown, f"git switch не уложился в {SWITCH_TIMEOUT} с")
+    except OSError as e:
+        return _refuse(ctx, "switch", shown, f"git не запустился: {e}")
+    try:
+        after = head_label(head_state(git, ctx.dir, environ))
+    except (gitsafe.GitUnsafe, OSError, subprocess.TimeoutExpired):
+        after = None
+    # учёт — до вывода: канал stdout бывает закрыт после отмены или выхода claude (круг 3, Р15)
+    ctx.record("switch", shown, r.returncode, None,
+               None if r.returncode == 0 else f"git switch вернул {r.returncode}: {(r.stderr or r.stdout).strip()}",
+               {"from": before, "to": after})
+    _say(r.stdout + r.stderr)
+    return r.returncode
+
+
 def _refuse(ctx: Ctx, cmd: str, shown: list[str], reason: str, extra: dict | None = None) -> int:
     # учёт — до вывода: канал stderr бывает закрыт после отмены или выхода claude (круг 3, Р15)
     ctx.record(cmd, shown, 1, None, reason, extra)
@@ -846,7 +902,7 @@ def _refuse(ctx: Ctx, cmd: str, shown: list[str], reason: str, extra: dict | Non
 
 def main(cmd: str, args: list[str], config: Path, state: Path, environ: dict | None = None,
          cwd: str | None = None) -> int:
-    """wshub push|forge|gate …: 0 — сделано, иначе отказ, код git или код гейта (причина — в stderr)."""
+    """wshub push|forge|gate|switch …: 0 — сделано, иначе отказ, код git или код гейта (причина — в stderr)."""
     from .core import Hub
     environ = dict(os.environ) if environ is None else environ
     cwd = cwd or os.getcwd()
@@ -860,4 +916,4 @@ def main(cmd: str, args: list[str], config: Path, state: Path, environ: dict | N
         print(f"wshub {cmd}: отказ: {e}", file=sys.stderr)
         hub._audit_code(f"wshub_{cmd}", None, environ.get("WSHUB_JOB") or None, status="error", error=str(e))
         return 1
-    return {"push": push, "forge": forge, "gate": gate}[cmd](ctx, args, environ, cwd)
+    return {"push": push, "forge": forge, "gate": gate, "switch": switch}[cmd](ctx, args, environ, cwd)

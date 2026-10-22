@@ -29,6 +29,7 @@ from .jobs import (
     meta_warning,
     outside_view,
     phase_cost,
+    switch_line,
 )
 from .registry import RegistryError, forge_url
 from .runner import apply_billing, billing_line, hide_cost_for, shown
@@ -229,7 +230,8 @@ def build_code_server(hub) -> FastMCP:
         """Итог задачи: состояние, выбор модели и его источник, ходы и действия, звенья цепочки (суммы в долларах
         на подписке не показываются), итоговый текст Code, снимок git, блок «Вне кода» (HEAD и ветка, коммиты,
         до 10 docker-команд и их число, правки .git/hooks и .git/config — по всем звеньям), «Внешние действия»
-        (пуш, API хостинга, гейты), команда, чтобы открыть сессию в терминале, и пути к существующим файлам.
+        (пуш, API хостинга, гейты, смены ветки), смену ветки ключом switch: шапки, команду, чтобы открыть сессию в
+        терминале, и пути к существующим файлам.
         Правка .git/hooks или .git/config — предупреждение первой строкой."""
         try:
             out = apply_billing(jobs, jobs.result_view(job, docker_max=RESULT_DOCKER_MAX), model=True)
@@ -487,7 +489,10 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
                                   "docker_count": oc.get("docker_count", 0), "head_moved": oc.get("head_moved") or []},
                       "external": {"push_count": ex.get("push_count", 0), "forge_count": ex.get("forge_count", 0),
                                    "gate_count": ex.get("gate_count", 0), "gate_failed": ex.get("gate_failed", 0),
-                                   "gate": ex.get("gate") or [], "links": ex.get("links") or []},
+                                   "gate": ex.get("gate") or [], "switch_count": ex.get("switch_count", 0),
+                                   "switch": ex.get("switch") or [], "links": ex.get("links") or []},
+                      # switch: шапки (ТЗ WSH-3.8, В2.7)
+                      "switch": [switch_line(x["switch"]) for x in links if isinstance(x.get("switch"), dict)],
                       "result_head": "\n".join(text.strip().splitlines()[:RESULT_HEAD_LINES])}
     return out
 

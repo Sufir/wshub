@@ -66,6 +66,17 @@ HUB_BLOCK_CMD = 100  # символов команды гейта в строк�
 HUB_BLOCK_PATH = 200  # символов пути в строке блока (круг 2, Р8)
 HIDDEN_JOB_MAX = 200  # путей sandbox_hidden в job.json
 GATES_PYTHON_M = "гейты недоступны: хаб запущен как python -m wshub"
+# смена ветки (ТЗ WSH-3.8, часть В): ключ switch: шапки и помощник wshub switch
+SWITCH_FORMS = "<ветка> | -c <ветка> <база> | --detach <ссылка>"
+SWITCH_PROFILES = ("task", "review")  # помощник; ключ шапки — все профили, форма -c — только task
+SWITCH_TIMEOUT = 120
+SWITCH_PYTHON_M = "смена ветки помощником недоступна: хаб запущен как python -m wshub"
+HUB_SWITCH_TAIL = (" целиком: `git switch` в песочнице падает на файлах, которые она монтирует («Device or resource "
+                   "busy»).")
+HUB_SWITCH = {"task": "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch -c <ветка> <база>` | "
+                      "`wshub switch --detach <ссылка>`" + HUB_SWITCH_TAIL,
+              "review": "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch --detach <ссылка>`"
+                        + HUB_SWITCH_TAIL}
 # гейт (ТЗ WSH-3.5, Г3): pid, pgid и proc_start идущего гейта — в каталоге звена; SIGTERM группе → пауза → SIGKILL
 GATE_PID = "gate.pid"
 GATE_KILL_AFTER = 10
@@ -159,6 +170,8 @@ class Plan:
     gates: tuple = ()  # гейты задачи профиля task; звену плана правила не даются (ТЗ WSH-3.5, Г2)
     sandbox_hidden: list[str] | None = None  # отслеживаемые файлы, скрытые песочницей (ТЗ WSH-3.5, П2)
     billing: str = BILLING  # режим оплаты; у звеньев цепочки — режим корня (ТЗ WSH-4.6, п. 2.1.1)
+    switch: str | None = None  # ключ switch: шапки — выполняет надзиратель до claude (ТЗ WSH-3.8, В2)
+    switch_helper: bool = False  # правила wshub switch профилю (task, review; исполнение) — ТЗ WSH-3.8, В4
 
     @property
     def permission_mode(self) -> str:
@@ -353,6 +366,9 @@ class Jobs:
         profile = header["profile"]
         if profile not in proj.profiles:
             raise JobError(f"профиль {profile} не разрешён проекту (profiles = {', '.join(proj.profiles)})")
+        switch = header.get("switch")
+        if switch is not None:  # форма и профиль — до старта (ТЗ WSH-3.8, В2.1); git — у надзирателя
+            switch_protected(parse_switch(switch.split(), profile), proj.push_protect)
         if chosen_by not in (None, "", "operator", "chat"):
             raise JobError("chosen_by — \"operator\" (выбор оператора) или пусто")
         if channel not in ("cli", "mcp"):
@@ -381,13 +397,15 @@ class Jobs:
         prompt_name = prompt_override or header.get("prompt") or profile
         prompt, warnings, note_left = self._render(root, proj, prompt_name, header["ticket"], task_rel, note)
         gates = link_gates(proj, profile, warnings)
+        switch_helper = link_switch(profile, warnings)
         hidden = self._hidden(dir_abs, glob, proj, warnings)
-        prompt += hub_block(note_left, gates, "plan" if choice.plan != "no" else None, hidden, prompt)
+        prompt += hub_block(note_left, gates, "plan" if choice.plan != "no" else None, hidden, prompt,
+                            switch=profile if switch_helper and choice.plan == "no" else None)
         out = Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, choice.model, choice.effort,
                    max_turns, budget_usd, prompt, warnings + gwarn + limit_warn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
                    budget_total=budget_usd, max_turns_total=max_turns, grants=grants, gates=gates,
-                   sandbox_hidden=hidden, billing=mode)
+                   sandbox_hidden=hidden, billing=mode, switch=switch, switch_helper=switch_helper)
         if choice.plan != "no":
             # шаблон исполнения проверяем на старте, а не после оплаченной фазы плана (2.6.3)
             self._render(root, proj, proj.execute_prompt, header["ticket"], task_rel,
@@ -612,7 +630,8 @@ class Jobs:
         flags = claude_cli.detect_flags(claude, self.hub.state_dir, env)
         grants = plan.grants or {}
         gates = plan.gates if plan.phase != "plan" else ()  # гейты — только фазе исполнения (Г1)
-        if grants.get("push") or grants.get("forge") or gates:
+        switch = plan.switch_helper and plan.phase != "plan"  # wshub switch — фаза исполнения (ТЗ WSH-3.8, В4)
+        if grants.get("push") or grants.get("forge") or gates or switch:
             env = helper_env(env, plan.dir)
         if grants.get("forge"):  # файл токена — при старте задачи с доступом к API (А1.2)
             from .helper import HelperError, read_token
@@ -662,6 +681,8 @@ class Jobs:
                 "notify": self._root_notify(chain_root) or glob.notify,
                 "billing": {"mode": plan.billing},  # режим оплаты; init и rate допишет надзиратель (ТЗ WSH-4.6)
             }
+            if plan.switch:  # from, to и done допишет надзиратель (ТЗ WSH-3.8, В2.7)
+                data["switch"] = {"spec": plan.switch}
             sid = resume or str(_uuid4())
             data["session_id"] = sid if not resume else resume
             data["claude"] = claude
@@ -673,7 +694,7 @@ class Jobs:
             settings = claude_cli.settings(plan.profile, plan.task_rel, glob, plan.proj, protected,
                                            self.hub.protected_data, hook_cmd, Path.home(), plan.dir,
                                            phase="plan" if plan.phase == "plan" else None, read_extra=read_extra,
-                                           grants=grants, gates=gates, key_helper=key_helper)
+                                           grants=grants, gates=gates, key_helper=key_helper, switch=switch)
             claude_cli.write_job_files(jdir, settings, plan.prompt)
             # помощнику — задача и хаб (не секреты); агент ssh — только в каталог задачи, Code туда не видит (А3)
             env = {**env, "WSHUB_JOB": jid, "WSHUB_CONFIG": str(self.hub.registry.path),
@@ -1091,8 +1112,10 @@ class Jobs:
             raise JobError(f"ходы задачи исчерпаны: из {d.get('max_turns_total')} не осталось")
         prompt, warnings, note_left = self._render(root, proj, template, d.get("ticket") or "", d["task_rel"], note)
         gates = link_gates(proj, d["profile"], warnings)
+        switch_helper = link_switch(d["profile"], warnings)
         hidden = self._hidden(dir_abs, glob, proj, warnings)
-        prompt += hub_block(note_left, gates, phase, hidden, prompt)
+        prompt += hub_block(note_left, gates, phase, hidden, prompt,
+                            switch=d["profile"] if switch_helper and phase != "plan" else None)
         # разрешения — у звеньев цепочки те же (А2.2), регламент проекта перепроверяется на старте звена
         grants, gwarn = task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants"))
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
@@ -1101,7 +1124,9 @@ class Jobs:
                     plan_mode=d.get("plan_mode") or "no",
                     budget_total=float(d["budget_total"]) if d.get("budget_total") else None,
                     max_turns_total=int(d["max_turns_total"]) if d.get("max_turns_total") else None,
-                    grants=grants, gates=gates, sandbox_hidden=hidden, billing=mode)
+                    grants=grants, gates=gates, sandbox_hidden=hidden, billing=mode,
+                    # switch: шапки — из job.json звена плана: надзиратель исполнения увидит «уже на месте» (В2.3)
+                    switch=(d.get("switch") or {}).get("spec"), switch_helper=switch_helper)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
         """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk, модель исполнения,
@@ -1154,6 +1179,9 @@ class Jobs:
                **({"reason_hint": REASON_HINT[d["reason"]]} if d.get("reason") in REASON_HINT else {}),
                "files": {"events": _existing(jdir / "events.jsonl"), "stderr": _existing(jdir / "stderr.log"),
                          "task": _existing(Path(d["task"]), "нет (файл ТЗ удалён)") if d.get("task") else None}}
+        switch = [switch_line(x["switch"]) for x in links if isinstance(x.get("switch"), dict)]
+        if switch:  # switch: из шапки (ТЗ WSH-3.8, В2.7)
+            out["switch"] = switch
         if snap.get("chain"):
             out.update(phase=snap.get("phase"), active=snap.get("active"), chain=snap["chain"],
                        cost_usd=snap.get("cost_usd"))
@@ -1178,7 +1206,8 @@ class Jobs:
     def external_view(self, links: list[dict]) -> dict:
         """Блок «Внешние действия» (ТЗ WSH-3.4, А3.4): вызовы помощника по external.jsonl звеньев — пуши целиком
         (их мало), вызовы API числом и последние EXTERNAL_MAX, ссылки на MR/PR; гейты (ТЗ WSH-3.5, Г4) — последние
-        EXTERNAL_MAX (имя, код, длительность, таймаут), число и сколько упало."""
+        EXTERNAL_MAX (имя, код, длительность, таймаут), число и сколько упало; смены ветки (ТЗ WSH-3.8, В3.5) —
+        последние EXTERNAL_MAX (аргументы, код, from, to) и число."""
         rows: list[dict] = []
         for x in links:
             try:
@@ -1195,17 +1224,19 @@ class Jobs:
         pushes = [r for r in rows if r.get("cmd") == "push"]
         calls = [r for r in rows if r.get("cmd") == "forge"]
         gates = [r for r in rows if r.get("cmd") == "gate"]
+        switches = [r for r in rows if r.get("cmd") == "switch"]  # wshub switch (ТЗ WSH-3.8, В3.5)
 
         def row(r: dict) -> dict:
-            return {k: r[k] for k in ("ts", "args", "exit", "status", "link", "error", "duration_s", "timeout")
-                    if r.get(k) is not None}
+            return {k: r[k] for k in ("ts", "args", "exit", "status", "link", "error", "duration_s", "timeout",
+                                      "from", "to") if r.get(k) is not None}
 
         return {"push": [row(r) for r in pushes[-EXTERNAL_MAX:]], "push_count": len(pushes),
                 "forge": [row(r) for r in calls[-EXTERNAL_MAX:]], "forge_count": len(calls),
                 "forge_errors": sum(1 for r in calls if r.get("exit")),
                 "gate": [row(r) for r in gates[-EXTERNAL_MAX:]], "gate_count": len(gates),
                 "gate_failed": sum(1 for r in gates if r.get("exit")),
-                "links": list(dict.fromkeys(r["link"] for r in rows if r.get("link")))}
+                "switch": [row(r) for r in switches[-EXTERNAL_MAX:]], "switch_count": len(switches),
+                "links":list(dict.fromkeys(r["link"] for r in rows if r.get("link")))}
 
     # ---------- статистика (2.4.5) ----------
 
@@ -1323,6 +1354,124 @@ def link_gates(proj: ProjectCode, profile: str, warnings: list[str]) -> tuple:
     return proj.gates
 
 
+def link_switch(profile: str, warnings: list[str]) -> bool:
+    """Правила помощника `wshub switch` (ТЗ WSH-3.8, В4): профилям task и review. Хаб запущен как python -m wshub —
+    правило выпустило бы из песочницы первый wshub из PATH: правил нет, задача стартует с предупреждением (ключ
+    switch: в шапке работает и так — его выполняет надзиратель)."""
+    if profile not in SWITCH_PROFILES:
+        return False
+    if not claude_cli.wshub_exe():
+        warnings.append(SWITCH_PYTHON_M)
+        return False
+    return True
+
+
+@dataclass(frozen=True)
+class Switch:
+    """Смена ветки (ТЗ WSH-3.8, В1): kind — branch (<ветка>), create (-c <ветка> <база>), detach (--detach <ссылка>);
+    name — ветка или ссылка, base — база новой ветки."""
+    kind: str
+    name: str
+    base: str | None = None
+
+    @property
+    def spec(self) -> str:
+        return {"branch": self.name, "create": f"-c {self.name} {self.base}", "detach": f"--detach {self.name}"}[
+            self.kind]
+
+    def argv(self) -> list[str]:
+        """argv git строго по таблице В1: без --force, --discard-changes, --merge, --orphan и --track."""
+        if self.kind == "create":
+            return ["switch", "--no-track", "-c", self.name, str(self.base)]
+        if self.kind == "detach":
+            return ["switch", "--detach", self.name]
+        return ["switch", "--no-guess", self.name]
+
+
+def parse_switch(args: list[str], profile: str | None = None) -> Switch:
+    """Форма смены ветки — одна для ключа switch: в шапке (значение, разбитое по пробелам) и помощника wshub switch
+    (ТЗ WSH-3.8, В1): <ветка> | -c <ветка> <база> | --detach <ссылка>; других опций нет, имя с «-» — отказ. Форма -c —
+    только профилю task. Отказ — JobError."""
+    def name(v: str) -> bool:
+        return bool(v) and not v.startswith("-")
+
+    if len(args) == 1 and name(args[0]):
+        return Switch("branch", args[0])
+    if len(args) == 2 and args[0] == "--detach" and name(args[1]):
+        return Switch("detach", args[1])
+    if len(args) == 3 and args[0] == "-c" and name(args[1]) and name(args[2]):
+        if profile is not None and profile != "task":
+            raise JobError(f"switch -c — только профилю task: новую ветку создаёт задача, которая пишет код "
+                           f"(у задачи {profile})")
+        return Switch("create", args[1], args[2])
+    got = " ".join(args)[:200] or "пусто"
+    raise JobError(f"switch: {got} — нужно {SWITCH_FORMS}; других опций нет")
+
+
+def switch_protected(sw: Switch, push_protect) -> None:
+    """Новая ветка (-c) с именем по маске push_protect проекта — отказ, как у пуша (ТЗ WSH-3.8, В1.3)."""
+    if sw.kind != "create":
+        return
+    hit = next((p for p in push_protect if fnmatch.fnmatchcase(sw.name, p)), None)
+    if hit:
+        raise JobError(f"ветка {sw.name} защищена регламентом проекта (push_protect: {hit}) — создать её через switch "
+                       "нельзя")
+
+
+def _git_text(r) -> str:
+    return (r.stderr.strip() or r.stdout.strip())[:300]
+
+
+def switch_commit(git: str, cwd: Path, ref: str, environ: dict) -> str | None:
+    """Коммит ссылки: git rev-parse --verify --quiet <ссылка>^{commit}; нет — None."""
+    r = gitsafe.run(git, cwd, ["rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"], environ, 30)
+    return r.stdout.strip() if r.returncode == 0 and r.stdout.strip() else None
+
+
+def branch_exists(git: str, cwd: Path, branch: str, environ: dict) -> bool:
+    r = gitsafe.run(git, cwd, ["rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], environ, 30)
+    return r.returncode == 0
+
+
+def switch_prepare(git: str, cwd: Path, sw: Switch, environ: dict, push_protect=()) -> None:
+    """Проверки до git switch (ТЗ WSH-3.8, В1.2–В1.3) — общие для надзирателя и помощника: push_protect у -c, имя
+    ветки — git check-ref-format --branch, ссылка и база — коммит (rev-parse --verify), ветка -c ещё не существует.
+    git — через gitsafe (GitUnsafe пробрасывается). Отказ — JobError с текстом git."""
+    switch_protected(sw, push_protect)
+    if sw.kind in ("branch", "create"):
+        r = gitsafe.run(git, cwd, ["check-ref-format", "--branch", sw.name], environ, 30)
+        if r.returncode != 0:
+            raise JobError(f"имя ветки {sw.name} недопустимо: {_git_text(r) or 'git check-ref-format отказал'}")
+    for ref in ([sw.name] if sw.kind == "detach" else [sw.base] if sw.kind == "create" else []):
+        if switch_commit(git, cwd, str(ref), environ) is None:
+            raise JobError(f"ссылка {ref} не ведёт к коммиту (git rev-parse --verify --quiet {ref}^{{commit}} — "
+                           "не найдено)")
+    if sw.kind == "create" and branch_exists(git, cwd, sw.name, environ):
+        raise JobError(f"ветка {sw.name} уже есть — переключись на неё: wshub switch {sw.name}")
+
+
+def switch_run(git: str, cwd: Path, sw: Switch, environ: dict) -> subprocess.CompletedProcess:
+    """git switch по форме В1 через gitsafe: проверка конфига, переопределения (хуки выключены), белый список
+    окружения, таймаут."""
+    return gitsafe.run(git, cwd, sw.argv(), environ, SWITCH_TIMEOUT)
+
+
+def head_label(state: dict | None) -> str:
+    """Ветка или (HEAD отсоединён) первые 9 знаков коммита — для from/to смены ветки."""
+    state = state or {}
+    return state.get("branch") or (state.get("head") or "")[:9] or "—"
+
+
+def switch_line(sw: dict) -> str:
+    """Строка смены ветки из шапки (поле switch звена) для code_result, CLI и карточки."""
+    spec = sw.get("spec")
+    if "done" not in sw:
+        return f"ветка: switch {spec} — не выполнен"
+    if not sw["done"]:
+        return f"ветка: switch {spec} — уже на месте ({sw.get('to')})"
+    return f"ветка: switch {spec} — {sw.get('from')} → {sw.get('to')}"
+
+
 def deny_read_hit(masks, rel: str, real: str) -> bool:
     """Маски deny_read: абсолютные и ~ — по реальному пути, относительные — от рабочего каталога. Одна функция для
     помощника (--data) и списка скрытых песочницей файлов (ТЗ WSH-3.5, П2)."""
@@ -1357,10 +1506,13 @@ def sandbox_hidden(workdir: Path, masks: list[str], environ: dict) -> tuple[list
                                                           or deny_read_hit(masks, rel, os.path.join(base, rel)))], None
 
 
-def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[str] | None, prompt: str = "") -> str:
+def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[str] | None, prompt: str = "",
+              switch: str | None = None) -> str:
     """Блок «От хаба» в конце промпта (ТЗ WSH-3.5, П1): замечание оператора, если шаблон его не подставил; гейты
-    (у фазы плана — какие будут в исполнении); скрытые песочницей файлы. Только непустые строки, весь блок ≤ 2 КБ:
-    лишнее — «и ещё N». Ответ — текст, который дописать к промпту (prompt — чтобы начать с новой строки), или ""."""
+    (у фазы плана — какие будут в исполнении); смена ветки помощником (switch — профиль task или review, если правила
+    выданы; ТЗ WSH-3.8, В5 — строка не сокращается); скрытые песочницей файлы. Только непустые строки, весь блок
+    ≤ 2 КБ: лишнее — «и ещё N». Ответ — текст, который дописать к промпту (prompt — чтобы начать с новой строки),
+    или ""."""
     hidden = hidden or []
 
     def build(ng: int, nh: int) -> str:
@@ -1374,6 +1526,8 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
             lines.append(f"- Гейты будут в фазе исполнения: {listed}." if phase == "plan" else
                          "- Гейты — проверки вне песочницы, только командой `wshub gate <имя>` целиком, Bash с timeout "
                          f"не меньше указанного: {listed}. Полный вывод — `--out <файл>`.")
+        if switch in HUB_SWITCH:
+            lines.append(HUB_SWITCH[switch])
         if hidden:
             shown = ", ".join(_shown_path(h) for h in hidden[:nh]) + \
                 (f" (и ещё {len(hidden) - nh})" if len(hidden) > nh else "") if nh else \

@@ -39,6 +39,7 @@ DENY_BASH = ("git push *", *GIT_REMOTE_DENY, "git clean *", "ssh *", "scp *", "s
 HELPER_PUSH = "wshub push *"
 HELPER_FORGE = "wshub forge *"
 HELPER_GATE = "wshub gate *"  # гейты проекта (ТЗ WSH-3.5, Г2): профиль task, фаза исполнения
+HELPER_SWITCH = "wshub switch *"  # смена ветки вне песочницы (ТЗ WSH-3.8, В4): профили task и review, исполнение
 BASH_MAX_TIMEOUT_MS = 600000  # потолок таймаута Bash у claude по умолчанию (документация, env-vars)
 ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ", "DOCKER_HOST", "DOCKER_CONFIG")
 # исполняемая часть git: Code её не меняет — иначе git хаба (вне песочницы) запустит его программу
@@ -104,14 +105,15 @@ def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home:
 def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
              data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path, phase: str | None = None,
              read_extra: list[str] = (), grants: dict | None = None, gates: tuple = (),
-             key_helper: str | None = None) -> dict:
+             key_helper: str | None = None, switch: bool = False) -> dict:
     """settings.json задачи. cwd — dir (рабочий каталог Code), task_rel — путь к ТЗ от него; protected — все
     служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук).
     phase="plan" — фаза плана (ТЗ WSH-3, решение 5): отличие от эталона профиля — ровно plan_overrides.
     read_extra — абсолютные пути и шаблоны, проверенные jobs (ТЗ WSH-3.1, п. 2.2): Read вне cwd.
     grants — разрешения задачи {push, forge} (ТЗ WSH-3.4, А3.5): помощник в allow и excludedCommands — только с ними.
     gates — гейты, доступные звену (ТЗ WSH-3.5, Г2): wshub gate в allow и excludedCommands и потолок таймаута Bash.
-    key_helper — команда apiKeyHelper задачи на ключе (ТЗ WSH-4.6, п. 2.3): сама команда, ключа в settings.json нет."""
+    key_helper — команда apiKeyHelper задачи на ключе (ТЗ WSH-4.6, п. 2.3): сама команда, ключа в settings.json нет.
+    switch — wshub switch в allow и excludedCommands профилям task и review в фазе исполнения (ТЗ WSH-3.8, В4)."""
     if RULE_UNSAFE.search(task_rel):
         raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
     allow = ["Read(./**)", *_read_extra_rules(read_extra), f"Edit(./{task_rel})",
@@ -124,7 +126,7 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     elif profile != "recon":
         raise CliError(f"неизвестный профиль {profile}")
     gates = gates if profile == "task" and phase != "plan" else ()
-    helper = helper_commands(profile, grants, bool(gates))
+    helper = helper_commands(profile, grants, bool(gates), switch and phase != "plan")
     allow += [f"Bash({c})" for c in helper]
     deny = [*(f"Bash({c})" for c in DENY_BASH), "Read(**/.env*)", "WebFetch", "WebSearch",
             *(f"Edit({m})" for m in proj.deny_edit),
@@ -191,13 +193,15 @@ def plan_overrides(data: dict, read_extra: list[str] = ()) -> None:
     data["sandbox"]["excludedCommands"] = []
 
 
-def helper_commands(profile: str, grants: dict | None, gates: bool = False) -> list[str]:
+def helper_commands(profile: str, grants: dict | None, gates: bool = False, switch: bool = False) -> list[str]:
     """Правила помощника хаба по разрешениям задачи: пуш — только профилю task, API хостинга — любому; гейты — только
-    профилю task, если у звена они есть (ТЗ WSH-3.5, Г2.1)."""
+    профилю task, если у звена они есть (ТЗ WSH-3.5, Г2.1); смена ветки — профилям task и review без разрешений задачи
+    (ТЗ WSH-3.8, В4)."""
     g = grants or {}
     return [*([HELPER_PUSH] if g.get("push") and profile == "task" else []),
             *([HELPER_FORGE] if g.get("forge") else []),
-            *([HELPER_GATE] if gates and profile == "task" else [])]
+            *([HELPER_GATE] if gates and profile == "task" else []),
+            *([HELPER_SWITCH] if switch and profile in ("task", "review") else [])]
 
 
 def _read_extra_rules(read_extra: list[str]) -> list[str]:

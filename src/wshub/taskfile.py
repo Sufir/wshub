@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 
 HEADER_KEYS = ("ticket", "dir", "profile", "prompt", "model", "effort", "max_turns", "budget_usd",
-               "size", "risk", "plan", "choice", "choice_reason")
+               "size", "risk", "plan", "choice", "choice_reason", "switch")
 REQUIRED = ("ticket", "dir", "profile")
 # по ним политика выбирает модель и план (ТЗ WSH-3, п. 2.4.1); отказ с объяснением строит jobs.plan
 REQUIRED_BY_PROFILE = {"task": ("size", "risk"), "recon": ("size",)}

@@ -36,8 +36,8 @@ def test_second_task_in_same_dir_refused(code):
     before = _job_dirs(code)
     with pytest.raises(JobError) as e:
         code.jobs.start(code.jobs.plan("proj", code.taskfile()))
-    assert str(e.value) == (f"в каталоге {code.root.resolve()} уже идёт задача {jid} (task, running) — одна живая задача на "
-                            "каталог; дождись её (code_wait) или останови (code_cancel)")
+    assert str(e.value) == (f"в каталоге {code.root.resolve()} уже идёт задача {jid} (task, running) — одна живая "
+                            "задача на каталог; дождись её (code_wait) или останови (code_cancel)")
     assert _job_dirs(code) == before  # отказ не оставляет каталога задачи
 
 

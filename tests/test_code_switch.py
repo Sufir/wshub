@@ -178,7 +178,8 @@ def test_header_detach(code):
     _diverged(code)
     d = _start(code, "--detach feat")
     wait_terminal(code.jobs, d["id"])
-    assert _out(code.root, "symbolic-ref", "-q", "HEAD").returncode != 0 and _head(code.root) == _head(code.root, "feat")
+    assert _out(code.root, "symbolic-ref", "-q", "HEAD").returncode != 0
+    assert _head(code.root) == _head(code.root, "feat")
     assert code.jobs.read(d["id"])["switch"]["to"] == _head(code.root, "feat")[:9]
 
 
@@ -468,7 +469,8 @@ def test_hub_block_switch_line_not_shortened():
 # ---------- видимость ----------
 
 def _finished_with_switch(code) -> tuple[str, str]:
-    """Завершённая задача с switch: feat в шапке и двумя вызовами wshub switch в учёте. Ответ — (job, основная ветка)."""
+    """Завершённая задача с switch: feat в шапке и двумя вызовами wshub switch в учёте. Ответ — (job, основная
+    ветка)."""
     main = _diverged(code)
     jid = _start(code, "feat")["id"]
     wait_terminal(code.jobs, jid)

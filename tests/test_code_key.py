@@ -14,7 +14,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from test_code import _wait_running, make_code, wait_terminal
+from test_code import SUB_DIRS, _wait_running, add_sub, make_code, wait_terminal
 from test_code_limits import NO_LIMITS, _argv
 from test_code_plan import _call, _opt, _wait_state
 
@@ -431,11 +431,12 @@ def test_lost_keeps_reserve(code, monkeypatch):
 
 
 def test_two_tasks_do_not_share_one_remainder(code, monkeypatch):
-    _registry(code, api=API.replace("included_usd = 100", "included_usd = 15"), max_parallel="2")
+    add_sub(code)  # вторая задача — в другом каталоге: одна живая задача на каталог (ТЗ WSH-3.8)
+    _registry(code, api=API.replace("included_usd = 100", "included_usd = 15"), max_parallel="2", dirs=SUB_DIRS)
     monkeypatch.setenv("FAKE_SLEEP", "5")
     first = code.jobs.start(_plan(code))["id"]
     with pytest.raises(JobError, match="включённые кредиты исчерпаны"):  # 15 − резерв 10 = 5 < 10
-        code.jobs.start(_plan(code))
+        code.jobs.start(_plan(code, code.taskfile(dir="sub")))
     wait_terminal(code.jobs, first)
     second = code.jobs.start(_plan(code))["id"]  # факт 0.5 вместо резерва — остаток снова 14.5
     wait_terminal(code.jobs, second)

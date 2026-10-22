@@ -635,6 +635,7 @@ class Jobs:
             if len(live) >= plan.proj.max_parallel:
                 raise JobError(f"у проекта {plan.project} уже {len(live)} живых задач "
                                f"(max_parallel = {plan.proj.max_parallel})")
+            self._check_dir_free(plan.dir)
             if lim.daily_budget_usd is not None:  # не задан — дневной бюджет не считается вовсе (WSH-4.7, п. 2.3.3)
                 self._check_daily_budget(plan, live, now, lim.daily_budget_usd)
 
@@ -719,6 +720,17 @@ class Jobs:
             "reason": c.reason if c else None, "parent": parent,
             "grants": {k: v for k, v in grants.items() if v}, "billing": plan.billing})
         return data
+
+    def _check_dir_free(self, workdir: Path) -> None:
+        """Одна живая задача на рабочий каталог (ТЗ WSH-3.8, К1): среди живых задач всех проектов и любого профиля нет
+        задачи в том же каталоге — две задачи делили бы рабочее дерево и ветку. Сравнение — по realpath. Вызывается
+        под flock старта."""
+        real = os.path.realpath(workdir)
+        for d in self._live_jobs():
+            if d.get("dir") and os.path.realpath(d["dir"]) == real:
+                raise JobError(f"в каталоге {workdir} уже идёт задача {d.get('id')} ({d.get('profile')}, "
+                               f"{self.effective_state(d)}) — одна живая задача на каталог; дождись её (code_wait) "
+                               "или останови (code_cancel)")
 
     def _key_api(self):
         from .llm.core import Api

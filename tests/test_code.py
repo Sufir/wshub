@@ -104,10 +104,12 @@ def make_code(tmp_path, monkeypatch):
             self.jobs = Jobs(self.hub)
 
         def taskfile(self, rel="TASK.md", profile="task", ticket="PAY-1", prompt=None, extra="", size="S",
-                     risk="low"):
-            """size/risk по умолчанию S/low — строка политики без плана (ТЗ WSH-3); None — ключа нет."""
+                     risk="low", dir="."):
+            """size/risk по умолчанию S/low — строка политики без плана (ТЗ WSH-3); None — ключа нет. dir — каталог
+            задачи (файл ТЗ — в нём); путь в ответе — от корня проекта."""
+            rel = rel if dir == "." else f"{dir}/{rel}"
             p = root / rel
-            hdr = f"---\nticket: {ticket}\ndir: .\nprofile: {profile}\n"
+            hdr = f"---\nticket: {ticket}\ndir: {dir}\nprofile: {profile}\n"
             hdr += f"size: {size}\n" if size else ""
             hdr += f"risk: {risk}\n" if risk else ""
             if prompt:
@@ -117,6 +119,15 @@ def make_code(tmp_path, monkeypatch):
             return rel
 
     return C()
+
+
+SUB_DIRS = '[".", "sub"]'
+
+
+def add_sub(code) -> Path:
+    """Второй каталог задач проекта: репозиторий sub внутри корня (одна живая задача на каталог, ТЗ WSH-3.8).
+    В реестр его добавляет code.write(dirs=SUB_DIRS, …)."""
+    return make_repo(code.root / "sub")
 
 
 def wait_terminal(jobs: Jobs, jid: str, timeout=30) -> dict:
@@ -538,11 +549,12 @@ def test_parallel_barrier(code, monkeypatch):
 
 def test_daily_budget(code, monkeypatch):
     monkeypatch.setenv("FAKE_SLEEP", "10")
-    code.write(max_parallel="5", daily_budget_usd="7", max_budget_usd="5")
+    add_sub(code)  # вторая задача — в другом каталоге: одна живая задача на каталог (ТЗ WSH-3.8)
+    code.write(max_parallel="5", daily_budget_usd="7", max_budget_usd="5", dirs=SUB_DIRS)
     d1 = code.jobs.start(code.jobs.plan("proj", code.taskfile("A.md"), budget_usd=5))
     _wait_running(code.jobs, d1["id"])
     with pytest.raises(JobError, match="дневной бюджет"):
-        code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md"), budget_usd=5))
+        code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md", dir="sub"), budget_usd=5))
     code.jobs.cancel(d1["id"])
     wait_terminal(code.jobs, d1["id"], timeout=60)
 

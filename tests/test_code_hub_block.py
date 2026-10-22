@@ -10,7 +10,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from test_code import git, make_code, wait_terminal
+from test_code import SUB_DIRS, add_sub, git, make_code, wait_terminal
 from test_code_plan import _wait_state
 
 from wshub import claude_cli, code_server, gitsafe, taskfile
@@ -392,12 +392,13 @@ def test_auto_refusal_skipped_when_transition_failed(code, over):
 
 def test_approve_works_after_chain_error(code, monkeypatch):
     """Автопереход не удался (chain_error) — человек утверждает, как раньше."""
-    code.write(max_parallel="2")
+    add_sub(code)  # вторая задача — в другом каталоге: одна живая задача на каталог (ТЗ WSH-3.8)
+    code.write(max_parallel="2", dirs=SUB_DIRS)
     monkeypatch.setenv("FAKE_SLEEP_PLAN", "2")
     root = code.jobs.start(code.jobs.plan("proj", code.taskfile("A.md", size="M", risk="low")))["id"]
     monkeypatch.setenv("FAKE_SLEEP", "30")
-    other = code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md")))["id"]
-    code.write(max_parallel="1")
+    other = code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md", dir="sub")))["id"]
+    code.write(max_parallel="1", dirs=SUB_DIRS)
     snap = _wait_state(code.jobs, root, ("plan_ready", "completed", "failed"))
     assert snap["state"] == "plan_ready" and code.jobs.read(root).get("chain_error")
     code.jobs.cancel(other)

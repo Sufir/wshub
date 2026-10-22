@@ -8,7 +8,7 @@ import time
 from importlib import resources
 
 import pytest
-from test_code import _wait_running, make_code, wait_terminal
+from test_code import SUB_DIRS, _wait_running, add_sub, make_code, wait_terminal
 from test_code_plan import _call, _opt, _reclog, _wait_state
 
 from wshub import code_cli, code_server
@@ -241,11 +241,12 @@ def test_plan_limit_alone_does_not_leak_into_execute(code):
 def test_daily_budget_without_task_budget(code, monkeypatch):
     """Дневной бюджет задан, бюджета задачи нет (решение 5.1.3): звено входит в сумму как 0, завершённые звенья
     сегодня — по их стоимости."""
-    code.write(**{**NO_LIMITS, "daily_budget_usd": "0.6", "max_parallel": "5"})
+    add_sub(code)  # вторая задача — в другом каталоге: одна живая задача на каталог (ТЗ WSH-3.8)
+    code.write(**{**NO_LIMITS, "daily_budget_usd": "0.6", "max_parallel": "5", "dirs": SUB_DIRS})
     monkeypatch.setenv("FAKE_SLEEP", "10")
     a = code.jobs.start(code.jobs.plan("proj", code.taskfile("A.md")))
     _wait_running(code.jobs, a["id"])
-    b = code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md")))  # идущая задача без бюджета — 0, отказа нет
+    b = code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md", dir="sub")))  # идущая без бюджета — 0, отказа нет
     for x in (a, b):
         code.jobs.cancel(x["id"])
         wait_terminal(code.jobs, x["id"], timeout=60)

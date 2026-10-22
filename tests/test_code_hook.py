@@ -374,6 +374,16 @@ HELPER_ALLOW = [
     "wshub gate check --out=out/gate.log",
     f"wshub gate check --out {CWD}/gate.log",
     "/home/u/.local/bin/wshub gate check",
+    # смена ветки (ТЗ WSH-3.8): ветка, -c ветка база, --detach ссылка
+    "wshub switch WSH-3.8",
+    "wshub switch feature/x_1.2",
+    "wshub switch -c WSH-3.8 origin/main",
+    "wshub switch -c pay-1125 HEAD",
+    "wshub switch --detach origin/pay-1125",
+    "wshub switch --detach HEAD~1",
+    "wshub switch --detach HEAD^",
+    "wshub switch --detach 7e3a1a9",
+    "/home/u/.local/bin/wshub switch main",
 ]
 
 HELPER_DENY = [
@@ -442,6 +452,51 @@ HELPER_DENY = [
     "FOO=1 wshub gate x",
     "sh -c 'wshub gate x'",
     "bash -lc 'wshub gate x'",
+    # wshub switch: три формы и ничего больше, форма команды — как у push
+    "wshub switch",
+    "wshub switch -",
+    "wshub switch -x",
+    "wshub switch -f x",
+    "wshub switch --force x",
+    "wshub switch --discard-changes x",
+    "wshub switch --merge x",
+    "wshub switch --orphan x",
+    "wshub switch x y",
+    "wshub switch x --track",
+    "wshub switch x -- y",
+    "wshub switch --detach",
+    "wshub switch --detach -x",
+    "wshub switch --detach x y",
+    "wshub switch --detach=origin/x",
+    "wshub switch --detach a..b",
+    "wshub switch -c x",
+    "wshub switch -c x y z",
+    "wshub switch -c -x y",
+    "wshub switch -c x -y",
+    "wshub switch -c x origin/main --track",
+    "wshub switch -C x origin/main",
+    "wshub switch --create x origin/main",
+    "wshub switch -c x~1 origin/main",
+    "wshub switch a..b",
+    "wshub switch 'a b'",
+    "wshub switch x.lock",
+    "wshub switch x/",
+    "wshub switch x.",
+    "wshub switch /x",
+    "wshub switch .x",
+    "wshub switch a//b",
+    "wshub switch x@{1}",
+    "wshub switch x:y",
+    "wshub switch 'x*'",
+    "wshub switch x && git status",
+    "git status; wshub switch x",
+    "wshub switch x | tail -5",
+    "wshub switch x 2>&1",
+    "wshub switch x &",
+    "wshub switch $B",
+    "timeout 60 wshub switch x",
+    "FOO=1 wshub switch x",
+    "sh -c 'wshub switch x'",
 ]
 
 
@@ -491,6 +546,41 @@ def test_main_gate_by_profile():
     assert _run(event, argv=["--profile", "plan", *map(str, DATA)])[0] == 2
     assert _run(event, argv=["--profile", "review", *map(str, DATA)])[0] == 2
     assert _run(event)[0] == 2
+
+
+def test_helper_switch_review():
+    """review меняет ветку для чтения: <ветка> и --detach; новую ветку не создаёт (ТЗ WSH-3.8)."""
+    for cmd in ("wshub switch WSH-3.8", "wshub switch --detach origin/pay-1125", "wshub switch --detach HEAD~1"):
+        assert hook.check(cmd, CWD, DATA, "review") is None, (cmd, hook.check(cmd, CWD, DATA, "review"))
+    reason = hook.check("wshub switch -c WSH-3.8 origin/main", CWD, DATA, "review")
+    assert reason is not None and "только в профиле task" in reason
+
+
+@pytest.mark.parametrize("profile", ["recon", "plan", None, "unknown"])
+def test_helper_switch_readonly_profiles(profile):
+    for cmd in ("wshub switch WSH-3.8", "wshub switch --detach origin/x", "wshub switch -c x origin/main"):
+        reason = hook.check(cmd, CWD, DATA, profile)
+        assert reason is not None and "только в профилях task и review" in reason, (cmd, profile, reason)
+
+
+def test_helper_switch_reasons():
+    assert "имя ветки" in hook.check("wshub switch a..b", CWD, DATA, "task")
+    assert "ссылка" in hook.check("wshub switch --detach -x", CWD, DATA, "task")
+    assert "база" in hook.check("wshub switch -c x a..b", CWD, DATA, "task")
+    assert "других опций нет" in hook.check("wshub switch --force x", CWD, DATA, "task")
+    assert "-c <ветка> <база>" in hook.check("wshub switch x y", CWD, DATA, "task")
+    assert "-c <ветка> <база>" not in hook.check("wshub switch x y", CWD, DATA, "review")
+    assert "wshub switch" in hook.check("wshub code jobs", CWD, DATA, "task")
+
+
+def test_main_switch_by_profile():
+    event = {"tool_name": "Bash", "tool_input": {"command": "wshub switch -c WSH-1 origin/main"}, "cwd": CWD}
+    assert _run(event, argv=["--profile", "task", *map(str, DATA)])[0] == 0
+    assert _run(event, argv=["--profile", "review", *map(str, DATA)])[0] == 2
+    assert _run(event, argv=["--profile", "plan", *map(str, DATA)])[0] == 2
+    assert _run(event)[0] == 2
+    event = {"tool_name": "Bash", "tool_input": {"command": "wshub switch --detach origin/x"}, "cwd": CWD}
+    assert _run(event, argv=["--profile", "review", *map(str, DATA)])[0] == 0
 
 
 def test_helper_out_by_profile():

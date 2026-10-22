@@ -20,11 +20,13 @@ sandbox_exclude, которые идут вне песочницы. Отказ, 
    (push, login, save/export), docker build (контекст сборки читает хост), удаление томов (down -v,
    volume rm/prune, system prune), compose-файл с чужим именем (-f), переменные окружения перед docker.
    Сама команда docker — вне песочницы (sandbox_exclude), поэтому этот пол — единственная её граница;
-6. wshub — кроме помощника хаба (ТЗ WSH-3.4, А3; WSH-3.5): wshub push, wshub forge и wshub gate идут вне
-   песочницы, поэтому разрешены только командой целиком — одно звено, без обёрток, присваиваний, $, обратных
-   кавычек и перенаправлений; wshub push и wshub gate — только в профиле task; у wshub gate — ровно имя гейта
-   и, может быть, --out; --out у помощника — по тем же правилам, что --output у git. Разрешение задачи,
-   регламент и гейты проекта проверяет сам помощник, хук держит форму команды.
+6. wshub — кроме помощника хаба (ТЗ WSH-3.4, А3; WSH-3.5; WSH-3.8): wshub push, wshub forge, wshub gate и
+   wshub switch идут вне песочницы, поэтому разрешены только командой целиком — одно звено, без обёрток,
+   присваиваний, $, обратных кавычек и перенаправлений; wshub push и wshub gate — только в профиле task; у
+   wshub gate — ровно имя гейта и, может быть, --out; --out у помощника — по тем же правилам, что --output у
+   git; wshub switch — в профилях task (<ветка>, -c <ветка> <база>, --detach <ссылка>) и review (<ветка>,
+   --detach <ссылка>), имя ветки и ссылка — без опций и пробелов. Разрешение задачи, регламент, гейты проекта
+   и существование веток проверяет сам помощник, хук держит форму команды.
 
 Профиль задачи приходит аргументом --profile (task, review, recon, plan). Без него — как у читающего профиля.
 
@@ -125,10 +127,16 @@ GIT_REMOTE_READ_FLAGS = {"-v", "--verbose"}
 GIT_REMOTE_GETURL_FLAGS = {"--push", "--all"}
 # профили, которым можно писать файлы (Edit): task — рабочий каталог, review — только .agents/
 WRITE_PROFILES = {"task", "review"}
-# помощник хаба (ТЗ WSH-3.4, А3; WSH-3.5 — гейты): вне песочницы, поэтому только командой целиком
+# помощник хаба (ТЗ WSH-3.4, А3; WSH-3.5 — гейты; WSH-3.8 — смена ветки): вне песочницы, поэтому только командой
+# целиком
 HELPER = "wshub"
-HELPER_SUBS = {"push", "forge", "gate"}
+HELPER_SUBS = {"push", "forge", "gate", "switch"}
 GATE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")  # имя гейта — как ключ в реестре (WSH-3.5)
+# wshub switch (WSH-3.8): форма имени ветки и ссылки. Не с «-», «/» или «.», без «..» и «//»; ветка — не на «/», «.»
+# и «.lock»; в ссылке ещё ~ и ^ (HEAD~1). Есть ли ветка и куда ведёт ссылка, проверяет помощник через git
+SWITCH_BRANCH_RE = re.compile(r"^(?![-/.])(?!.*\.\.)(?!.*//)[A-Za-z0-9._/-]{1,200}(?<![/.])(?<!\.lock)$")
+SWITCH_REF_RE = re.compile(r"^(?![-/.])(?!.*\.\.)(?!.*//)[A-Za-z0-9._/~^-]{1,200}$")
+SWITCH_PROFILES = {"task", "review"}
 
 CODE_DENY = re.compile(
     r"\bgit\b[^\n;|&]{0,200}?\b(" + "|".join(sorted(GIT_DENY | {"config"})) + r")\b"
@@ -221,9 +229,9 @@ def _check_segment(tokens: list[str], ctx: _Ctx, depth: int) -> None:
         n = _base(tokens[j])
         if n == HELPER:
             if not (ctx.helper and depth == 0 and j == 0):
-                raise _Deny("wshub в задаче — только помощник хаба (wshub push, wshub forge, wshub gate) и только "
-                            "командой целиком: одно звено, без обёрток, присваиваний, $, обратных кавычек и "
-                            "перенаправлений")
+                raise _Deny("wshub в задаче — только помощник хаба (wshub push, wshub forge, wshub gate, wshub "
+                            "switch) и только командой целиком: одно звено, без обёрток, присваиваний, $, обратных "
+                            "кавычек и перенаправлений")
             _check_helper(tokens, ctx)
             return
         if n in NET_TOOLS:
@@ -242,9 +250,9 @@ def _check_segment(tokens: list[str], ctx: _Ctx, depth: int) -> None:
 
 
 def _helper_call(command: str) -> bool:
-    """Вся команда — один вызов помощника хаба: wshub push|forge|gate … Одно звено без обёрток и присваиваний, без $,
-    обратных кавычек, переводов строки, перенаправлений и фона. Помощник идёт вне песочницы (sandbox_exclude), и
-    рядом с ним в той же команде не должно быть ничего."""
+    """Вся команда — один вызов помощника хаба: wshub push|forge|gate|switch … Одно звено без обёрток и присваиваний,
+    без $, обратных кавычек, переводов строки, перенаправлений и фона. Помощник идёт вне песочницы
+    (sandbox_exclude), и рядом с ним в той же команде не должно быть ничего."""
     if any(c in command for c in "$`\n\r"):
         return False
     lex = shlex.shlex(command, posix=True, punctuation_chars=True)
@@ -257,12 +265,16 @@ def _helper_call(command: str) -> bool:
 
 
 def _check_helper(tokens: list[str], ctx: _Ctx) -> None:
-    """Помощник хаба, уже проверенный по форме (_helper_call): профиль для push и gate, аргументы gate, путь --out."""
+    """Помощник хаба, уже проверенный по форме (_helper_call): профиль для push, gate и switch, аргументы gate и
+    switch, путь --out."""
     sub = tokens[1]
     if sub == "push" and ctx.profile != "task":
         raise _Deny("wshub push — только в профиле task: пушит задача, которая пишет код")
     if sub == "gate":
         _check_gate(tokens[2:], ctx)
+        return
+    if sub == "switch":
+        _check_switch(tokens[2:], ctx)
         return
     for idx, t in enumerate(tokens[2:], 2):
         if t == "--out" or t.startswith("--out="):
@@ -288,6 +300,38 @@ def _check_gate(args: list[str], ctx: _Ctx) -> None:
         _check_write_path("wshub gate --out", rest[1], ctx)
         return
     raise _Deny("wshub gate: после имени гейта — только --out <файл>")
+
+
+def _check_switch(args: list[str], ctx: _Ctx) -> None:
+    """wshub switch (ТЗ WSH-3.8): смена ветки вне песочницы — git switch в песочнице падает на файлах, которые она
+    монтирует. task: <ветка> | -c <ветка> <база> | --detach <ссылка>; review: <ветка> | --detach <ссылка>. Хук держит
+    форму; есть ли ветка, не занята ли она и куда ведёт ссылка, проверяет помощник через git."""
+    if ctx.profile not in SWITCH_PROFILES:
+        raise _Deny("wshub switch — только в профилях task и review: читающие профили ветку не меняют")
+    usage = "wshub switch <ветка> | wshub switch --detach <ссылка>"
+    if ctx.profile == "task":
+        usage += " | wshub switch -c <ветка> <база>"
+    if len(args) == 1 and not args[0].startswith("-"):
+        _switch_name(args[0], SWITCH_BRANCH_RE, "имя ветки")
+        return
+    if len(args) == 2 and args[0] == "--detach":
+        _switch_name(args[1], SWITCH_REF_RE, "ссылка")
+        return
+    if len(args) == 3 and args[0] == "-c":
+        if ctx.profile != "task":
+            raise _Deny("wshub switch -c — только в профиле task: новую ветку создаёт задача, которая пишет код")
+        _switch_name(args[1], SWITCH_BRANCH_RE, "имя ветки")
+        _switch_name(args[2], SWITCH_REF_RE, "база")
+        return
+    raise _Deny(f"wshub switch: нужно {usage} — других опций нет")
+
+
+def _switch_name(val: str, rx: re.Pattern, what: str) -> None:
+    if rx.match(val):
+        return
+    chars = "«. _ / - ~ ^»" if rx is SWITCH_REF_RE else "«. _ / -»"
+    raise _Deny(f"wshub switch: {what} {val[:100]!r} — латиница, цифры и {chars}; не с «-», «/» или «.», без «..» "
+                "и «//»")
 
 
 def _check_write_path(label: str, val: str, ctx: _Ctx) -> None:

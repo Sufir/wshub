@@ -12,7 +12,7 @@ from test_api import NOW, ApiEnv, req, set_api, use
 from test_api_anthropic import Server
 from test_api_batch import created
 from test_api_server import Srv
-from test_code import _wait_running, make_code, wait_terminal
+from test_code import SUB_DIRS, _wait_running, add_sub, make_code, wait_terminal
 from test_code_key import API as KEY_API
 from test_code_key import MARKER as KEY_MARKER
 from test_code_key import _key_path, _plan, _raw, _registry, _run
@@ -158,12 +158,14 @@ def test_code_cap_included_allow_and_parallel(code, monkeypatch):
     assert api_main(["allow", "anthropic", "--usd", "4", "--until", "31.12.2099"], code.cfg, code.state) == 0
     jid, d = _run(code, monkeypatch)
     assert _opt(_argv(code, jid), "--max-budget-usd") == "4" and d["billing"]["zone"] == "purchased"
-    _registry(code, api=KEY_API.replace("included_usd = 100", "included_usd = 1"), max_parallel="2", **NO_LIMITS)
+    add_sub(code)  # вторая задача — в другом каталоге: одна живая задача на каталог (ТЗ WSH-3.8)
+    _registry(code, api=KEY_API.replace("included_usd = 100", "included_usd = 1"), max_parallel="2", dirs=SUB_DIRS,
+              **NO_LIMITS)
     monkeypatch.setenv("FAKE_SLEEP", "3")
     first = code.jobs.start(_plan(code))["id"]
     assert _opt(_argv(code, first), "--max-budget-usd") == "3.5"
     with pytest.raises(JobError, match="исчерпаны"):  # резерв первой — весь остаток разрешения
-        code.jobs.start(_plan(code))
+        code.jobs.start(_plan(code, code.taskfile(dir="sub")))
     assert wait_terminal(code.jobs, first)["state"] == "completed"
     _registry(code, api="[api]\ndaily_usd = 50\n", **NO_LIMITS)  # без зоны — флага нет, как раньше
     jid, _d = _run(code, monkeypatch)

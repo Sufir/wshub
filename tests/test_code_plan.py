@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 import pytest
-from test_code import _assert_no_fake, _wait_running, make_code, wait_terminal
+from test_code import SUB_DIRS, _assert_no_fake, _wait_running, add_sub, make_code, wait_terminal
 
 from wshub import claude_cli, code_cli, code_policy, code_server, taskfile
 from wshub.jobs import JobError
@@ -644,12 +644,13 @@ def test_daily_budget_refuses_execute_on_approve(code, monkeypatch):
 
 def test_max_parallel_checked_on_auto_transition(code, monkeypatch):
     """Кейс 7: max_parallel проверяется и при автоматическом переходе; не вышло — plan_ready с причиной."""
-    code.write(max_parallel="2")
+    add_sub(code)  # вторая задача — в другом каталоге: одна живая задача на каталог (ТЗ WSH-3.8)
+    code.write(max_parallel="2", dirs=SUB_DIRS)
     monkeypatch.setenv("FAKE_SLEEP_PLAN", "2")
     root = code.jobs.start(code.jobs.plan("proj", code.taskfile("A.md", size="M", risk="low")))["id"]
     monkeypatch.setenv("FAKE_SLEEP", "30")
-    other = code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md")))["id"]
-    code.write(max_parallel="1")  # к переходу живая — только B, а лимит 1
+    other = code.jobs.start(code.jobs.plan("proj", code.taskfile("B.md", dir="sub")))["id"]
+    code.write(max_parallel="1", dirs=SUB_DIRS)  # к переходу живая — только B, а лимит 1
     snap = _wait_state(code.jobs, root, ("plan_ready", "completed", "failed"))
     assert snap["state"] == "plan_ready" and "max_parallel" in (code.jobs.read(root).get("chain_error") or "")
     assert len(code.jobs.chain(root)) == 1

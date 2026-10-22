@@ -59,6 +59,18 @@ def test_other_dir_of_same_project_starts(code):
     assert wait_terminal(code.jobs, d["id"])["state"] == "completed"
 
 
+def test_nested_dir_taskfile_belongs_to_deepest(code):
+    """Раздел 5, п. 7: при dirs = [".", "sub"] файл ТЗ в sub принадлежит каталогу sub (самый глубокий), а не корню."""
+    add_sub(code)
+    code.write(dirs=SUB_DIRS)
+    p = code.jobs.plan("proj", code.taskfile("B.md", dir="sub"))
+    assert p.dir == (code.root / "sub").resolve() and p.task_rel == "B.md"
+    (code.root / "sub" / "C.md").write_text("---\nticket: P-1\ndir: .\nprofile: task\nsize: S\nrisk: low\n---\n")
+    with pytest.raises(JobError, match="лежит вне своего dir"):
+        code.jobs.plan("proj", "sub/C.md")
+    assert code.jobs.plan("proj", code.taskfile("A.md")).dir == code.root.resolve()  # корень — как раньше
+
+
 def test_same_dir_in_two_projects_refused(code):
     """Корни проектов реестра пересекаются: каталог тот же — отказ, хотя max_parallel у проектов свой."""
     code.cfg.write_text(code.cfg.read_text() + f'\n[workspace.other]\npath = "{code.root}"\nmode = "rw"\n\n'

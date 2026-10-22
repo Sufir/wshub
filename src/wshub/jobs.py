@@ -348,7 +348,7 @@ class Jobs:
         task_in = Path(task)
         task_abs = (task_in if task_in.is_absolute() else root / task_in).resolve()
         # «внутри dir» — до чтения файла (замечание 13): иначе моделью можно открыть любой читаемый файл
-        # самый глубокий подходящий каталог: при dirs = [".", "sub"] файл в sub — каталога sub (ТЗ WSH-3.8, раздел 5, п. 7)
+        # самый глубокий подходящий каталог: при dirs = [".", "sub"] файл в sub — каталога sub (ТЗ WSH-3.8, 5.7)
         container = max((d for d in dirs if task_abs == d or task_abs.is_relative_to(d)), key=lambda d: len(d.parts),
                         default=None)
         if container is None:

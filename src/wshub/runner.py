@@ -484,6 +484,13 @@ def _outside_code(git: str, cwd: Path, environ: dict, jdir: Path) -> dict:
             errors.append(f"коммиты: {e}")
     elif start:
         errors.append("коммиты: HEAD на старте неизвестен")
+    if start and start.get("head"):
+        try:
+            out["eol_changed"], out["eol_changed_count"] = _eol_changed(git, cwd, environ, start["head"])
+        except gitsafe.GitUnsafe as e:
+            errors.append(f"концы строк: {e.reason}: {e}")
+        except Exception as e:  # noqa: BLE001 — OSError, TimeoutExpired, код git
+            errors.append(f"концы строк: {e}")
     try:
         out["docker"], out["docker_count"] = _docker_calls(jdir / "events.jsonl")
     except Exception as e:  # noqa: BLE001
@@ -491,6 +498,29 @@ def _outside_code(git: str, cwd: Path, environ: dict, jdir: Path) -> dict:
     if errors:
         out["errors"] = clip_list([x[:500] for x in errors])
     return out
+
+
+def _numstat(git: str, cwd: Path, environ: dict, head: str, *opts: str) -> dict[str, tuple[str, str]]:
+    r = gitsafe.run(git, cwd, ["diff", "--numstat", "--no-renames", "-z", *opts, head], environ, 60)
+    if r.returncode != 0:
+        raise RuntimeError(f"git diff --numstat {' '.join(opts)} вернул {r.returncode}: {r.stderr.strip()[:300]}")
+    out = {}
+    for rec in r.stdout.split("\0"):
+        added, _, rest = rec.partition("\t")
+        deleted, _, path = rest.partition("\t")
+        if path:
+            out[path] = (added, deleted)
+    return out
+
+
+def _eol_changed(git: str, cwd: Path, environ: dict, head: str) -> tuple[list[str], int]:
+    """Файлы, где задача поменяла концы строк без правки содержимого (ТЗ WSH-3.8, Э2): от HEAD на старте звена до
+    рабочего дерева — git diff --numstat с --ignore-cr-at-eol и без; числа строк различаются — концы строк в файле
+    сменены (файла во втором выводе нет — 0 и 0). Список — до META_MAX и общее число."""
+    plain = _numstat(git, cwd, environ, head)
+    ignored = _numstat(git, cwd, environ, head, "--ignore-cr-at-eol")
+    changed = [p for p, n in plain.items() if ignored.get(p, ("0", "0")) != n]
+    return clip_list(changed), len(changed)
 
 
 def _drop_push_upstream(lines: list[str], jdir: Path) -> list[str]:

@@ -18,6 +18,7 @@ from mcp.server.fastmcp import FastMCP
 from . import code_events, code_policy
 from .core import WsError
 from .jobs import (
+    EOL_SHOWN,
     KEY_PROVIDER,
     TERMINAL,
     JobError,
@@ -26,6 +27,7 @@ from .jobs import (
     _sum,
     billing_mode,
     cost_shown,
+    eol_warning,
     meta_warning,
     outside_view,
     phase_cost,
@@ -491,8 +493,10 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
                                    "gate_count": ex.get("gate_count", 0), "gate_failed": ex.get("gate_failed", 0),
                                    "gate": ex.get("gate") or [], "switch_count": ex.get("switch_count", 0),
                                    "switch": ex.get("switch") or [], "links": ex.get("links") or []},
-                      # switch: шапки (ТЗ WSH-3.8, В2.7)
+                      # switch: шапки (ТЗ WSH-3.8, В2.7); концы строк — до и после (Э1, Э2)
                       "switch": [switch_line(x["switch"]) for x in links if isinstance(x.get("switch"), dict)],
+                      "eol_warning": eol_warning(oc), "eol_mixed": (active.get("eol_mixed") or [])[:EOL_SHOWN],
+                      "eol_mixed_count": len(active.get("eol_mixed") or []),
                       "result_head": "\n".join(text.strip().splitlines()[:RESULT_HEAD_LINES])}
     return out
 

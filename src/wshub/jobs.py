@@ -65,6 +65,9 @@ HUB_BLOCK_HIDDEN = 20
 HUB_BLOCK_CMD = 100  # символов команды гейта в строке блока
 HUB_BLOCK_PATH = 200  # символов пути в строке блока (круг 2, Р8)
 HIDDEN_JOB_MAX = 200  # путей sandbox_hidden в job.json
+HUB_BLOCK_EOL = 20  # путей со смешанными концами строк в строке блока (ТЗ WSH-3.8, Э1.2)
+EOL_JOB_MAX = 200  # путей eol_mixed в job.json
+EOL_SHOWN = 20  # путей eol_mixed в code_result и карточке
 GATES_PYTHON_M = "гейты недоступны: хаб запущен как python -m wshub"
 # смена ветки (ТЗ WSH-3.8, часть В): ключ switch: шапки и помощник wshub switch
 SWITCH_FORMS = "<ветка> | -c <ветка> <база> | --detach <ссылка>"
@@ -172,6 +175,7 @@ class Plan:
     billing: str = BILLING  # режим оплаты; у звеньев цепочки — режим корня (ТЗ WSH-4.6, п. 2.1.1)
     switch: str | None = None  # ключ switch: шапки — выполняет надзиратель до claude (ТЗ WSH-3.8, В2)
     switch_helper: bool = False  # правила wshub switch профилю (task, review; исполнение) — ТЗ WSH-3.8, В4
+    eol_mixed: list[str] | None = None  # отслеживаемые файлы со смешанными концами строк (ТЗ WSH-3.8, Э1)
 
     @property
     def permission_mode(self) -> str:
@@ -399,13 +403,14 @@ class Jobs:
         gates = link_gates(proj, profile, warnings)
         switch_helper = link_switch(profile, warnings)
         hidden = self._hidden(dir_abs, glob, proj, warnings)
+        mixed = self._mixed(dir_abs, warnings)
         prompt += hub_block(note_left, gates, "plan" if choice.plan != "no" else None, hidden, prompt,
-                            switch=profile if switch_helper and choice.plan == "no" else None)
+                            switch=profile if switch_helper and choice.plan == "no" else None, mixed=mixed)
         out = Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, choice.model, choice.effort,
                    max_turns, budget_usd, prompt, warnings + gwarn + limit_warn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
                    budget_total=budget_usd, max_turns_total=max_turns, grants=grants, gates=gates,
-                   sandbox_hidden=hidden, billing=mode, switch=switch, switch_helper=switch_helper)
+                   sandbox_hidden=hidden, billing=mode, switch=switch, switch_helper=switch_helper, eol_mixed=mixed)
         if choice.plan != "no":
             # шаблон исполнения проверяем на старте, а не после оплаченной фазы плана (2.6.3)
             self._render(root, proj, proj.execute_prompt, header["ticket"], task_rel,
@@ -490,6 +495,13 @@ class Jobs:
         if problem:
             warnings.append(problem)
         return hidden
+
+    def _mixed(self, workdir: Path, warnings: list[str]) -> list[str]:
+        """Файлы со смешанными концами строк (ТЗ WSH-3.8, Э1); сбой git — предупреждение, списка нет."""
+        mixed, problem = eol_mixed(workdir, dict(os.environ))
+        if problem:
+            warnings.append(problem)
+        return mixed
 
     def _choose(self, glob, proj, header, profile, model, effort, plan, chosen_by, reason,
                 channel) -> code_policy.Choice:
@@ -677,6 +689,7 @@ class Jobs:
                 "max_turns_total": plan.max_turns_total, "chain_root": chain_root or jid,
                 "session_name": plan.session_name(), "grants": grants,
                 "sandbox_hidden": (plan.sandbox_hidden or [])[:HIDDEN_JOB_MAX],
+                "eol_mixed": (plan.eol_mixed or [])[:EOL_JOB_MAX],  # ТЗ WSH-3.8, Э1.3
                 # режим notify — на момент старта корня; звенья и resume берут его у корня (ТЗ WSH-3.4, В3.1)
                 "notify": self._root_notify(chain_root) or glob.notify,
                 "billing": {"mode": plan.billing},  # режим оплаты; init и rate допишет надзиратель (ТЗ WSH-4.6)
@@ -1114,8 +1127,9 @@ class Jobs:
         gates = link_gates(proj, d["profile"], warnings)
         switch_helper = link_switch(d["profile"], warnings)
         hidden = self._hidden(dir_abs, glob, proj, warnings)
+        mixed = self._mixed(dir_abs, warnings)
         prompt += hub_block(note_left, gates, phase, hidden, prompt,
-                            switch=d["profile"] if switch_helper and phase != "plan" else None)
+                            switch=d["profile"] if switch_helper and phase != "plan" else None, mixed=mixed)
         # разрешения — у звеньев цепочки те же (А2.2), регламент проекта перепроверяется на старте звена
         grants, gwarn = task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants"))
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
@@ -1126,7 +1140,7 @@ class Jobs:
                     max_turns_total=int(d["max_turns_total"]) if d.get("max_turns_total") else None,
                     grants=grants, gates=gates, sandbox_hidden=hidden, billing=mode,
                     # switch: шапки — из job.json звена плана: надзиратель исполнения увидит «уже на месте» (В2.3)
-                    switch=(d.get("switch") or {}).get("spec"), switch_helper=switch_helper)
+                    switch=(d.get("switch") or {}).get("spec"), switch_helper=switch_helper, eol_mixed=mixed)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
         """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk, модель исполнения,
@@ -1182,6 +1196,11 @@ class Jobs:
         switch = [switch_line(x["switch"]) for x in links if isinstance(x.get("switch"), dict)]
         if switch:  # switch: из шапки (ТЗ WSH-3.8, В2.7)
             out["switch"] = switch
+        eol = eol_warning(out["outside_code"])
+        if eol:  # концы строк сменены без правки содержимого (ТЗ WSH-3.8, Э2.3)
+            out["eol_warning"] = eol
+        if d.get("eol_mixed"):  # файлы со смешанными концами строк на старте звена (ТЗ WSH-3.8, Э1)
+            out.update(eol_mixed=d["eol_mixed"][:EOL_SHOWN], eol_mixed_count=len(d["eol_mixed"]))
         if snap.get("chain"):
             out.update(phase=snap.get("phase"), active=snap.get("active"), chain=snap["chain"],
                        cost_usd=snap.get("cost_usd"))
@@ -1506,16 +1525,39 @@ def sandbox_hidden(workdir: Path, masks: list[str], environ: dict) -> tuple[list
                                                           or deny_read_hit(masks, rel, os.path.join(base, rel)))], None
 
 
+def eol_mixed(workdir: Path, environ: dict) -> tuple[list[str], str | None]:
+    """Отслеживаемые файлы со смешанными концами строк — CRLF и LF в одном файле (ТЗ WSH-3.8, Э1): git ls-files --eol
+    через gitsafe, записи с i/mixed (по содержимому в индексе). Встроенный Edit claude приводит концы строк такого
+    файла к одному виду целиком. Ответ — (пути, None) или ([], причина сбоя git)."""
+    git = shutil.which("git") or "git"
+    why = "смешанные концы строк не посчитаны"
+    try:
+        r = gitsafe.run(git, workdir, ["ls-files", "--eol", "-z"], environ, 30)
+    except gitsafe.GitUnsafe as e:
+        return [], f"{why}: {e.reason}: {e}"[:500]
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:  # ValueError — имя не в UTF-8
+        return [], f"{why}: {e}"[:500]
+    if r.returncode != 0:
+        return [], f"{why}: git ls-files вернул {r.returncode}: {r.stderr.strip()[:300]}"
+    out = []
+    for rec in r.stdout.split("\0"):
+        info, tab, path = rec.partition("\t")
+        if tab and path and info.split()[:1] == ["i/mixed"]:
+            out.append(path)
+    return out, None
+
+
 def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[str] | None, prompt: str = "",
-              switch: str | None = None) -> str:
+              switch: str | None = None, mixed: list[str] | None = None) -> str:
     """Блок «От хаба» в конце промпта (ТЗ WSH-3.5, П1): замечание оператора, если шаблон его не подставил; гейты
     (у фазы плана — какие будут в исполнении); смена ветки помощником (switch — профиль task или review, если правила
-    выданы; ТЗ WSH-3.8, В5 — строка не сокращается); скрытые песочницей файлы. Только непустые строки, весь блок
-    ≤ 2 КБ: лишнее — «и ещё N». Ответ — текст, который дописать к промпту (prompt — чтобы начать с новой строки),
-    или ""."""
+    выданы; ТЗ WSH-3.8, В5 — строка не сокращается); скрытые песочницей файлы; файлы со смешанными концами строк
+    (ТЗ WSH-3.8, Э1 — сокращается вместе со скрытыми). Только непустые строки, весь блок ≤ 2 КБ: лишнее — «и ещё N».
+    Ответ — текст, который дописать к промпту (prompt — чтобы начать с новой строки), или ""."""
     hidden = hidden or []
+    mixed = mixed or []
 
-    def build(ng: int, nh: int) -> str:
+    def build(ng: int, nh: int, ne: int) -> str:
         lines = []
         if note and note.strip():  # замечание из одних пробелов — строки нет (круг 2, Р11)
             lines.append(f"- Замечание оператора: {note}")
@@ -1535,18 +1577,33 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
             lines.append(f"- Песочница скрывает отслеживаемые файлы: {shown}. В `git status` задачи они выглядят "
                          "изменёнными — это не правка задачи: не восстанавливай их и не добавляй в коммит. "
                          "`git add -A` и `git add .` на них падают — добавляй файлы в индекс явными путями.")
+        if mixed:
+            shown = ", ".join(_shown_path(m) for m in mixed[:ne]) + \
+                (f" (и ещё {len(mixed) - ne})" if len(mixed) > ne else "") if ne else \
+                f"файлов: {len(mixed)}, список — `eol_mixed` в job.json"
+            lines.append(f"- Смешанные концы строк (CRLF и LF в одном файле): {shown}. Edit приводит концы строк всего "
+                         "файла к одному виду — после правки такого файла сверь `git diff --stat` с "
+                         "`git diff --ignore-cr-at-eol --stat` и верни концы строк, которые не правил.")
         if not lines:
             return ""
         return ("" if not prompt or prompt.endswith("\n") else "\n") + \
             "\n---\nОт хаба wshub (добавлено к шаблону):\n" + "\n".join(lines) + "\n"
 
-    ng, nh = min(len(gates), HUB_BLOCK_GATES), min(len(hidden), HUB_BLOCK_HIDDEN)
-    text = build(ng, nh)
-    # сокращаем списки: пути до одного, гейты до одного, затем пути до нуля — строка «скрыто файлов: N» без путей
-    # (круг 3, Р17): тогда хвост инструкции не срезает предохранитель по байтам
-    while len(text.encode("utf-8")) > HUB_BLOCK_MAX and (nh > 0 or ng > 1):
-        nh, ng = (nh - 1, ng) if nh > 1 or (nh == 1 and ng <= 1) else (nh, ng - 1)
-        text = build(ng, nh)
+    ng, nh, ne = min(len(gates), HUB_BLOCK_GATES), min(len(hidden), HUB_BLOCK_HIDDEN), min(len(mixed), HUB_BLOCK_EOL)
+    text = build(ng, nh, ne)
+    # сокращаем списки: пути (скрытые и смешанные концы строк — вместе, длинный список первым) до одного, гейты до
+    # одного, затем пути до нуля — строки «скрыто файлов: N» и «файлов: N» без путей (круг 3, Р17): тогда хвост
+    # инструкции не срезает предохранитель по байтам. Строка wshub switch не сокращается (ТЗ WSH-3.8, В5)
+    while len(text.encode("utf-8")) > HUB_BLOCK_MAX and (nh > 0 or ne > 0 or ng > 1):
+        if nh > 1 or ne > 1:
+            nh, ne = (nh - 1, ne) if nh >= ne else (nh, ne - 1)
+        elif ng > 1:
+            ng -= 1
+        elif nh > 0:
+            nh -= 1
+        else:
+            ne -= 1
+        text = build(ng, nh, ne)
     if len(text.encode("utf-8")) > HUB_BLOCK_MAX:  # последний предохранитель (note из 4-байтовых символов)
         text = text.encode("utf-8")[:HUB_BLOCK_MAX - 4].decode("utf-8", "ignore") + "…\n"
     return text
@@ -1806,7 +1863,7 @@ def outside_view(links: list[dict], docker_max: int = DOCKER_MAX) -> dict:
     последнего, строки «HEAD ушёл», коммиты (новые сверху), docker-вызовы по порядку (не больше docker_max),
     изменения .git/hooks и .git/config. Звено без блока (идёт, не дошло до итога, старое) — в no_data."""
     out: dict = {"commits": [], "commits_count": 0, "docker": [], "docker_count": 0, "git_meta_changed": []}
-    errors, no_data, moved = [], [], []
+    errors, no_data, moved, eol, eol_count = [], [], [], [], 0
     for x in links:
         oc = (x.get("result") or {}).get("outside_code")
         if not isinstance(oc, dict):
@@ -1825,11 +1882,15 @@ def outside_view(links: list[dict], docker_max: int = DOCKER_MAX) -> dict:
         out["docker"] += list(oc.get("docker") or [])
         out["docker_count"] += int(oc.get("docker_count") or 0)
         out["git_meta_changed"] += [m for m in oc.get("git_meta_changed") or [] if m not in out["git_meta_changed"]]
+        eol += [p for p in oc.get("eol_changed") or [] if not p.startswith("…ещё ") and p not in eol]
+        eol_count = max(eol_count, int(oc.get("eol_changed_count") or 0))
         errors += [f"{x.get('id')}: {e}" for e in oc.get("errors") or []]
     out["commits"] = out["commits"][:COMMITS_MAX]
     out["docker"] = out["docker"][:min(docker_max, DOCKER_MAX)]
     if moved:
         out["head_moved"] = moved
+    if eol:  # файлы, где задача сменила только концы строк (ТЗ WSH-3.8, Э2): по всем звеньям, без дублей
+        out["eol_changed"], out["eol_changed_count"] = clip_list(eol), max(eol_count, len(eol))
     out["git_meta_changed"] = clip_list(out["git_meta_changed"])
     if errors:
         out["errors"] = clip_list(errors)
@@ -1841,6 +1902,16 @@ def outside_view(links: list[dict], docker_max: int = DOCKER_MAX) -> dict:
 def clip_list(items: list[str], limit: int = META_MAX) -> list[str]:
     """Не больше limit строк (предел ответа 20 КБ и строки журнала) плюс «…ещё N»."""
     return items if len(items) <= limit else [*items[:limit], f"…ещё {len(items) - limit}"]
+
+
+def eol_warning(oc: dict) -> str | None:
+    """Строка ⚠ итога (ТЗ WSH-3.8, Э2.3): задача сменила концы строк без правки содержимого."""
+    files = [p for p in oc.get("eol_changed") or [] if not p.startswith("…ещё ")]
+    if not files:
+        return None
+    more = int(oc.get("eol_changed_count") or 0) - len(files)
+    return (f"⚠ концы строк изменены без правки содержимого: {', '.join(files)}"
+            + (f" (и ещё {more})" if more > 0 else "") + " — проверь `git diff --ignore-cr-at-eol`")
 
 
 def meta_warning(view: dict) -> str | None:

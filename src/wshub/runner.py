@@ -672,11 +672,16 @@ class Supervisor:
         return True
 
     def _switch(self, git: str, cwd: Path, environ: dict) -> bool:
-        """Ключ switch: шапки (ТЗ WSH-3.8, В2): уже на месте — ничего не делать (звено исполнения после плана и
-        code_resume не переключают второй раз); иначе проверки и git switch по форме В1 через gitsafe. Сбой — звено
-        failed с reason switch и текстом git, claude не запускается. После переключения снимок git на старте
-        снимается заново: «Вне кода» считает коммиты от HEAD после switch."""
+        """Ключ switch: шапки (ТЗ WSH-3.8, В2) — один раз на цепочку (ревью, Р1): у родителя тот же spec и он выполнен
+        или был на месте (есть done) — git не трогать, поле switch родителя наследуется с inherited (звено исполнения
+        после плана, replan, code_resume). Иначе — уже на месте (корень) ничего не делать; проверки и git switch по
+        форме В1 через gitsafe. Сбой — звено failed с reason switch и текстом git, claude не запускается. После
+        переключения снимок git на старте снимается заново: «Вне кода» считает коммиты от HEAD после switch."""
         spec = self.d["switch"]["spec"]
+        inherited = self._parent_switch(spec)
+        if inherited is not None:
+            self._save(switch=inherited)
+            return True
         try:
             sw = parse_switch(spec.split(), self.d.get("profile"))
             now = head_state(git, cwd, environ)
@@ -710,6 +715,20 @@ class Supervisor:
             return False
         self._save(switch={"spec": spec, "from": frm, "to": to, "done": True})
         return True
+
+    def _parent_switch(self, spec: str) -> dict | None:
+        """Поле switch родителя для наследования (ТЗ WSH-3.8, В2.3, Р1): тот же spec и есть done. Нет родителя, другой
+        spec (шапка сменилась к code_resume) или сбой switch: у родителя — None: switch: выполняется."""
+        parent = self.d.get("parent")
+        if not parent:
+            return None
+        try:
+            ps = self.jobs.read(parent).get("switch")
+        except JobError:
+            return None
+        if not isinstance(ps, dict) or ps.get("spec") != spec or "done" not in ps:
+            return None
+        return {**{k: ps[k] for k in ("spec", "from", "to", "done") if k in ps}, "inherited": parent}
 
     def _fail(self, reason: str, message: str) -> None:
         self.d.update(state="failed", reason=reason, error=message, finished_ts=time.time(),

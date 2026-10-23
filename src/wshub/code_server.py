@@ -31,7 +31,7 @@ from .jobs import (
     meta_warning,
     outside_view,
     phase_cost,
-    switch_line,
+    switch_lines,
 )
 from .registry import RegistryError, forge_url
 from .runner import apply_billing, billing_line, hide_cost_for, shown
@@ -496,7 +496,7 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
                                    "gate": ex.get("gate") or [], "switch_count": ex.get("switch_count", 0),
                                    "switch": ex.get("switch") or [], "links": ex.get("links") or []},
                       # switch: шапки (ТЗ WSH-3.8, В2.7); концы строк — до и после (Э1, Э2)
-                      "switch": [switch_line(x["switch"]) for x in links if isinstance(x.get("switch"), dict)],
+                      "switch": switch_lines(links),
                       "eol_warning": eol_warning(oc), "eol_mixed": (active.get("eol_mixed") or [])[:EOL_SHOWN],
                       "eol_mixed_count": len(active.get("eol_mixed") or []),
                       "result_head": "\n".join(text.strip().splitlines()[:RESULT_HEAD_LINES])}

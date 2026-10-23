@@ -1141,7 +1141,7 @@ class Jobs:
                     budget_total=float(d["budget_total"]) if d.get("budget_total") else None,
                     max_turns_total=int(d["max_turns_total"]) if d.get("max_turns_total") else None,
                     grants=grants, gates=gates, sandbox_hidden=hidden, billing=mode,
-                    # switch: шапки — из job.json звена плана: надзиратель исполнения увидит «уже на месте» (В2.3)
+                    # switch: шапки — из job.json звена плана: надзиратель исполнения унаследует его (В2.3, Р1)
                     switch=(d.get("switch") or {}).get("spec"), switch_helper=switch_helper, eol_mixed=mixed)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
@@ -1195,7 +1195,7 @@ class Jobs:
                **({"reason_hint": REASON_HINT[d["reason"]]} if d.get("reason") in REASON_HINT else {}),
                "files": {"events": _existing(jdir / "events.jsonl"), "stderr": _existing(jdir / "stderr.log"),
                          "task": _existing(Path(d["task"]), "нет (файл ТЗ удалён)") if d.get("task") else None}}
-        switch = [switch_line(x["switch"]) for x in links if isinstance(x.get("switch"), dict)]
+        switch = switch_lines(links)
         if switch:  # switch: из шапки (ТЗ WSH-3.8, В2.7)
             out["switch"] = switch
         eol = eol_warning(out["outside_code"])
@@ -1491,6 +1491,12 @@ def switch_line(sw: dict) -> str:
     if not sw["done"]:
         return f"ветка: switch {spec} — уже на месте ({sw.get('to')})"
     return f"ветка: switch {spec} — {sw.get('from')} → {sw.get('to')}"
+
+
+def switch_lines(links: list[dict]) -> list[str]:
+    """Строки switch: по звеньям — только где он выполнялся; унаследованное звено (inherited) не повторяется (Р1)."""
+    return [switch_line(x["switch"]) for x in links if isinstance(x.get("switch"), dict)
+            and not x["switch"].get("inherited")]
 
 
 def deny_read_hit(masks, rel: str, real: str) -> bool:

@@ -248,14 +248,60 @@ def test_header_switch_after_prefetch(code, tmp_path):
     assert _head(code.root) == x and code.jobs.read(d["id"])["switch"]["done"] is True
 
 
-def test_resume_does_not_switch_again(code):
+def _resume(code, jid: str) -> dict:
+    r = code.jobs.resume(jid, "cont", note="дальше")
+    wait_terminal(code.jobs, r["id"])
+    return code.jobs.read(r["id"])
+
+
+def test_resume_after_commit_on_detached_head_keeps_head(code, monkeypatch):
+    """Р1: задача закоммитила на отсоединённом HEAD — code_resume HEAD не трогает, коммит достижим из HEAD."""
     _diverged(code)
+    monkeypatch.setenv("FAKE_COMMIT", "1")
+    d = _start(code, "--detach feat")
+    wait_terminal(code.jobs, d["id"])
+    head = _head(code.root)
+    assert head != _head(code.root, "feat")  # коммит задачи поверх feat
+    monkeypatch.delenv("FAKE_COMMIT")
+    r = _resume(code, d["id"])
+    assert r["switch"]["inherited"] == d["id"] and r["switch"]["done"] is True
+    assert _head(code.root) == head
+    assert _out(code.root, "merge-base", "--is-ancestor", head, "HEAD").returncode == 0
+
+
+def test_resume_after_helper_switch_keeps_branch(code):
+    """Р1: задача сменила ветку помощником (wshub switch) — code_resume ветку не возвращает к шапке."""
+    main = _diverged(code)
     d = _start(code, "feat")
     wait_terminal(code.jobs, d["id"])
-    r = code.jobs.resume(d["id"], "cont", note="дальше")
-    assert r["switch"] == {"spec": "feat"}
-    wait_terminal(code.jobs, r["id"])
-    assert code.jobs.read(r["id"])["switch"] == {"spec": "feat", "from": "feat", "to": "feat", "done": False}
+    git(code.root, "switch", "-q", main)  # то, что сделал бы wshub switch внутри задачи
+    r = _resume(code, d["id"])
+    assert _branch(code.root) == main
+    assert r["switch"] == {"spec": "feat", "from": main, "to": "feat", "done": True, "inherited": d["id"]}
+    assert "switch" not in code.jobs.result_view(r["id"])  # унаследованное звено строку не повторяет
+
+
+def test_resume_with_other_spec_switches(code):
+    """Р1: к code_resume в шапке другой switch: — переключение выполняется как новое."""
+    main = _diverged(code)
+    d = _start(code, "feat")
+    wait_terminal(code.jobs, d["id"])
+    code.taskfile(extra=f"switch: {main}\n")
+    r = _resume(code, d["id"])
+    assert _branch(code.root) == main
+    assert r["switch"] == {"spec": main, "from": "feat", "to": main, "done": True}
+
+
+def test_resume_after_failed_switch_switches(code):
+    """Р1: у родителя switch: упал (failed/switch, done нет) — code_resume переключение выполняет."""
+    main = _branch(code.root)
+    d = _start(code, "nope")
+    wait_terminal(code.jobs, d["id"])
+    assert (code.jobs.read(d["id"])["reason"], "done" in code.jobs.read(d["id"])["switch"]) == ("switch", False)
+    git(code.root, "branch", "nope")
+    r = _resume(code, d["id"])
+    assert _branch(code.root) == "nope" and "inherited" not in r["switch"]
+    assert r["switch"] == {"spec": "nope", "from": main, "to": "nope", "done": True}
 
 
 def test_snapshot_after_switch_counts_task_commit(code, monkeypatch):
@@ -271,14 +317,23 @@ def test_snapshot_after_switch_counts_task_commit(code, monkeypatch):
 
 
 def test_chain_execute_link_does_not_switch_again(code):
-    _diverged(code)
-    root = _start(code, "feat", size="L")["id"]
+    """Р1: switch: — один раз на цепочку. Между планом и исполнением ссылка сдвинулась — исполнение HEAD не трогает,
+    поле switch унаследовано с inherited; строка «ветка: …» — одна, у звена, где switch: выполнялся."""
+    main = _diverged(code)
+    feat = _head(code.root, "feat")
+    root = _start(code, "--detach feat", size="L")["id"]
     _wait_state(code.jobs, root, ("plan_ready",))
-    assert code.jobs.read(root)["switch"]["done"] is True
+    sw = code.jobs.read(root)["switch"]
+    assert sw["done"] is True and _head(code.root) == feat
+    git(code.root, "branch", "-f", "feat", main)  # ссылка уехала на другой коммит
     child = code.jobs.approve(root)
-    assert child["switch"] == {"spec": "feat"}
+    assert child["switch"] == {"spec": "--detach feat"}
     wait_terminal(code.jobs, child["id"])
-    assert code.jobs.read(child["id"])["switch"] == {"spec": "feat", "from": "feat", "to": "feat", "done": False}
+    assert code.jobs.read(child["id"])["switch"] == {**sw, "inherited": root}
+    assert _head(code.root) == feat  # HEAD не тронут
+    line = f"ветка: switch --detach feat — {main} → {feat[:9]}"
+    assert code.jobs.result_view(root)["switch"] == [line]
+    assert code_server.card_data(code.jobs, root, 0)["end"]["switch"] == [line]
 
 
 # ---------- argv git: надзиратель и помощник ----------

@@ -290,6 +290,42 @@ def test_resume_with_other_spec_switches(code):
     r = _resume(code, d["id"])
     assert _branch(code.root) == main
     assert r["switch"] == {"spec": main, "from": "feat", "to": main, "done": True}
+    assert code.jobs.result_view(r["id"])["switch"] == [f"ветка: switch {main} — feat → {main}"]  # выполнил — строка
+
+
+def test_resume_inherits_when_parent_was_in_place(code):
+    """Р1: у родителя switch: был на месте (done = false) — тоже выполнен: code_resume после смены ветки задачей
+    наследует, ветку не возвращает."""
+    main = _diverged(code)
+    d = _start(code, main)
+    wait_terminal(code.jobs, d["id"])
+    assert code.jobs.read(d["id"])["switch"]["done"] is False
+    git(code.root, "switch", "-q", "feat")  # то, что сделал бы wshub switch внутри задачи
+    r = _resume(code, d["id"])
+    assert _branch(code.root) == "feat" and r["switch"]["inherited"] == d["id"] and r["switch"]["done"] is False
+
+
+def test_resume_same_spec_extra_spaces_inherits(code):
+    """spec сравнивается по словам: лишний пробел в шапке к code_resume — тот же switch:, наследование."""
+    main = _diverged(code)
+    d = _start(code, "--detach feat")
+    wait_terminal(code.jobs, d["id"])
+    git(code.root, "switch", "-q", main)
+    code.taskfile(extra="switch: --detach  feat\n")
+    r = _resume(code, d["id"])
+    assert _branch(code.root) == main and r["switch"]["inherited"] == d["id"]
+
+
+def test_replan_link_inherits(code):
+    """Р1: переделка плана после сдвига ссылки — HEAD не тронут, звено наследует switch: от плана."""
+    main = _diverged(code)
+    feat = _head(code.root, "feat")
+    root = _start(code, "--detach feat", size="L")["id"]
+    _wait_state(code.jobs, root, ("plan_ready",))
+    git(code.root, "branch", "-f", "feat", main)
+    child = code.jobs.replan(root, "короче")["id"]
+    _wait_state(code.jobs, child, ("plan_ready", "failed"))
+    assert code.jobs.read(child)["switch"]["inherited"] == root and _head(code.root) == feat
 
 
 def test_resume_after_failed_switch_switches(code):
@@ -302,6 +338,7 @@ def test_resume_after_failed_switch_switches(code):
     r = _resume(code, d["id"])
     assert _branch(code.root) == "nope" and "inherited" not in r["switch"]
     assert r["switch"] == {"spec": "nope", "from": main, "to": "nope", "done": True}
+    assert code.jobs.result_view(r["id"])["switch"] == [f"ветка: switch nope — {main} → nope"]
 
 
 def test_snapshot_after_switch_counts_task_commit(code, monkeypatch):
@@ -334,6 +371,9 @@ def test_chain_execute_link_does_not_switch_again(code):
     line = f"ветка: switch --detach feat — {main} → {feat[:9]}"
     assert code.jobs.result_view(root)["switch"] == [line]
     assert code_server.card_data(code.jobs, root, 0)["end"]["switch"] == [line]
+    # третье звено (code_resume исполнения) наследует от ближайшего родителя — звена исполнения, HEAD не тронут
+    r = _resume(code, child["id"])
+    assert r["switch"] == {**sw, "inherited": child["id"]} and _head(code.root) == feat
 
 
 # ---------- argv git: надзиратель и помощник ----------

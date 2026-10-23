@@ -674,7 +674,8 @@ class Supervisor:
     def _switch(self, git: str, cwd: Path, environ: dict) -> bool:
         """Ключ switch: шапки (ТЗ WSH-3.8, В2) — один раз на цепочку (ревью, Р1): у родителя тот же spec и он выполнен
         или был на месте (есть done) — git не трогать, поле switch родителя наследуется с inherited (звено исполнения
-        после плана, replan, code_resume). Иначе — уже на месте (корень) ничего не делать; проверки и git switch по
+        после плана, replan, code_resume). Иначе (корень цепочки или звено, которое выполняет switch: заново — другой
+        spec, сбой у родителя) — уже на месте ничего не делать; проверки и git switch по
         форме В1 через gitsafe. Сбой — звено failed с reason switch и текстом git, claude не запускается. После
         переключения снимок git на старте снимается заново: «Вне кода» считает коммиты от HEAD после switch."""
         spec = self.d["switch"]["spec"]
@@ -726,7 +727,9 @@ class Supervisor:
             ps = self.jobs.read(parent).get("switch")
         except JobError:
             return None
-        if not isinstance(ps, dict) or ps.get("spec") != spec or "done" not in ps:
+        # spec — по словам: лишний пробел в шапке к code_resume — не другой switch:
+        if not isinstance(ps, dict) or " ".join(str(ps.get("spec")).split()) != " ".join(spec.split()) \
+                or "done" not in ps:
             return None
         return {**{k: ps[k] for k in ("spec", "from", "to", "done") if k in ps}, "inherited": parent}
 

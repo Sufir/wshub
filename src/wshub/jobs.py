@@ -1257,7 +1257,7 @@ class Jobs:
                 "gate": [row(r) for r in gates[-EXTERNAL_MAX:]], "gate_count": len(gates),
                 "gate_failed": sum(1 for r in gates if r.get("exit")),
                 "switch": [row(r) for r in switches[-EXTERNAL_MAX:]], "switch_count": len(switches),
-                "links":list(dict.fromkeys(r["link"] for r in rows if r.get("link")))}
+                "links": list(dict.fromkeys(r["link"] for r in rows if r.get("link")))}
 
     # ---------- статистика (2.4.5) ----------
 
@@ -1884,15 +1884,17 @@ def outside_view(links: list[dict], docker_max: int = DOCKER_MAX) -> dict:
         out["docker"] += list(oc.get("docker") or [])
         out["docker_count"] += int(oc.get("docker_count") or 0)
         out["git_meta_changed"] += [m for m in oc.get("git_meta_changed") or [] if m not in out["git_meta_changed"]]
-        eol += [p for p in oc.get("eol_changed") or [] if not p.startswith("…ещё ") and p not in eol]
-        eol_count = max(eol_count, int(oc.get("eol_changed_count") or 0))
+        shown_eol = [p for p in oc.get("eol_changed") or [] if not p.startswith("…ещё ")]
+        eol += [p for p in shown_eol if p not in eol]
+        eol_count += max(int(oc.get("eol_changed_count") or 0) - len(shown_eol), 0)  # не показанные в списке звена
         errors += [f"{x.get('id')}: {e}" for e in oc.get("errors") or []]
     out["commits"] = out["commits"][:COMMITS_MAX]
     out["docker"] = out["docker"][:min(docker_max, DOCKER_MAX)]
     if moved:
         out["head_moved"] = moved
-    if eol:  # файлы, где задача сменила только концы строк (ТЗ WSH-3.8, Э2): по всем звеньям, без дублей
-        out["eol_changed"], out["eol_changed_count"] = clip_list(eol), max(eol_count, len(eol))
+    if eol:  # файлы, где задача сменила только концы строк (ТЗ WSH-3.8, Э2): по всем звеньям, без дублей; число —
+        # объединение показанных плюс не показанные хвосты звеньев (их пересечение не известно)
+        out["eol_changed"], out["eol_changed_count"] = clip_list(eol), len(eol) + eol_count
     out["git_meta_changed"] = clip_list(out["git_meta_changed"])
     if errors:
         out["errors"] = clip_list(errors)

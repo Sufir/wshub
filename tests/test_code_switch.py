@@ -205,6 +205,59 @@ def test_header_unsafe_config_fails_without_git(code):
     assert _branch(code.root) != "feat"
 
 
+def test_header_detach_from_branch_at_same_commit_switches(code):
+    """HEAD на ветке, коммит тот же, что у ссылки, — это не «на месте» для --detach: HEAD отсоединяется."""
+    main = _branch(code.root)
+    d = _start(code, f"--detach {main}")
+    wait_terminal(code.jobs, d["id"])
+    sw = code.jobs.read(d["id"])["switch"]
+    assert sw["done"] is True and sw["from"] == main and sw["to"] == _head(code.root)[:9]
+    assert _out(code.root, "symbolic-ref", "-q", "HEAD").returncode != 0
+
+
+def test_header_switch_reading_profile_and_python_m(code, monkeypatch):
+    """Ключ шапки работает у recon (форма без -c) и при хабе python -m wshub: его выполняет надзиратель (В2, В4.3)."""
+    _diverged(code)
+    d = _start(code, "--detach feat", profile="recon")
+    assert wait_terminal(code.jobs, d["id"])["state"] == "completed"
+    assert code.jobs.read(d["id"])["switch"]["done"] is True and _head(code.root) == _head(code.root, "feat")
+    monkeypatch.setattr(claude_cli, "wshub_exe", lambda: None)
+    d = _start(code, "feat")
+    assert wait_terminal(code.jobs, d["id"])["state"] == "completed"
+    assert _branch(code.root) == "feat" and code.jobs.read(d["id"])["switch"]["done"] is True
+    assert jobs_mod.SWITCH_PYTHON_M in code.jobs.read(d["id"])["warnings"]
+
+
+def test_header_switch_after_prefetch(code, tmp_path):
+    """switch: идёт после prefetch: ссылка origin/x появляется только после git fetch хаба."""
+    bare = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(bare)], check=True)
+    main = _branch(code.root)
+    git(code.root, "remote", "add", "origin", str(bare))
+    git(code.root, "switch", "-q", "-c", "x")
+    git(code.root, "commit", "-q", "--allow-empty", "-m", "x")
+    x = _head(code.root)
+    git(code.root, "push", "-q", "origin", "x")
+    git(code.root, "switch", "-q", main)
+    git(code.root, "branch", "-q", "-D", "x")
+    git(code.root, "update-ref", "-d", "refs/remotes/origin/x")
+    assert _out(code.root, "rev-parse", "--verify", "-q", "origin/x").returncode != 0
+    code.write(prefetch="true")
+    d = _start(code, "--detach origin/x")
+    assert wait_terminal(code.jobs, d["id"])["state"] == "completed", code.jobs.read(d["id"]).get("error")
+    assert _head(code.root) == x and code.jobs.read(d["id"])["switch"]["done"] is True
+
+
+def test_resume_does_not_switch_again(code):
+    _diverged(code)
+    d = _start(code, "feat")
+    wait_terminal(code.jobs, d["id"])
+    r = code.jobs.resume(d["id"], "cont", note="дальше")
+    assert r["switch"] == {"spec": "feat"}
+    wait_terminal(code.jobs, r["id"])
+    assert code.jobs.read(r["id"])["switch"] == {"spec": "feat", "from": "feat", "to": "feat", "done": False}
+
+
 def test_snapshot_after_switch_counts_task_commit(code, monkeypatch):
     """Снимок на старте — после switch:, иначе коммит задачи на расходящейся ветке дал бы «HEAD ушёл» без коммитов."""
     _diverged(code)
@@ -342,6 +395,7 @@ def test_helper_git_failure_returns_git_code(code, capsys):
     ({}, ["--detach", "nope"], "ссылка nope не ведёт к коммиту"),
     ({}, ["-c", "x", "nope"], "ссылка nope не ведёт к коммиту"),
     ({}, ["a..b"], "имя ветки a..b недопустимо"),
+    ({}, ["-c", "a..b", "feat"], "имя ветки a..b недопустимо"),
 ])
 def test_helper_refusals_recorded(code, capsys, setup, args, text):
     _diverged(code)

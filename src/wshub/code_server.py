@@ -234,14 +234,16 @@ def build_code_server(hub) -> FastMCP:
         до 10 docker-команд и их число, правки .git/hooks и .git/config — по всем звеньям), «Внешние действия»
         (пуш, API хостинга, гейты, смены ветки), смену ветки ключом switch: шапки, команду, чтобы открыть сессию в
         терминале, и пути к существующим файлам.
-        Правка .git/hooks или .git/config — предупреждение первой строкой."""
+        Правка .git/hooks или .git/config — предупреждение первой строкой; концы строк, сменённые без правки
+        содержимого, — строкой ⚠ следом."""
         try:
             out = apply_billing(jobs, jobs.result_view(job, docker_max=RESULT_DOCKER_MAX), model=True)
         except USER_ERR as e:
             _audit("code_result", job=job, status="error", error=str(e))
             return f"отказ: {e}"
         _audit("code_result", project=out.get("project"), job=job)
-        warn = meta_warning(out)  # первой строкой, до JSON: обрезка по пределу ответа его не съест
+        # предупреждения — до JSON: обрезка по пределу ответа их не съест (⚠ концов строк — ТЗ WSH-3.8, Э2.3)
+        warn = "\n".join(w for w in (meta_warning(out), out.get("eol_warning")) if w)
         return _trim(f"{warn}\n" + json.dumps(out, ensure_ascii=False, indent=1)) if warn else _dump(out)
 
     @tool()

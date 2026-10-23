@@ -159,6 +159,22 @@ def test_eol_changed_in_outside_code_and_errors(code, monkeypatch, tmp_path):
     out = runner._outside_code(shutil.which("git"), code.root, dict(os.environ), jdir)
     assert "eol_changed" not in out and "концы строк: git diff --numstat вернул 128: fatal" in out["errors"]
 
+    def unsafe(*a, **kw):
+        raise gitsafe.GitUnsafe("git_config_unsafe", "плохой ключ", ["core.fsmonitor"])
+
+    monkeypatch.setattr(runner, "_numstat", unsafe)
+    out = runner._outside_code(shutil.which("git"), code.root, dict(os.environ), jdir)
+    assert "eol_changed" not in out and "концы строк: git_config_unsafe: плохой ключ" in out["errors"]
+
+
+def test_eol_changed_union_over_chain():
+    """Цепочка: файлы — объединение без дублей; число — объединение показанных плюс не показанные хвосты звеньев."""
+    a = {"result": {"outside_code": {"eol_changed": ["x", "y"], "eol_changed_count": 2}}}
+    b = {"result": {"outside_code": {"eol_changed": ["y", "z", "…ещё 3"], "eol_changed_count": 5}}}
+    out = jobs_mod.outside_view([a, b])
+    assert (out["eol_changed"], out["eol_changed_count"]) == (["x", "y", "z"], 6)
+    assert "eol_changed" not in jobs_mod.outside_view([{"result": {"outside_code": {}}}])
+
 
 def test_eol_changed_limit(code):
     body = b"x\ny\n"
@@ -182,12 +198,15 @@ def test_eol_in_result_cli_and_card(code, capsys):
     view = code.jobs.result_view(jid)
     assert view["eol_warning"] == warn and view["outside_code"]["eol_changed"] == ["a.txt"]
     assert view["eol_mixed"] == ["mixed.txt"]
-    out = json.loads(_call(code, "code_result", {"job": jid}))
+    text = _call(code, "code_result", {"job": jid})
+    head, body = text.split("\n", 1)  # строка ⚠ — до JSON: обрезка ответа её не съест
+    assert head == warn
+    out = json.loads(body)
     assert out["eol_warning"] == warn and out["eol_mixed"] == ["mixed.txt"]
     assert out["outside_code"]["eol_changed_count"] == 1
     assert code_cli.code_main("code", ["result", jid], code.cfg, code.state) == 0
     cli = capsys.readouterr().out
-    assert warn in cli and '"eol_mixed": [' in cli
+    assert cli.splitlines()[0] == warn and '"eol_mixed": [' in cli
     end = code_server.card_data(code.jobs, jid, 0)["end"]
     assert end["eol_warning"] == warn and (end["eol_mixed"], end["eol_mixed_count"]) == (["mixed.txt"], 1)
 

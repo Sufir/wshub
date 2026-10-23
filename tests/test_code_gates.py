@@ -567,6 +567,16 @@ def test_gate_orphan_killed(code, capsys):
             os.killpg(orphan.pid, signal.SIGKILL)
 
 
+def test_gate_lock_key_by_realpath(code, tmp_path):
+    """Ключ лока — от реального пути каталога: тот же каталог через симлинк — тот же лок (ТЗ WSH-3.8, Л1)."""
+    link = tmp_path / "link"
+    link.symlink_to(code.root)
+    assert helper.gate_lock_paths(code.state, "proj", link) == helper.gate_lock_paths(code.state, "proj", code.root)
+    lock, holder = helper.gate_lock_paths(code.state, "proj", code.root)
+    assert lock.parent == code.state / "code" / "gates" / "proj" and len(lock.stem) == 16 and holder.stem == lock.stem
+    assert helper.gate_lock_paths(code.state, "proj", code.root / "sub")[0] != lock
+
+
 def test_gate_orphan_found_by_own_dir_holder(code, capsys):
     """ТЗ WSH-3.8, Л: сирота ищется по .holder своего каталога — гейт в корне не трогает сироту каталога sub, гейт
     в sub гасит её."""

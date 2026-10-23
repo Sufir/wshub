@@ -210,9 +210,9 @@ def _result(hub: Hub, args: list[str]) -> int:
     if len(pos) != 1:
         raise WsError("нужно: wshub code result <job>")
     out = apply_billing(jobs, jobs.result_view(pos[0]), model=True)  # строка оплаты и модель (ТЗ WSH-4.1)
-    warn = meta_warning(out)
-    if warn:
-        print(warn)
+    for warn in (meta_warning(out), out.get("eol_warning")):  # ⚠ концов строк — тоже до JSON (ТЗ WSH-3.8, Э2.3)
+        if warn:
+            print(warn)
     print(json.dumps(out, ensure_ascii=False, indent=1))
     if out.get("open_in_terminal"):
         print(f"открыть сессию: {out['open_in_terminal']}")

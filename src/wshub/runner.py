@@ -695,9 +695,13 @@ class Supervisor:
             if r.returncode != 0:
                 raise JobError(f"git {' '.join(sw.argv())} вернул {r.returncode}: "
                                f"{(r.stderr.strip() or r.stdout.strip())[:500]}")
-            to = head_label(head_state(git, cwd, environ))
-            atomic_write_text(self.jdir / GIT_START, json.dumps(start_snapshot(cwd, environ), ensure_ascii=False,
-                                                                indent=1))
+            try:
+                to = head_label(head_state(git, cwd, environ))
+                atomic_write_text(self.jdir / GIT_START, json.dumps(start_snapshot(cwd, environ), ensure_ascii=False,
+                                                                    indent=1))
+            except Exception as e:  # noqa: BLE001 — git switch уже прошёл: ветка сменена, в отказе — сказать об этом
+                raise JobError(f"git switch выполнен (ветка уже сменена: {spec}), но снимок git после него не "
+                               f"записан: {e}") from None
         except gitsafe.GitUnsafe as e:
             self._fail("switch", f"{e.reason}: {e}")
             return False

@@ -621,6 +621,17 @@ def test_hub_block_switch_line(code):
     assert "wshub switch" not in code.jobs.plan("proj", code.taskfile(size="L")).prompt  # фаза плана
 
 
+def test_hub_block_switch_line_kept_with_4byte_note():
+    """Ревью круга 3: замечание из 4-байтовых символов и гейт не влезают в 2 КБ — укорачивается замечание, строка
+    wshub switch остаётся целой (В5)."""
+    gates = (Gate("g", ("x" * 90,), 600),)
+    block = jobs_mod.hub_block("😀" * 300, gates, None, [], "p\n", switch="task")
+    assert len(block.encode("utf-8")) <= jobs_mod.HUB_BLOCK_MAX
+    assert block.endswith(jobs_mod.HUB_SWITCH["task"] + "\n")
+    note = block.split("- Замечание оператора: ", 1)[1].split("\n", 1)[0]
+    assert note.startswith("😀") and note.endswith("…") and len(note) < 300
+
+
 def test_hub_block_switch_line_not_shortened():
     gates = tuple(Gate(f"g{i}", ("x" * 90,), 600) for i in range(10))
     block = jobs_mod.hub_block("н" * 300, gates, None, [f"d/{'p' * 150}{i}" for i in range(20)], "p\n",

@@ -514,7 +514,8 @@ def _numstat(git: str, cwd: Path, environ: dict, head: str, *opts: str) -> dict[
 
 
 def _eol_changed(git: str, cwd: Path, environ: dict, head: str) -> tuple[list[str], int]:
-    """Файлы, где задача поменяла концы строк без правки содержимого (ТЗ WSH-3.8, Э2): от HEAD на старте звена до
+    """Файлы, где есть строки со сменой только концов строк, правка содержимого при этом может быть (ТЗ WSH-3.8, Э2;
+    круг 3, Р4): от HEAD на старте звена до
     рабочего дерева — git diff --numstat с --ignore-cr-at-eol и без; числа строк различаются — концы строк в файле
     сменены (файла во втором выводе нет — 0 и 0). Список — до META_MAX и общее число."""
     plain = _numstat(git, cwd, environ, head)

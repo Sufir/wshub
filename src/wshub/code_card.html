@@ -260,7 +260,7 @@ function renderEnd(end) {
   rows.push(el("div", null, "вне кода: " + parts.join(", ")));
   for (const m of oc.head_moved || []) rows.push(el("div", "danger", m));
   for (const s of end.switch || []) rows.push(el("div", null, s));  // switch: из шапки (ТЗ WSH-3.8)
-  if (end.eol_warning) rows.push(el("div", "danger", end.eol_warning));  // концы строк без правки (ТЗ WSH-3.8, Э2)
+  if (end.eol_warning) rows.push(el("div", "danger", end.eol_warning));  // строки со сменой только концов строк (ТЗ WSH-3.8, Э2)
   if (end.eol_mixed_count) {  // смешанные концы строк на старте звена (ТЗ WSH-3.8, Э1)
     const d = el("div", "mono");
     d.textContent = "смешанные концы строк: " + end.eol_mixed_count + " — " + (end.eol_mixed || []).join(", ")

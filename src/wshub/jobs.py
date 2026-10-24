@@ -1201,7 +1201,7 @@ class Jobs:
         if switch:  # switch: из шапки (ТЗ WSH-3.8, В2.7)
             out["switch"] = switch
         eol = eol_warning(out["outside_code"])
-        if eol:  # концы строк сменены без правки содержимого (ТЗ WSH-3.8, Э2.3)
+        if eol:  # есть строки, где сменились только концы строк (ТЗ WSH-3.8, Э2.3; круг 3, Р4)
             out["eol_warning"] = eol
         if d.get("eol_mixed"):  # файлы со смешанными концами строк на старте звена (ТЗ WSH-3.8, Э1)
             out.update(eol_mixed=d["eol_mixed"][:EOL_SHOWN], eol_mixed_count=len(d["eol_mixed"]))
@@ -1614,7 +1614,14 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
         else:
             ne -= 1
         text = build(ng, nh, ne)
-    if len(text.encode("utf-8")) > HUB_BLOCK_MAX:  # последний предохранитель (note из 4-байтовых символов)
+    if len(text.encode("utf-8")) > HUB_BLOCK_MAX and note and note.strip():
+        # note из 4-байтовых символов: сначала укорачиваем замечание — строка wshub switch (В5) и хвосты инструкций
+        # остаются целыми (ревью круга 3)
+        over = len(text.encode("utf-8")) - HUB_BLOCK_MAX
+        raw = note.encode("utf-8")
+        note = raw[:max(len(raw) - over - 4, 0)].decode("utf-8", "ignore") + "…"
+        text = build(ng, nh, ne)
+    if len(text.encode("utf-8")) > HUB_BLOCK_MAX:  # последний предохранитель
         text = text.encode("utf-8")[:HUB_BLOCK_MAX - 4].decode("utf-8", "ignore") + "…\n"
     return text
 

@@ -307,9 +307,10 @@ def _check_gate(args: list[str], ctx: _Ctx) -> None:
 
 
 def _check_switch(args: list[str], ctx: _Ctx) -> None:
-    """wshub switch (ТЗ WSH-3.8): смена ветки вне песочницы — git switch в песочнице падает на файлах, которые она
-    монтирует. task: <ветка> | -c <ветка> <база> | --detach <ссылка>; review: <ветка> | --detach <ссылка>. Хук держит
-    форму; есть ли ветка, не занята ли она и куда ведёт ссылка, проверяет помощник через git."""
+    """wshub switch (ТЗ WSH-3.8): смена ветки вне песочницы — git switch в песочнице на файлах, которые она монтирует,
+    меняет ветку наполовину. task: <ветка> | -c <ветка> <база> | --detach <ссылка>; review: <ветка> |
+    --detach <ссылка>. Хук держит форму; есть ли ветка, не занята ли она и куда ведёт ссылка, проверяет помощник
+    через git."""
     if ctx.profile not in SWITCH_PROFILES:
         raise _Deny("wshub switch — только в профилях task и review: читающие профили ветку не меняют")
     usage = "wshub switch <ветка> | wshub switch --detach <ссылка>"
@@ -455,10 +456,11 @@ def _check_git(tokens: list[str], j: int, ctx: _Ctx) -> None:
 def _check_git_branch(sub: str, args: list[str]) -> None:
     """Смена ветки в задаче — только помощником wshub switch (ТЗ WSH-3.8, стенд С1): в песочнице git switch на файле,
     который она монтирует, пишет «Device or resource busy», но меняет ветку наполовину и возвращает успех — HEAD на
-    новой ветке, файл старой версии. git switch — отказ; git checkout — только восстановление файлов (с «--»)."""
+    новой ветке, файл старой версии. git switch — отказ; git checkout — только восстановление файлов: «--» и после
+    него хотя бы один путь (git checkout <ветка> -- без путей меняет ветку — ревью круга 3)."""
     if sub == "switch":
         raise _Deny(GIT_SWITCH_REASON)
-    if sub == "checkout" and "--" not in args:
+    if sub == "checkout" and ("--" not in args or not args[args.index("--") + 1:]):
         raise _Deny("git checkout в задаче — только восстановление файлов: git checkout [<коммит>] -- <путь>. "
                     + GIT_SWITCH_REASON)
 

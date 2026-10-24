@@ -222,6 +222,10 @@ DENY = [
     "git checkout .",
     "git checkout src/app.py",
     "git-checkout b",
+    # «--» без путей — тоже смена ветки (ревью круга 3)
+    "git checkout b --",
+    "git checkout --detach origin/x --",
+    "git-checkout b --",
 ]
 
 ALLOW = [
@@ -572,6 +576,7 @@ def test_git_switch_and_checkout_reasons():
             assert reason is not None and "wshub switch" in reason, (cmd, profile, reason)
     assert "только восстановление файлов" in hook.check("git checkout b", CWD, DATA, "task")
     assert hook.check("git checkout -- a.txt", CWD, DATA, "task") is None
+    assert "только восстановление файлов" in hook.check("git checkout b --", CWD, DATA, "task")
 
 
 def test_helper_switch_review():

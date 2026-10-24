@@ -564,7 +564,8 @@ def test_main_gate_by_profile():
 
 
 def test_git_switch_and_checkout_reasons():
-    """git switch и git checkout без «--» — отказ с подсказкой wshub switch; git checkout -- <путь> — можно (WSH-3.8)."""
+    """git switch и git checkout без «--» — отказ с подсказкой wshub switch; git checkout -- <путь> — можно
+    (WSH-3.8)."""
     for profile in ("task", "review", "recon", "plan", None):
         for cmd in ("git switch b", "git checkout b"):
             reason = hook.check(cmd, CWD, DATA, profile)

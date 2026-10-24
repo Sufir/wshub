@@ -77,7 +77,8 @@ SWITCH_PYTHON_M = "смена ветки помощником недоступн
 # хвост строки — по факту стенда (ТЗ WSH-3.8, круг 3, Р2): git switch на смонтированном файле меняет ветку наполовину
 HUB_SWITCH_TAIL = (" целиком. `git switch` и `git checkout <ветка>` в задаче запрещены: в песочнице на файлах, которые "
                    "она монтирует, они меняют ветку наполовину и возвращают успех")
-HUB_SWITCH_RESTORE = "; файлы восстанавливай `git checkout -- <путь>`"  # только task: у review правила git checkout нет (Р5)
+# совет — только task: у review правила git checkout нет (Р5)
+HUB_SWITCH_RESTORE = "; файлы восстанавливай `git checkout -- <путь>`"
 HUB_SWITCH = {"task": "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch -c <ветка> <база>` | "
                       "`wshub switch --detach <ссылка>`" + HUB_SWITCH_TAIL + HUB_SWITCH_RESTORE + ".",
               "review": "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch --detach <ссылка>`"

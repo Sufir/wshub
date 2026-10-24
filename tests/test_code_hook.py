@@ -209,6 +209,19 @@ DENY = [
     "ls ~/.local/state/ws[h]ub",
     # не разобрано — отказ
     "echo 'незакрытая",
+    # смена ветки — только wshub switch (WSH-3.8, стенд С1: в песочнице ветка меняется наполовину)
+    "git switch b",
+    "git switch -c PAY-1 --no-track origin/master",
+    "git switch --detach origin/x",
+    "git -C . switch b",
+    "git-switch b",
+    "git status && git switch b",
+    "git checkout b",
+    "git checkout -b x origin/master",
+    "git checkout --detach origin/x",
+    "git checkout .",
+    "git checkout src/app.py",
+    "git-checkout b",
 ]
 
 ALLOW = [
@@ -221,7 +234,9 @@ ALLOW = [
     "git add -A",
     'git commit -m "push later"',
     "git commit -m push",
-    "git switch -c PAY-1 --no-track origin/master",
+    "git checkout -- src/app.py",
+    "git checkout HEAD -- src/app.py",
+    "git checkout HEAD~1 -- a.txt b.txt",
     "git rev-parse --abbrev-ref --symbolic-full-name @{u}",
     "git remote",
     "git remote -v",
@@ -546,6 +561,16 @@ def test_main_gate_by_profile():
     assert _run(event, argv=["--profile", "plan", *map(str, DATA)])[0] == 2
     assert _run(event, argv=["--profile", "review", *map(str, DATA)])[0] == 2
     assert _run(event)[0] == 2
+
+
+def test_git_switch_and_checkout_reasons():
+    """git switch и git checkout без «--» — отказ с подсказкой wshub switch; git checkout -- <путь> — можно (WSH-3.8)."""
+    for profile in ("task", "review", "recon", "plan", None):
+        for cmd in ("git switch b", "git checkout b"):
+            reason = hook.check(cmd, CWD, DATA, profile)
+            assert reason is not None and "wshub switch" in reason, (cmd, profile, reason)
+    assert "только восстановление файлов" in hook.check("git checkout b", CWD, DATA, "task")
+    assert hook.check("git checkout -- a.txt", CWD, DATA, "task") is None
 
 
 def test_helper_switch_review():

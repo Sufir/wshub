@@ -9,7 +9,8 @@ sandbox_exclude, которые идут вне песочницы. Отказ, 
    --open-files-in-pager (запускает программу, в том числе сокращения и склейки коротких опций); --output у
    log/show/diff — только в пишущем профиле и только в файл внутри рабочего каталога (review — внутри
    .agents/), не в .git; git с переменной окружения GIT_*, PAGER, LESSOPEN, LESSCLOSE перед ним (внешний diff,
-   пейджер, чужой каталог git);
+   пейджер, чужой каталог git); git switch и git checkout без «--» — смена ветки только помощником wshub switch
+   (WSH-3.8: в песочнице они меняют ветку наполовину);
 2. сетевой клиент (ssh, scp, rsync, curl, wget, nc …);
 3. путь внутрь служебных каталогов wshub (реестр, состояние) — их передаёт settings.json аргументами;
 4. оболочка, читающая команды из stdin, или интерпретатор с кодом в строке, где упомянуто запрещённое;
@@ -137,6 +138,9 @@ GATE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")  # имя гейта �
 SWITCH_BRANCH_RE = re.compile(r"^(?![-/.])(?!.*\.\.)(?!.*//)[A-Za-z0-9._/-]{1,200}(?<![/.])(?<!\.lock)$")
 SWITCH_REF_RE = re.compile(r"^(?![-/.])(?!.*\.\.)(?!.*//)[A-Za-z0-9._/~^-]{1,200}$")
 SWITCH_PROFILES = {"task", "review"}
+GIT_SWITCH_REASON = ("ветку меняй командой wshub switch <ветка> | -c <ветка> <база> | --detach <ссылка>: в песочнице "
+                     "git switch и git checkout <ветка> на смонтированных файлах могут сменить ветку наполовину "
+                     "и вернуть успех")
 
 CODE_DENY = re.compile(
     r"\bgit\b[^\n;|&]{0,200}?\b(" + "|".join(sorted(GIT_DENY | {"config"})) + r")\b"
@@ -413,6 +417,7 @@ def _check_git(tokens: list[str], j: int, ctx: _Ctx) -> None:
         sub = n[4:]
         if sub in GIT_DENY or sub.startswith("remote") or sub == "config":
             raise _Deny(f"{n}: {_git_reason(sub)}")
+        _check_git_branch(sub, tokens[j + 1:])
         _check_git_args(sub, tokens[j + 1:], ctx)
         return
     k = j + 1
@@ -439,11 +444,23 @@ def _check_git(tokens: list[str], j: int, ctx: _Ctx) -> None:
         return
     if sub in GIT_DENY:
         raise _Deny(f"git {sub}: {_git_reason(sub)}")
+    _check_git_branch(sub, tokens[k + 1:])
     if sub == "config":
         args = set(tokens[k + 1:])
         if args & GIT_CONFIG_WRITE or not args & GIT_CONFIG_READ:
             raise _Deny("git config: в задачах разрешено только чтение (--get, --list)")
     _check_git_args(sub, tokens[k + 1:], ctx)
+
+
+def _check_git_branch(sub: str, args: list[str]) -> None:
+    """Смена ветки в задаче — только помощником wshub switch (ТЗ WSH-3.8, стенд С1): в песочнице git switch на файле,
+    который она монтирует, пишет «Device or resource busy», но меняет ветку наполовину и возвращает успех — HEAD на
+    новой ветке, файл старой версии. git switch — отказ; git checkout — только восстановление файлов (с «--»)."""
+    if sub == "switch":
+        raise _Deny(GIT_SWITCH_REASON)
+    if sub == "checkout" and "--" not in args:
+        raise _Deny("git checkout в задаче — только восстановление файлов: git checkout [<коммит>] -- <путь>. "
+                    + GIT_SWITCH_REASON)
 
 
 def _check_git_args(sub: str, args: list[str], ctx: _Ctx) -> None:

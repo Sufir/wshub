@@ -152,7 +152,6 @@
                 "Task",
                 "Bash(git add *)",
                 "Bash(git commit *)",
-                "Bash(git switch *)",
                 "Bash(git branch *)",
                 "Bash(git rev-parse *)",
                 "Bash(git rev-list *)",

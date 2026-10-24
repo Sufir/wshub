@@ -543,6 +543,16 @@ def test_cli_dispatch_switch(code):
 
 # ---------- В4. settings ----------
 
+@pytest.mark.parametrize("profile", ["task", "review", "recon"])
+def test_settings_no_direct_git_switch(profile):
+    """Круг 3, Р2: правила Bash(git switch *) нет ни у одного профиля — ветку меняет wshub switch; git checkout у task
+    остаётся (восстановление файлов, форму держит хук)."""
+    s = claude_cli.settings(profile, "T.md", CodeGlobal(), ProjectCode(), [], [], ["/w"], Path("/h"), Path("/d"),
+                            switch=True)
+    assert not [a for a in s["permissions"]["allow"] if a.startswith("Bash(git switch")]
+    assert ("Bash(git checkout *)" in s["permissions"]["allow"]) is (profile == "task")
+
+
 @pytest.mark.parametrize("profile,phase,has", [("task", None, True), ("review", None, True), ("recon", None, False),
                                                ("task", "plan", False), ("review", "plan", False)])
 def test_settings_switch_rules(profile, phase, has):
@@ -598,10 +608,13 @@ def test_python_m_warns_no_rules(code, monkeypatch):
 def test_hub_block_switch_line(code):
     task = code.jobs.plan("proj", code.taskfile()).prompt
     assert task.endswith(jobs_mod.HUB_SWITCH["task"] + "\n")
+    tail = (" целиком. `git switch` и `git checkout <ветка>` в задаче запрещены: в песочнице на файлах, которые она "
+            "монтирует, они меняют ветку наполовину и возвращают успех; файлы восстанавливай `git checkout -- <путь>`.")
     assert jobs_mod.HUB_SWITCH["task"] == (
         "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch -c <ветка> <база>` | `wshub switch --detach "
-        "<ссылка>` целиком: `git switch` в песочнице падает на файлах, которые она монтирует («Device or resource "
-        "busy»).")
+        "<ссылка>`" + tail)  # круг 3, Р2 — дословно
+    assert jobs_mod.HUB_SWITCH["review"] == \
+        "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch --detach <ссылка>`" + tail
     review = code.jobs.plan("proj", code.taskfile(profile="review")).prompt
     assert jobs_mod.HUB_SWITCH["review"] in review and "-c <ветка>" not in review
     assert "wshub switch" not in code.jobs.plan("proj", code.taskfile(profile="recon")).prompt

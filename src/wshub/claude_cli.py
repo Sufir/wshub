@@ -23,7 +23,9 @@ from .runtime import atomic_write_text
 SUBAGENT_TOOL = "Task"  # так инструмент называется в init.tools у 2.1.291; в документации Agent — алиас
 FILE_TOOLS = ("Read", "Edit", "Write", "NotebookEdit")  # Grep и Glob нет в init.tools у 2.1.291 (WSH-3.4)
 RECON_BASH = ("git status *", "git log *", "git show *", "git diff *", "git grep *")
-TASK_BASH = ("git add *", "git commit *", "git switch *", "git branch *", "git rev-parse *", "git rev-list *",
+# git switch — нет (ТЗ WSH-3.8, круг 3, Р2): ветку меняет только wshub switch, хук git switch отклоняет; git checkout —
+# для восстановления файлов (git checkout [<коммит>] -- <путь>), форму держит хук
+TASK_BASH = ("git add *", "git commit *", "git branch *", "git rev-parse *", "git rev-list *",
              "git merge --ff-only *", "git checkout *")
 # git remote на чтение (ТЗ WSH-3.4, А4.2): правила — удобство, настоящая граница — хук
 GIT_REMOTE_READ = ("git remote", "git remote -v", "git remote get-url *")

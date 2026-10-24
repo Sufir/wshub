@@ -15,8 +15,11 @@ from test_code import git, make_code, wait_terminal
 from wshub import code_cli, code_server, gitsafe, runner
 from wshub import jobs as jobs_mod
 
-LINE = ("Edit приводит концы строк всего файла к одному виду — после правки такого файла сверь `git diff --stat` с "
-        "`git diff --ignore-cr-at-eol --stat` и верни концы строк, которые не правил.")
+# совет — с путём (круг 3, Р3): без него git diff --stat в песочнице падает на скрытом файле
+LINE = ("Edit приводит концы строк всего файла к одному виду — после правки такого файла сверь "
+        "`git diff --stat -- <файл>` с `git diff --ignore-cr-at-eol --stat -- <файл>` и верни концы строк, которые "
+        "не правил.")
+WARN_TAIL = " — сверь `git diff --stat -- <файл>` с `git diff --ignore-cr-at-eol --stat -- <файл>`"  # круг 3, Р4
 
 
 @pytest.fixture
@@ -194,7 +197,7 @@ def test_eol_in_result_cli_and_card(code, capsys):
     (code.root / "a.txt").write_bytes(b"one\r\ntwo\r\n")
     jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
     wait_terminal(code.jobs, jid)
-    warn = "⚠ концы строк изменены без правки содержимого: a.txt — проверь `git diff --ignore-cr-at-eol`"
+    warn = "⚠ в файлах есть строки, где сменились только концы строк: a.txt" + WARN_TAIL
     view = code.jobs.result_view(jid)
     assert view["eol_warning"] == warn and view["outside_code"]["eol_changed"] == ["a.txt"]
     assert view["eol_mixed"] == ["mixed.txt"]
@@ -213,8 +216,8 @@ def test_eol_in_result_cli_and_card(code, capsys):
 
 def test_eol_warning_more():
     oc = {"eol_changed": ["a", "b", "…ещё 3"], "eol_changed_count": 5}
-    assert jobs_mod.eol_warning(oc) == \
-        "⚠ концы строк изменены без правки содержимого: a, b (и ещё 3) — проверь `git diff --ignore-cr-at-eol`"
+    assert jobs_mod.eol_warning(oc) == "⚠ в файлах есть строки, где сменились только концы строк: a, b (и ещё 3)" + \
+        " — сверь `git diff --stat -- <файл>` с `git diff --ignore-cr-at-eol --stat -- <файл>`"  # Р4 — дословно
     assert jobs_mod.eol_warning({}) is None
 
 

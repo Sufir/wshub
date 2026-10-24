@@ -74,8 +74,10 @@ SWITCH_FORMS = "<ветка> | -c <ветка> <база> | --detach <ссылк
 SWITCH_PROFILES = ("task", "review")  # помощник; ключ шапки — все профили, форма -c — только task
 SWITCH_TIMEOUT = 120
 SWITCH_PYTHON_M = "смена ветки помощником недоступна: хаб запущен как python -m wshub"
-HUB_SWITCH_TAIL = (" целиком: `git switch` в песочнице падает на файлах, которые она монтирует («Device or resource "
-                   "busy»).")
+# хвост строки — по факту стенда (ТЗ WSH-3.8, круг 3, Р2): git switch на смонтированном файле меняет ветку наполовину
+HUB_SWITCH_TAIL = (" целиком. `git switch` и `git checkout <ветка>` в задаче запрещены: в песочнице на файлах, которые "
+                   "она монтирует, они меняют ветку наполовину и возвращают успех; файлы восстанавливай "
+                   "`git checkout -- <путь>`.")
 HUB_SWITCH = {"task": "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch -c <ветка> <база>` | "
                       "`wshub switch --detach <ссылка>`" + HUB_SWITCH_TAIL,
               "review": "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch --detach <ссылка>`"
@@ -1590,8 +1592,8 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
                 (f" (и ещё {len(mixed) - ne})" if len(mixed) > ne else "") if ne else \
                 f"файлов: {len(mixed)}, список — `eol_mixed` в job.json"
             lines.append(f"- Смешанные концы строк (CRLF и LF в одном файле): {shown}. Edit приводит концы строк всего "
-                         "файла к одному виду — после правки такого файла сверь `git diff --stat` с "
-                         "`git diff --ignore-cr-at-eol --stat` и верни концы строк, которые не правил.")
+                         "файла к одному виду — после правки такого файла сверь `git diff --stat -- <файл>` с "
+                         "`git diff --ignore-cr-at-eol --stat -- <файл>` и верни концы строк, которые не правил.")
         if not lines:
             return ""
         return ("" if not prompt or prompt.endswith("\n") else "\n") + \
@@ -1915,13 +1917,15 @@ def clip_list(items: list[str], limit: int = META_MAX) -> list[str]:
 
 
 def eol_warning(oc: dict) -> str | None:
-    """Строка ⚠ итога (ТЗ WSH-3.8, Э2.3): задача сменила концы строк без правки содержимого."""
+    """Строка ⚠ итога (ТЗ WSH-3.8, Э2.3; круг 3, Р4): в файлах есть строки, где сменились только концы строк (правка
+    содержимого при этом может быть)."""
     files = [p for p in oc.get("eol_changed") or [] if not p.startswith("…ещё ")]
     if not files:
         return None
     more = int(oc.get("eol_changed_count") or 0) - len(files)
-    return (f"⚠ концы строк изменены без правки содержимого: {', '.join(files)}"
-            + (f" (и ещё {more})" if more > 0 else "") + " — проверь `git diff --ignore-cr-at-eol`")
+    return (f"⚠ в файлах есть строки, где сменились только концы строк: {', '.join(files)}"
+            + (f" (и ещё {more})" if more > 0 else "")
+            + " — сверь `git diff --stat -- <файл>` с `git diff --ignore-cr-at-eol --stat -- <файл>`")
 
 
 def meta_warning(view: dict) -> str | None:

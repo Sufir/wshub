@@ -613,10 +613,14 @@ def test_hub_block_switch_line(code):
     assert jobs_mod.HUB_SWITCH["task"] == (
         "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch -c <ветка> <база>` | `wshub switch --detach "
         "<ссылка>`" + tail)  # круг 3, Р2 — дословно
-    assert jobs_mod.HUB_SWITCH["review"] == \
-        "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch --detach <ссылка>`" + tail
+    # Р5: у review хвост без совета `git checkout -- <путь>` — правила git checkout у review нет; остальное то же
+    assert jobs_mod.HUB_SWITCH["review"] == (
+        "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch --detach <ссылка>` целиком. `git switch` и "
+        "`git checkout <ветка>` в задаче запрещены: в песочнице на файлах, которые она монтирует, они меняют ветку "
+        "наполовину и возвращают успех.")
     review = code.jobs.plan("proj", code.taskfile(profile="review")).prompt
     assert jobs_mod.HUB_SWITCH["review"] in review and "-c <ветка>" not in review
+    assert "git checkout -- <путь>" not in review
     assert "wshub switch" not in code.jobs.plan("proj", code.taskfile(profile="recon")).prompt
     assert "wshub switch" not in code.jobs.plan("proj", code.taskfile(size="L")).prompt  # фаза плана
 

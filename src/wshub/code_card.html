@@ -220,7 +220,8 @@ function render(d) {
   if (d.grants && d.grants.push) tags.push("пуш");
   if (d.grants && d.grants.forge) tags.push("API");
   g.replaceChildren(...tags.map((t) => { const s = el("span", "tag", t); if (d.grants.reason) s.title = d.grants.reason; return s; }));
-  g.hidden = !tags.length;
+  if (d.mode === "auto") g.append(el("span", "tag", "режим: auto"));  // без песочницы (ТЗ WSH-3.15)
+  g.hidden = !tags.length && d.mode !== "auto";
 
   const ph = $("phases");
   ph.hidden = !d.phases;

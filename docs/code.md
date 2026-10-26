@@ -61,6 +61,7 @@ execute_prompt = "execute"        # шаблон фазы исполнения �
 push = "no"                       # пуш: no | task | always (раздел «Пуш и API хостинга»)
 push_protect = ["main", "master"] # куда пуш запрещён всегда
 forge_access = "no"               # API хостинга: no | task | always; при доступе нужны forge и forge_token
+mode = "sandbox"                  # sandbox | auto (раздел «Режим auto»)
 
 [[code.policy]]                   # строка политики для всех проектов (сильнее встроенной)
 profile = "task"
@@ -86,7 +87,7 @@ plan_effort = "high"
 Умолчания: `enabled = false`; при `enabled = true` обязательны `dirs` и `prompts`; `profiles` — все три;
 `model_min = "haiku"`, `model_max = "opus"`, `effort_max = "high"`, `max_parallel = 1`, `prefetch = false`,
 `plan_budget_share = 0.3`, `execute_prompt = "execute"`, `push = "no"`, `push_protect = ["main", "master"]`,
-`forge_access = "no"`, `forge_write = false`; списки пустые. Каждый
+`forge_access = "no"`, `forge_write = false`, `mode = "sandbox"`; списки пустые. Каждый
 элемент `dirs` после `resolve()` лежит внутри корня проекта, существует и строго не пересекается со
 служебными каталогами wshub (код, реестр, состояние) — иначе ошибка реестра для `wshub-code`.
 
@@ -113,6 +114,44 @@ plan_effort = "high"
 Флаги терминала `wshub code start --max-turns/--budget-usd` — ручной выбор оператора: применяются как явный лимит
 и без потолка в реестре, и выше него (ходы — в обоих режимах, бюджет — на подписке); на ключе бюджет не выше
 `max_budget_usd`, если он задан (раздел «Задачи на ключе»). Лимиты на ключе — там же.
+
+## Режим auto
+
+**Зачем.** wshub-code убирает оператора из перекладывания текста между чатом и Code, а не строит для Code
+отдельную строгую среду. Руками оператор запускает Code в режиме «Авто»; режим проекта `mode = "auto"` даёт задаче
+те же права. В `sandbox` (по умолчанию) задача идёт в `dontAsk` с закрытым allow, песочницей и хуком — там
+рождается большая часть стопоров.
+
+```toml
+[workspace.team-service.code]
+mode = "auto"                     # sandbox (по умолчанию) | auto; другое значение — ошибка секции проекта
+```
+
+**Что делает.** У задачи профиля `task` в фазе исполнения (без плана или после него):
+
+- `--permission-mode auto` вместо `dontAsk`: каждое действие оценивает классификатор Claude Code, отказ — действие
+  не выполняется, Code получает причину и продолжает;
+- в settings.json нет песочницы и хука, `permissions.allow` пуст; `env.BASH_MAX_TIMEOUT_MS = "3600000"` — долгие
+  прогоны проекта не уходят в фон; `apiKeyHelper` (задача на ключе) и `claudeMdExcludes` — как в `sandbox`;
+- не выдаются помощник хаба (`wshub push`, `wshub forge`, `wshub gate`, `wshub switch`, его PATH), гейты,
+  `sandbox_exclude`, `bash_allow`, `network`. Разрешения `push`/`forge` задача не получает: в предупреждениях —
+  «режим auto: пуш и API хостинга задаче не выдаются». Ключи проекта остаются в реестре и действуют в `sandbox` и для
+  других профилей;
+- в блоке «От хаба» нет строк `wshub switch`, гейтов и скрытых песочницей файлов; замечание оператора и строка о
+  смешанных концах строк — остаются.
+
+Как раньше: фаза плана (`--permission-mode plan` и её settings), профили `recon` и `review` (песочница,
+`dontAsk`), `switch:` шапки (надзиратель), одна задача на каталог, страж оплаты, снимок git и «Вне кода», концы
+строк, учёт. Видно: `job.json` — `mode` звена (`sandbox` | `auto`; у фазы плана — `sandbox`); `code_result`,
+`wshub code result` — строка `"mode": "режим: auto"`, карточка — тег «режим: auto», если в auto шло хоть одно
+звено; `code_projects` — `mode` проекта.
+
+**Что запрещено.** `permissions.deny` — только `Bash(git push)` и `Bash(git push *)`; `Read`/`Edit` служебных
+каталогов wshub и `deny_read` (`[code]` и проекта); `Edit` для `.claude/settings.json` и `.claude/settings.local.json`
+рабочего каталога (страж оплаты); `Read(**/.env*)`; `WebFetch`, `WebSearch`. `--setting-sources project,local`
+остаётся: пользовательские настройки `~/.claude` в задачу не попадают.
+
+> **В режиме `auto` Code работает без песочницы, с правами пользователя** — как в терминале оператора с режимом «Авто». Каждое действие оценивает классификатор Claude Code; документация Claude Code прямо говорит, что режим уменьшает число запросов, но не гарантирует безопасность. Хаб запрещает `git push` и доступ к своим служебным каталогам — это защита от случайного, а не от намеренного. Включай `auto` в проектах, где доверяешь задачам так же, как при работе руками.
 
 ## Шапка запуска
 

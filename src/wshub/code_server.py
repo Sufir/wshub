@@ -144,6 +144,7 @@ def build_code_server(hub) -> FastMCP:
                         # гейты проекта (ТЗ WSH-3.5, Г1): wshub gate <имя> задачи профиля task
                         "gates": [{"name": g.name, "cmd": shlex.join(g.cmd), "timeout_s": g.timeout_s}
                                   for g in proj.gates],
+                        "mode": proj.mode,  # sandbox | auto (ТЗ WSH-3.15)
                         # действующая политика: строки проекта, глобальные, встроенные — от сильной к слабой
                         "policy": code_policy.effective(reg.code.glob, proj),
                         # последний снимок лимитов подписки — общий для хаба (ТЗ WSH-4.1, п. 2.7)
@@ -477,6 +478,8 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
            "billing": pay,
            "rate": next((s.rate for s in reversed(scans) if s.rate), None),
            "actions": [_card_action(a, t0) for a in acts[-LOG_MAX:]], "marks": marks, "offset": new_offset}
+    if any(x.get("mode") == "auto" for x in links):  # звено в режиме auto (ТЗ WSH-3.15, п. 1.2.6)
+        out["mode"] = "auto"
     costs = [phase_cost(x) for x in links]
     if (cost_shown(d) or cost_shown(active)) and any(c is not None for c in costs):
         out["cost_usd"] = _sum(costs)  # сумма — на ключе и при остановке стражем оплаты (ТЗ WSH-4.6, п. 2.6.2)

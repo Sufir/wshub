@@ -69,6 +69,8 @@ HUB_BLOCK_EOL = 20  # путей со смешанными концами стр
 EOL_JOB_MAX = 200  # путей eol_mixed в job.json
 EOL_SHOWN = 20  # путей eol_mixed в code_result и карточке
 GATES_PYTHON_M = "гейты недоступны: хаб запущен как python -m wshub"
+AUTO_NO_GRANTS = "режим auto: пуш и API хостинга задаче не выдаются"  # ТЗ WSH-3.15, решение архитектора по плану
+AUTO_LINE = "режим: auto"  # строка итога и карточки (ТЗ WSH-3.15, п. 1.2.6)
 # смена ветки (ТЗ WSH-3.8, часть В): ключ switch: шапки и помощник wshub switch
 SWITCH_FORMS = "<ветка> | -c <ветка> <база> | --detach <ссылка>"
 SWITCH_PROFILES = ("task", "review")  # помощник; ключ шапки — все профили, форма -c — только task
@@ -181,8 +183,14 @@ class Plan:
     eol_mixed: list[str] | None = None  # отслеживаемые файлы со смешанными концами строк (ТЗ WSH-3.8, Э1)
 
     @property
+    def mode(self) -> str:
+        """Режим звена (ТЗ WSH-3.15): auto — задача task проекта с mode = "auto" в фазе исполнения; фаза плана, recon
+        и review — sandbox."""
+        return "auto" if auto_task(self.proj, self.profile) and self.phase != "plan" else "sandbox"
+
+    @property
     def permission_mode(self) -> str:
-        return "plan" if self.phase == "plan" else "dontAsk"
+        return "plan" if self.phase == "plan" else "auto" if self.mode == "auto" else "dontAsk"
 
     def session_name(self) -> str:
         return f"{self.project}/{self.ticket}" + ("/plan" if self.phase == "plan" else "")
@@ -383,8 +391,8 @@ class Jobs:
         if channel not in ("cli", "mcp"):
             raise JobError(f"канал выбора {channel!r} не поддерживается")
 
-        grants, gwarn = task_grants(project, proj, profile, push, forge, reason,
-                                    (inherit or {}).get("grants"))
+        grants, gwarn = auto_grants(proj, profile, *task_grants(project, proj, profile, push, forge, reason,
+                                                                (inherit or {}).get("grants")))
         mode = self._billing(billing, inherit, channel, reason)
         lim = effective_limits(proj, mode)
         explicit = channel == "cli"  # флаги терминала — ручной выбор оператора (ТЗ WSH-4.6, п. 2.6.1)
@@ -406,8 +414,9 @@ class Jobs:
         prompt_name = prompt_override or header.get("prompt") or profile
         prompt, warnings, note_left = self._render(root, proj, prompt_name, header["ticket"], task_rel, note)
         gates = link_gates(proj, profile, warnings)
-        switch_helper = link_switch(profile, warnings)
-        hidden = self._hidden(dir_abs, glob, proj, warnings)
+        switch_helper = link_switch(proj, profile, warnings)
+        auto_exec = auto_task(proj, profile) and choice.plan == "no"  # без песочницы (ТЗ WSH-3.15, п. 1.2.4)
+        hidden = [] if auto_exec else self._hidden(dir_abs, glob, proj, warnings)
         mixed = self._mixed(dir_abs, warnings)
         prompt += hub_block(note_left, gates, "plan" if choice.plan != "no" else None, hidden, prompt,
                             switch=profile if switch_helper and choice.plan == "no" else None, mixed=mixed)
@@ -698,6 +707,7 @@ class Jobs:
                 # режим notify — на момент старта корня; звенья и resume берут его у корня (ТЗ WSH-3.4, В3.1)
                 "notify": self._root_notify(chain_root) or glob.notify,
                 "billing": {"mode": plan.billing},  # режим оплаты; init и rate допишет надзиратель (ТЗ WSH-4.6)
+                "mode": plan.mode,  # sandbox | auto — режим звена (ТЗ WSH-3.15, п. 1.2.6)
             }
             if plan.switch:  # from, to и done допишет надзиратель (ТЗ WSH-3.8, В2.7)
                 data["switch"] = {"spec": plan.switch}
@@ -712,7 +722,8 @@ class Jobs:
             settings = claude_cli.settings(plan.profile, plan.task_rel, glob, plan.proj, protected,
                                            self.hub.protected_data, hook_cmd, Path.home(), plan.dir,
                                            phase="plan" if plan.phase == "plan" else None, read_extra=read_extra,
-                                           grants=grants, gates=gates, key_helper=key_helper, switch=switch)
+                                           grants=grants, gates=gates, key_helper=key_helper, switch=switch,
+                                           mode=plan.mode)
             claude_cli.write_job_files(jdir, settings, plan.prompt)
             # помощнику — задача и хаб (не секреты); агент ssh — только в каталог задачи, Code туда не видит (А3)
             env = {**env, "WSHUB_JOB": jid, "WSHUB_CONFIG": str(self.hub.registry.path),
@@ -1130,13 +1141,15 @@ class Jobs:
             raise JobError(f"ходы задачи исчерпаны: из {d.get('max_turns_total')} не осталось")
         prompt, warnings, note_left = self._render(root, proj, template, d.get("ticket") or "", d["task_rel"], note)
         gates = link_gates(proj, d["profile"], warnings)
-        switch_helper = link_switch(d["profile"], warnings)
-        hidden = self._hidden(dir_abs, glob, proj, warnings)
+        switch_helper = link_switch(proj, d["profile"], warnings)
+        auto_exec = auto_task(proj, d["profile"]) and phase != "plan"  # без песочницы (ТЗ WSH-3.15, п. 1.2.4)
+        hidden = [] if auto_exec else self._hidden(dir_abs, glob, proj, warnings)
         mixed = self._mixed(dir_abs, warnings)
         prompt += hub_block(note_left, gates, phase, hidden, prompt,
                             switch=d["profile"] if switch_helper and phase != "plan" else None, mixed=mixed)
         # разрешения — у звеньев цепочки те же (А2.2), регламент проекта перепроверяется на старте звена
-        grants, gwarn = task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants"))
+        grants, gwarn = auto_grants(proj, d["profile"],
+                                    *task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants")))
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
                     effort, turns, budget, prompt, warnings + gwarn, proj, ticket=d.get("ticket") or "",
                     size=d.get("size"), risk=d.get("risk"), choice=choice, phase=phase,
@@ -1201,6 +1214,8 @@ class Jobs:
         switch = switch_lines(links)
         if switch:  # switch: из шапки (ТЗ WSH-3.8, В2.7)
             out["switch"] = switch
+        if any(x.get("mode") == "auto" for x in links):  # звено в режиме auto (ТЗ WSH-3.15, п. 1.2.6)
+            out["mode"] = AUTO_LINE
         eol = eol_warning(out["outside_code"])
         if eol:  # есть строки, где сменились только концы строк (ТЗ WSH-3.8, Э2.3; круг 3, Р4)
             out["eol_warning"] = eol
@@ -1367,10 +1382,26 @@ def helper_env(env: dict, workdir: Path) -> dict:
     return {**env, "PATH": os.pathsep.join([home, *keep])}
 
 
+def auto_task(proj: ProjectCode, profile: str) -> bool:
+    """Задача task проекта с mode = "auto" (ТЗ WSH-3.15): её фаза исполнения идёт в режиме auto."""
+    return proj.mode == "auto" and profile == "task"
+
+
+def auto_grants(proj: ProjectCode, profile: str, grants: dict, warnings: list[str]) -> tuple[dict, list[str]]:
+    """В режиме auto помощника хаба нет (ТЗ WSH-3.15, п. 1.2.3): разрешения push и forge в задачу не пишутся, а
+    выданные регламентом или просьбой — одна строка AUTO_NO_GRANTS. Ответ — как у task_grants."""
+    if not auto_task(proj, profile):
+        return grants, warnings
+    if grants.get("push") or grants.get("forge"):
+        warnings = [*warnings, AUTO_NO_GRANTS]
+    return {"push": False, "forge": False, "reason": None}, warnings
+
+
 def link_gates(proj: ProjectCode, profile: str, warnings: list[str]) -> tuple:
-    """Гейты задачи (ТЗ WSH-3.5, Г1–Г2): только профилю task. Хаб запущен как python -m wshub — правило
-    Bash(wshub gate *) выпустило бы из песочницы первый wshub из PATH: гейтов нет, задача стартует с предупреждением."""
-    if profile != "task" or not proj.gates:
+    """Гейты задачи (ТЗ WSH-3.5, Г1–Г2): только профилю task, в режиме auto — нет (ТЗ WSH-3.15, п. 1.2.3). Хаб
+    запущен как python -m wshub — правило Bash(wshub gate *) выпустило бы из песочницы первый wshub из PATH: гейтов
+    нет, задача стартует с предупреждением."""
+    if profile != "task" or not proj.gates or auto_task(proj, profile):
         return ()
     if not claude_cli.wshub_exe():
         warnings.append(GATES_PYTHON_M)
@@ -1378,11 +1409,11 @@ def link_gates(proj: ProjectCode, profile: str, warnings: list[str]) -> tuple:
     return proj.gates
 
 
-def link_switch(profile: str, warnings: list[str]) -> bool:
-    """Правила помощника `wshub switch` (ТЗ WSH-3.8, В4): профилям task и review. Хаб запущен как python -m wshub —
-    правило выпустило бы из песочницы первый wshub из PATH: правил нет, задача стартует с предупреждением (ключ
-    switch: в шапке работает и так — его выполняет надзиратель)."""
-    if profile not in SWITCH_PROFILES:
+def link_switch(proj: ProjectCode, profile: str, warnings: list[str]) -> bool:
+    """Правила помощника `wshub switch` (ТЗ WSH-3.8, В4): профилям task и review; задаче task в режиме auto — нет
+    (ТЗ WSH-3.15, п. 1.2.3). Хаб запущен как python -m wshub — правило выпустило бы из песочницы первый wshub из PATH:
+    правил нет, задача стартует с предупреждением (ключ switch: в шапке работает и так — его выполняет надзиратель)."""
+    if profile not in SWITCH_PROFILES or auto_task(proj, profile):
         return False
     if not claude_cli.wshub_exe():
         warnings.append(SWITCH_PYTHON_M)

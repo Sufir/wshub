@@ -43,6 +43,7 @@ HELPER_FORGE = "wshub forge *"
 HELPER_GATE = "wshub gate *"  # гейты проекта (ТЗ WSH-3.5, Г2): профиль task, фаза исполнения
 HELPER_SWITCH = "wshub switch *"  # смена ветки вне песочницы (ТЗ WSH-3.8, В4): профили task и review, исполнение
 BASH_MAX_TIMEOUT_MS = 600000  # потолок таймаута Bash у claude по умолчанию (документация, env-vars)
+AUTO_BASH_MAX_TIMEOUT_MS = 3600000  # режим auto (ТЗ WSH-3.15): долгие прогоны проекта не уходят в фон
 ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ", "DOCKER_HOST", "DOCKER_CONFIG")
 # исполняемая часть git: Code её не меняет — иначе git хаба (вне песочницы) запустит его программу
 GIT_PROTECTED = (".git/config", ".git/hooks", ".git/info", ".git/modules")
@@ -107,7 +108,7 @@ def deny_paths(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home:
 def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
              data_dirs: list[Path], hook_cmd: list[str], home: Path, cwd: Path, phase: str | None = None,
              read_extra: list[str] = (), grants: dict | None = None, gates: tuple = (),
-             key_helper: str | None = None, switch: bool = False) -> dict:
+             key_helper: str | None = None, switch: bool = False, mode: str = "sandbox") -> dict:
     """settings.json задачи. cwd — dir (рабочий каталог Code), task_rel — путь к ТЗ от него; protected — все
     служебные каталоги wshub (deny для файловых инструментов), data_dirs — реестр и состояние (их ищет хук).
     phase="plan" — фаза плана (ТЗ WSH-3, решение 5): отличие от эталона профиля — ровно plan_overrides.
@@ -115,9 +116,13 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     grants — разрешения задачи {push, forge} (ТЗ WSH-3.4, А3.5): помощник в allow и excludedCommands — только с ними.
     gates — гейты, доступные звену (ТЗ WSH-3.5, Г2): wshub gate в allow и excludedCommands и потолок таймаута Bash.
     key_helper — команда apiKeyHelper задачи на ключе (ТЗ WSH-4.6, п. 2.3): сама команда, ключа в settings.json нет.
-    switch — wshub switch в allow и excludedCommands профилям task и review в фазе исполнения (ТЗ WSH-3.8, В4)."""
+    switch — wshub switch в allow и excludedCommands профилям task и review в фазе исполнения (ТЗ WSH-3.8, В4).
+    mode="auto" — у профиля task в фазе исполнения settings режима auto (auto_settings, ТЗ WSH-3.15); фаза плана
+    и читающие профили — как в sandbox."""
     if RULE_UNSAFE.search(task_rel):
         raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
+    if mode == "auto" and profile == "task" and phase is None:
+        return auto_settings(glob, proj, protected, home, cwd, key_helper)
     allow = ["Read(./**)", *_read_extra_rules(read_extra), f"Edit(./{task_rel})",
              *(f"Bash({c})" for c in (*READ_BASH, *FILTER_BASH))]
     if profile == "task":
@@ -133,10 +138,7 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     deny = [*(f"Bash({c})" for c in DENY_BASH), "Read(**/.env*)", "WebFetch", "WebSearch",
             *(f"Edit({m})" for m in proj.deny_edit),
             *(f"Edit(./{g}{'' if g.endswith('config') else '/**'})" for g in GIT_PROTECTED),
-            *(f"Edit(./{s})" for s in CLAUDE_SETTINGS)]
-    for p in deny_paths(glob, proj, protected, home, cwd):
-        r = _abs_rule(p)
-        deny += [f"Read({r})", f"Edit({r})", f"Read({r}/**)", f"Edit({r}/**)"]
+            *(f"Edit(./{s})" for s in CLAUDE_SETTINGS), *_deny_path_rules(glob, proj, protected, home, cwd)]
     data: dict = {
         "permissions": {"allow": list(dict.fromkeys(allow)), "deny": list(dict.fromkeys(deny))},
         "sandbox": {
@@ -183,6 +185,31 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     return data
 
 
+def _deny_path_rules(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home: Path, cwd: Path) -> list[str]:
+    """Read и Edit закрыты для deny_read и служебных каталогов wshub — сам путь и всё под ним."""
+    out = []
+    for p in deny_paths(glob, proj, protected, home, cwd):
+        r = _abs_rule(p)
+        out += [f"Read({r})", f"Edit({r})", f"Read({r}/**)", f"Edit({r}/**)"]
+    return out
+
+
+def auto_settings(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home: Path, cwd: Path,
+                  key_helper: str | None = None) -> dict:
+    """settings.json задачи task в режиме auto, фаза исполнения (ТЗ WSH-3.15, п. 1.2.2): без песочницы и хука, allow
+    пуст — решает классификатор auto; deny — только git push, служебные каталоги wshub и deny_read, настройки claude
+    рабочего каталога (страж оплаты WSH-4.1), .env, WebFetch и WebSearch."""
+    deny = ["Bash(git push)", "Bash(git push *)", *_deny_path_rules(glob, proj, protected, home, cwd),
+            *(f"Edit(./{s})" for s in CLAUDE_SETTINGS), "Read(**/.env*)", "WebFetch", "WebSearch"]
+    data: dict = {"permissions": {"allow": [], "deny": list(dict.fromkeys(deny))},
+                  "env": {"BASH_MAX_TIMEOUT_MS": str(AUTO_BASH_MAX_TIMEOUT_MS)}}
+    if proj.claude_md_excludes:
+        data["claudeMdExcludes"] = list(proj.claude_md_excludes)
+    if key_helper:
+        data["apiKeyHelper"] = key_helper
+    return data
+
+
 def plan_overrides(data: dict, read_extra: list[str] = ()) -> None:
     """Фаза плана (PoC WSH-3, 0.3.2 и решение 5): в --permission-mode plan классификатор auto mode
     пропускал любые Bash-команды мимо allow профиля. Выключаем его; allow — чтение (с read_extra) и git на
@@ -211,13 +238,14 @@ def _read_extra_rules(read_extra: list[str]) -> list[str]:
     return [f"Read({_abs_rule(p)})" for p in read_extra]
 
 
-PERMISSION_MODES = ("dontAsk", "plan")
+PERMISSION_MODES = ("dontAsk", "plan", "auto")
 
 
 def argv(claude: str, prompt: str, *, job_dir: Path, model: str, effort: str, max_turns: int | None,
          budget_usd: float | None, flags: dict, session_id: str | None = None, resume: str | None = None,
          permission_mode: str = "dontAsk", name: str | None = None) -> list[str]:
-    """name — имя сессии (--name, PoC WSH-3 0.3.4); permission_mode plan — только для фазы плана.
+    """name — имя сессии (--name, PoC WSH-3 0.3.4); permission_mode plan — только для фазы плана, auto — задача task
+    проекта в режиме auto (ТЗ WSH-3.15).
     max_turns и budget_usd равны None — флаг не передаётся: у claude умолчания нет, лимита нет (WSH-4.7)."""
     if (session_id is None) == (resume is None):
         raise CliError("нужен ровно один из session_id и resume")

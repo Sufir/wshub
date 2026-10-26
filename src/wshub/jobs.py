@@ -1161,8 +1161,8 @@ class Jobs:
                     switch=(d.get("switch") or {}).get("spec"), switch_helper=switch_helper, eol_mixed=mixed)
 
     def approve(self, jid: str, note=None, *, auto: bool = False) -> dict:
-        """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk, модель исполнения,
-        остаток бюджета. auto=True — переход сам, из надзирателя фазы плана (plan = auto)."""
+        """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk (режим проекта auto — auto),
+        модель исполнения, остаток бюджета. auto=True — переход сам, из надзирателя фазы плана (plan = auto)."""
         d = self._plan_ready(jid, auto=auto)
         plan = self._link_plan(d, "execute", note)
         return self.start(plan, parent=d["id"], resume=d["session_id"], chain_root=d.get("chain_root") or d["id"],

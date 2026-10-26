@@ -240,6 +240,94 @@ def test_auto_grants_requested(code):
     assert q.grants == {"push": False, "forge": False, "reason": None} and jobs_mod.AUTO_NO_GRANTS not in q.warnings
 
 
+def _token(tmp_path) -> str:
+    p = tmp_path / "secrets" / "forge.token"
+    p.parent.mkdir(parents=True)
+    p.write_text("tok\n")
+    p.chmod(0o600)
+    return str(p)
+
+
+@pytest.mark.parametrize("push", ['"no"', '"always"'])
+def test_auto_forge_not_granted(code, tmp_path, hub_wshub, push):
+    """API хостинга (always) в auto не выдаётся — ни в grants, ни помощником; с пушем — та же одна строка."""
+    code.write(mode='"auto"', push=push, forge='"github"', forge_access='"always"', forge_token=f'"{_token(tmp_path)}"')
+    p = code.jobs.plan("proj", code.taskfile())
+    assert p.grants == {"push": False, "forge": False, "reason": None}
+    assert p.warnings.count(jobs_mod.AUTO_NO_GRANTS) == 1
+    d = code.jobs.start(p)
+    _argv, settings, env = _job_files(code, d["id"])
+    assert d["grants"] == {"push": False, "forge": False, "reason": None} and "Bash(wshub" not in json.dumps(settings)
+    assert str(hub_wshub.parent) not in env["PATH"].split(":")
+    wait_terminal(code.jobs, d["id"])
+    code.write(push=push, forge='"github"', forge_access='"always"', forge_token=f'"{_token(tmp_path / "s")}"')
+    assert code.jobs.plan("proj", code.taskfile()).grants["forge"] is True  # контроль: в sandbox выдаётся
+
+
+def test_auto_resume(code, hub_wshub):
+    """code_resume задачи task в auto — снова auto: argv, settings без песочницы, mode в job.json."""
+    _project_files(code)
+    _write(code, mode='"auto"')
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    wait_terminal(code.jobs, jid)
+    child = code.jobs.resume(jid, "cont", note="продолжи")
+    argv, settings, env = _job_files(code, child["id"])
+    assert _opt(argv, "--permission-mode") == "auto" and _opt(argv, "--resume")
+    assert "sandbox" not in settings and "hooks" not in settings and settings["permissions"]["allow"] == []
+    assert str(hub_wshub.parent) not in env["PATH"].split(":")
+    assert child["mode"] == "auto" and child["sandbox_hidden"] == []
+    assert child["grants"] == {"push": False, "forge": False, "reason": None}
+    assert jobs_mod.AUTO_NO_GRANTS in child["warnings"]
+    prompt = (code.jobs.job_dir(child["id"]) / "prompt.txt").read_text()
+    assert "wshub switch" not in prompt and "Гейты" not in prompt and "Песочница" not in prompt
+    wait_terminal(code.jobs, child["id"])
+
+
+def test_auto_header_switch(code):
+    """switch: шапки в auto — как раньше: ветку ставит надзиратель до claude."""
+    import subprocess
+    code.write(mode='"auto"')
+    main = subprocess.run(["git", "-C", str(code.root), "symbolic-ref", "--short", "HEAD"], capture_output=True,
+                          text=True).stdout.strip()
+    d = code.jobs.start(code.jobs.plan("proj", code.taskfile(extra=f"switch: -c WSH-X {main}\n")))
+    assert d["mode"] == "auto" and d["switch"] == {"spec": f"-c WSH-X {main}"}
+    wait_terminal(code.jobs, d["id"])
+    assert code.jobs.read(d["id"])["switch"]["done"] is True
+    assert subprocess.run(["git", "-C", str(code.root), "symbolic-ref", "--short", "HEAD"], capture_output=True,
+                          text=True).stdout.strip() == "WSH-X"
+
+
+def test_auto_billing_guard_and_one_task_per_dir(code):
+    """Страж оплаты и одна задача на каталог в auto — как раньше."""
+    import os
+
+    from wshub.runtime import proc_start
+    code.write(mode='"auto"', max_parallel="3")
+    p = code.root / ".claude" / "settings.local.json"
+    p.parent.mkdir()
+    p.write_text('{"apiKeyHelper": "/bin/echo k"}')
+    with pytest.raises(jobs_mod.JobError, match="задаёт apiKeyHelper"):
+        code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+    p.unlink()
+    jid = jobs_mod.new_id()
+    code.jobs.job_dir(jid).mkdir(parents=True)
+    code.jobs.write(jid, {"id": jid, "project": "proj", "dir": str(code.root), "profile": "task", "state": "running",
+                          "sup_pid": os.getpid(), "sup_start": proc_start(os.getpid())})
+    with pytest.raises(jobs_mod.JobError, match="одна живая задача на каталог"):
+        code.jobs.start(code.jobs.plan("proj", code.taskfile()))
+
+
+def test_auto_python_m_no_helper_warnings(code, monkeypatch):
+    """Хаб запущен как python -m wshub: в auto гейтов и switch нет вовсе — и предупреждений о них тоже."""
+    monkeypatch.setattr(claude_cli, "wshub_exe", lambda: None)
+    code.write(mode='"auto"', gates='{ check = "scripts/check.sh" }')
+    w = code.jobs.plan("proj", code.taskfile()).warnings
+    assert jobs_mod.GATES_PYTHON_M not in w and jobs_mod.SWITCH_PYTHON_M not in w
+    code.write(gates='{ check = "scripts/check.sh" }')  # контроль: в sandbox оба предупреждения есть
+    w = code.jobs.plan("proj", code.taskfile()).warnings
+    assert jobs_mod.GATES_PYTHON_M in w and jobs_mod.SWITCH_PYTHON_M in w
+
+
 def test_auto_plan_chain(code, hub_wshub):
     """Фаза плана auto-проекта — plan и прежний settings фазы плана (песочница, скрытые файлы), без строки «Гейты
     будут…»; исполнение после утверждения — auto."""
@@ -256,7 +344,14 @@ def test_auto_plan_chain(code, hub_wshub):
     assert settings["permissions"]["disableAutoMode"] == "disable" and settings["hooks"]
     assert code.jobs.read(root)["mode"] == "sandbox"
     _wait_state(code.jobs, root, ("plan_ready",))
-    child = code.jobs.approve(root, "учти ревью")
+    # переделка плана — снова фаза плана в песочнице, со скрытыми файлами
+    re_plan = code.jobs.replan(root, "короче")
+    argv, settings, _env = _job_files(code, re_plan["id"])
+    assert _opt(argv, "--permission-mode") == "plan" and settings["sandbox"]["enabled"] is True
+    assert re_plan["mode"] == "sandbox" and re_plan["sandbox_hidden"] == [".env.example", "secret/key.txt"]
+    assert "Песочница скрывает" in (code.jobs.job_dir(re_plan["id"]) / "prompt.txt").read_text()
+    _wait_state(code.jobs, re_plan["id"], ("plan_ready",))
+    child = code.jobs.approve(re_plan["id"], "учти ревью")
     argv, settings, env = _job_files(code, child["id"])
     assert _opt(argv, "--permission-mode") == "auto" and _opt(argv, "--resume")
     assert "sandbox" not in settings and "hooks" not in settings and settings["permissions"]["allow"] == []
@@ -289,4 +384,5 @@ def test_auto_reading_profiles_unchanged(code, profile):
 
 def test_card_html_shows_mode():
     html = (Path(code_server.__file__).parent / "code_card.html").read_text()
-    assert 'd.mode === "auto"' in html and "режим: auto" in html
+    assert 'if (d.mode === "auto") g.append(el("span", "tag", "режим: auto"));' in html
+    assert 'g.hidden = !tags.length && d.mode !== "auto";' in html  # без разрешений тег не прячется

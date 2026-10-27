@@ -217,7 +217,7 @@ def test_block_overflow_drops_split_first():
                                   mixed=["docs/mixed.txt"], sandbox=sandbox)
 
     base = len(block(None, False).encode("utf-8"))
-    note_line = len("- Замечание оператора: \n".encode("utf-8"))
+    note_line = len("- Замечание оператора: \n".encode())
     note = "н" * ((jobs_mod.HUB_BLOCK_MAX - base - note_line - 20) // 2)  # 20 байт запаса до лимита
     assert len(note) > 20  # сценарий осмысленный: замечание есть
     without = block(note, False)

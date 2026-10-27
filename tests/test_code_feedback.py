@@ -138,8 +138,8 @@ def test_block_lines_texts():
     """Тексты ТЗ дословно; потолок Bash в строке forge — потолок режима auto."""
     assert PLAN == ("- Фаза плана идёт в песочнице: docker, сборки и сеть недоступны — они будут в фазе исполнения. "
                     "Не ставь BLOCKED из-за них: впиши в план, что проверишь при исполнении.")
-    assert SPLIT == ("- Отказ одной команды не значит, что Bash закрыт: составные команды (`;`, `&&`, `|` с "
-                     "неразрешённой частью) отклоняются целиком — разбей на отдельные вызовы.")
+    # текст строки 1.3.2 — решение архитектора по ревью (находка 1), дословно
+    assert SPLIT == "- Отказ составной команды (`;`, `&&`, `|`) — не закрытый Bash: разбей на отдельные вызовы."
     assert PUSH == "- Пуш — только `wshub push <remote> <ветка>` (голый `git push` запрещён)."
     assert f"с таймаутом Bash до {claude_cli.AUTO_BASH_MAX_TIMEOUT_MS} мс." in FORGE
     assert "Ждать пайплайн — в одном вызове Bash: цикл `sleep` + `wshub forge GET …`" in FORGE
@@ -191,15 +191,49 @@ def test_helper_lines_only_in_auto(code, tmp_path):
 
 
 def test_block_limit_with_new_lines():
-    """Лимит 2 КБ прежний; новые строки не сокращаются — сокращаются списки."""
+    """Лимит 2 КБ прежний; строки помощника и фазы плана не сокращаются — сокращаются списки."""
     gates = tuple(Gate(f"g{i}-" + "x" * 35, ("cmd-" + "y" * 200,), 3600) for i in range(10))
     hidden = [f"dir-{i}/" + "z" * 120 for i in range(25)]
     block = jobs_mod.hub_block("н" * 300, gates, "plan", hidden, "p\n", grants={"push": True, "forge": True},
-                               sandbox=True, auto_plan=True)
+                               auto_plan=True)
     assert len(block.encode("utf-8")) <= jobs_mod.HUB_BLOCK_MAX
-    for line in (PUSH, FORGE, PLAN, SPLIT):
+    for line in (PUSH, FORGE, PLAN):
         assert line + "\n" in block
     assert jobs_mod.hub_block(None, (), None, [], "p\n") == ""  # без строк — блока нет
+
+
+EOL_TAIL = "`git diff --ignore-cr-at-eol --stat -- <файл>` и верни концы строк, которые не правил.\n"
+REAL_GATES = (Gate("test-docker", (".venv/bin/python", "-m", "pytest", "-m", "docker"), 600),
+              Gate("check", ("scripts/check.sh",), 1500))
+
+
+def test_block_overflow_drops_split_first():
+    """Находка 1 ревью, решение архитектора: sandbox-исполнение task с гейтами, строкой wshub switch, скрытыми и
+    смешанными файлами; замечание такой длины, что без строки о составных командах блок влезает в 2 КБ, а с ней — нет.
+    Строка уходит первой: блок ровно как без неё — замечание целиком, списки не сокращены, хвост инструкции о концах
+    строк на месте."""
+    def block(note, sandbox):
+        return jobs_mod.hub_block(note, REAL_GATES, None, [".env.example"], "p\n", switch="task",
+                                  mixed=["docs/mixed.txt"], sandbox=sandbox)
+
+    base = len(block(None, False).encode("utf-8"))
+    note_line = len("- Замечание оператора: \n".encode("utf-8"))
+    note = "н" * ((jobs_mod.HUB_BLOCK_MAX - base - note_line - 20) // 2)  # 20 байт запаса до лимита
+    assert len(note) > 20  # сценарий осмысленный: замечание есть
+    without = block(note, False)
+    assert len(without.encode("utf-8")) <= jobs_mod.HUB_BLOCK_MAX < len(without.encode("utf-8")) + len(
+        (SPLIT + "\n").encode("utf-8"))  # со строкой 1.3.2 блок переполнился бы
+    got = block(note, True)
+    assert got == without and SPLIT not in got
+    assert f"- Замечание оператора: {note}\n" in got and got.endswith(EOL_TAIL) and "и ещё" not in got
+
+
+def test_block_split_kept_when_fits():
+    """Влезает — строка о составных командах на месте, ничего не сокращено."""
+    block = jobs_mod.hub_block("учти ревью", REAL_GATES[:1], None, [".env.example"], "p\n", switch="task",
+                               sandbox=True)
+    assert SPLIT + "\n" in block and "- Замечание оператора: учти ревью\n" in block
+    assert ".env.example" in block and "и ещё" not in block
 
 
 # ---------- 1.4 --out создаёт каталоги ----------

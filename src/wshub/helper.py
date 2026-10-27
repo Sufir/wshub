@@ -227,6 +227,23 @@ def _work_file(ctx: Ctx, cwd: str, val: str, what: str) -> Path:
     return Path(p)
 
 
+def _out_dirs(ctx: Ctx, out_path: Path, val: str) -> tuple[str, ...]:
+    """Родительские каталоги --out, которых нет (ТЗ WSH-3.16, 1.4): их создаст open_out. Пути — от рабочего каталога
+    задачи. .git, .claude/, точки монтирования и выход наружу _work_file уже проверил по каждому компоненту пути;
+    здесь — deny_edit проекта для каждого создаваемого каталога, как для самого файла."""
+    base = os.path.normpath(str(ctx.dir))
+    parts = os.path.relpath(out_path, base).split("/")
+    out = []
+    for i in range(1, len(parts)):
+        rel = "/".join(parts[:i])
+        if os.path.lexists(os.path.join(base, rel)):
+            continue
+        if any(fnmatch.fnmatchcase(rel, m) or fnmatch.fnmatchcase(parts[i - 1], m) for m in ctx.proj.deny_edit):
+            raise HelperError(f"--out {val}: каталог {rel} закрыт deny_edit проекта")
+        out.append(rel)
+    return tuple(out)
+
+
 def _deny_read_hit(ctx: Ctx, rel: str, real: str) -> bool:
     """Маски deny_read проекта и [code]: абсолютные и ~ — по реальному пути, относительные — от рабочего каталога.
     Сопоставление — jobs.deny_read_hit, та же функция, что считает скрытые песочницей файлы (ТЗ WSH-3.5, П2)."""
@@ -234,19 +251,29 @@ def _deny_read_hit(ctx: Ctx, rel: str, real: str) -> bool:
     return deny_read_hit(masks, rel, real)
 
 
-def open_out(top: Path, rel: str) -> int:
+def open_out(top: Path, rel: str, create=()) -> int:
     """--out без гонки с симлинком в родителе (ревью WSH-3.4, круг 1): каталоги от рабочего каталога задачи —
     по одному, O_DIRECTORY | O_NOFOLLOW относительно предыдущего; файл — O_NOFOLLOW относительно последнего.
-    Подменённый на симлинк каталог — OSError. Файл — только обычный (ТЗ WSH-3.5, круг 3, Р14): открытие с
+    Подменённый на симлинк каталог — OSError. create — проверенные пути каталогов (_out_dirs), которых не было:
+    такой каталог создаётся mkdir относительно родителя и открывается так же (ТЗ WSH-3.16, 1.4); симлинк на его месте —
+    ELOOP, а не ENOENT, и ничего не создаётся. Файл — только обычный (ТЗ WSH-3.5, круг 3, Р14): открытие с
     O_NONBLOCK (FIFO без читателя не повесит помощника), затем fstat; FIFO, устройство — OSError «не обычный файл».
     После проверки O_NONBLOCK снимается."""
     import errno
     import fcntl
     parts = rel.split("/")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
     fd = os.open(os.path.realpath(top), os.O_RDONLY | os.O_DIRECTORY)
     try:
-        for part in parts[:-1]:
-            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        for i, part in enumerate(parts[:-1], 1):
+            try:
+                nfd = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if "/".join(parts[:i]) not in create:
+                    raise
+                with contextlib.suppress(FileExistsError):  # создал кто-то другой — открываем с теми же проверками
+                    os.mkdir(part, 0o755, dir_fd=fd)
+                nfd = os.open(part, flags, dir_fd=fd)
             os.close(fd)
             fd = nfd
         try:  # тип — заранее, ради понятного отказа; от подмены после проверки защищает fstat ниже
@@ -476,6 +503,7 @@ def forge(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
             except ValueError as e:
                 raise HelperError(f"--data {data_arg}: не JSON ({e})") from None
         out_path = _work_file(ctx, cwd, out_arg, "--out") if out_arg is not None else None
+        create = _out_dirs(ctx, out_path, out_arg) if out_path is not None else ()
         token = read_token(proj.forge_token)
         base = forge_url(proj)
         req = urllib.request.Request(base + url_path, data=body, method=method,
@@ -483,7 +511,7 @@ def forge(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
                                               **({"Content-Type": "application/json"} if body is not None else {})})
         if out_path is not None:  # файл — до запроса: отказ по --out не должен прийти после выполненной записи в API
             try:
-                out_fd = open_out(ctx.dir, os.path.relpath(out_path, os.path.normpath(str(ctx.dir))))
+                out_fd = open_out(ctx.dir, os.path.relpath(out_path, os.path.normpath(str(ctx.dir))), create)
             except OSError as e:
                 raise HelperError(f"--out {out_arg}: не записан ({e.strerror})") from None
         status, payload = _send(req)
@@ -730,6 +758,7 @@ def gate(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
             have = ", ".join(x.name for x in ctx.proj.gates) or "—"
             raise HelperError(f"гейта {name} нет в реестре проекта (есть: {have})")
         out_path = _work_file(ctx, cwd, out_arg, "--out") if out_arg is not None else None
+        create = _out_dirs(ctx, out_path, out_arg) if out_path is not None else ()
         env = _gate_env(ctx)
         argv = _gate_argv(ctx, g, env)
         lock, holder, orphan = _gate_lock(ctx, name)
@@ -738,7 +767,7 @@ def gate(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
     try:
         if orphan:
             _say(f"погашен осиротевший гейт {orphan['gate']} задачи {orphan['job']}\n")
-        return _run_gate(ctx, g, argv, env, out_path, out_arg, shown, holder, orphan)
+        return _run_gate(ctx, g, argv, env, out_path, out_arg, shown, holder, orphan, create)
     finally:
         _write_holder(holder, _holder_rec(ctx, name))  # гейт кончился — группы нет
         os.close(lock)
@@ -768,7 +797,7 @@ def _job_running(ctx: Ctx) -> bool:
 
 
 def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, out_arg: str | None,
-              shown: list[str], holder: Path, orphan: dict | None) -> int:
+              shown: list[str], holder: Path, orphan: dict | None, create=()) -> int:
     jdir = ctx.jobs.job_dir(ctx.jid)
     base = {"orphan_killed": orphan} if orphan else {}
     fds: list[int] = []
@@ -776,7 +805,7 @@ def _run_gate(ctx: Ctx, g, argv: list[str], env: dict, out_path: Path | None, ou
         log_fd, log_rel = _gate_log(jdir, g.name)
         fds.append(log_fd)
         if out_path is not None:
-            fds.append(open_out(ctx.dir, os.path.relpath(out_path, os.path.normpath(str(ctx.dir)))))
+            fds.append(open_out(ctx.dir, os.path.relpath(out_path, os.path.normpath(str(ctx.dir))), create))
     except OSError as e:
         for fd in fds:
             os.close(fd)

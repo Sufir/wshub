@@ -145,6 +145,7 @@ def build_code_server(hub) -> FastMCP:
                         "gates": [{"name": g.name, "cmd": shlex.join(g.cmd), "timeout_s": g.timeout_s}
                                   for g in proj.gates],
                         "mode": proj.mode,  # sandbox | auto (ТЗ WSH-3.15)
+                        "attribution": proj.attribution,  # false — трейлер коммита скрыт (ТЗ WSH-3.16)
                         # действующая политика: строки проекта, глобальные, встроенные — от сильной к слабой
                         "policy": code_policy.effective(reg.code.glob, proj),
                         # последний снимок лимитов подписки — общий для хаба (ТЗ WSH-4.1, п. 2.7)

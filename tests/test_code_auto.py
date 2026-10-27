@@ -1,5 +1,6 @@
 """wshub-code, ТЗ WSH-3.15: режим проекта auto — задача task в фазе исполнения идёт в --permission-mode auto без
-песочницы, хука и allow; фаза плана, recon и review — как в sandbox. Настоящий claude не вызывается."""
+песочницы и хука; фаза плана, recon и review — как в sandbox. ТЗ WSH-3.16, 1.1: пуш и API хостинга в auto выдаются
+по регламенту, как в sandbox (wshub push / wshub forge в allow, PATH помощника). Настоящий claude не вызывается."""
 from __future__ import annotations
 
 import asyncio
@@ -67,15 +68,25 @@ def _project_files(code):
 
 
 def _write(code, **over):
-    """Проект с гейтом, пушем always, deny_read и ключами песочницы — всем, что auto не должен выдать."""
-    code.write(gates='{ check = "scripts/check.sh" }', push='"always"', deny_read='["secret"]',
-               bash_allow='["docker compose run --rm migrations"]', sandbox_exclude='["docker"]',
-               network='["pypi.org"]', **over)
+    """Проект с гейтом, пушем always, deny_read и ключами песочницы: гейт, switch и ключи песочницы auto не выдаёт,
+    пуш — выдаёт (ТЗ WSH-3.16, 1.1)."""
+    code.write(**{"gates": '{ check = "scripts/check.sh" }', "push": '"always"', "deny_read": '["secret"]',
+                  "bash_allow": '["docker compose run --rm migrations"]', "sandbox_exclude": '["docker"]',
+                  "network": '["pypi.org"]', **over})
 
 
 EOL_LINE = ("- Смешанные концы строк (CRLF и LF в одном файле): docs/mixed.txt. Edit приводит концы строк всего файла "
             "к одному виду — после правки такого файла сверь `git diff --stat -- <файл>` с "
             "`git diff --ignore-cr-at-eol --stat -- <файл>` и верни концы строк, которые не правил.\n")
+# строки блока по ТЗ WSH-3.16 (1.1.4, 1.3) — дословно
+PUSH_LINE = "- Пуш — только `wshub push <remote> <ветка>` (голый `git push` запрещён).\n"
+FORGE_LINE = ("- API хостинга — `wshub forge <метод> <путь>`. Ждать пайплайн — в одном вызове Bash: цикл `sleep` + "
+              "`wshub forge GET …` с таймаутом Bash до 3600000 мс.\n")
+PLAN_LINE = ("- Фаза плана идёт в песочнице: docker, сборки и сеть недоступны — они будут в фазе исполнения. Не ставь "
+             "BLOCKED из-за них: впиши в план, что проверишь при исполнении.\n")
+SPLIT_LINE = ("- Отказ одной команды не значит, что Bash закрыт: составные команды (`;`, `&&`, `|` с неразрешённой "
+              "частью) отклоняются целиком — разбей на отдельные вызовы.\n")
+ALLOW_PUSH, ALLOW_FORGE = "Bash(wshub push *)", "Bash(wshub forge *)"
 
 
 # ---------- 1.1 реестр ----------
@@ -119,14 +130,32 @@ AUTO_DENY = ["Bash(git push)", "Bash(git push *)", *PATH_RULES, "Edit(./.claude/
 
 
 def test_auto_settings_task_execute():
-    """1.2.2 целиком: нет песочницы и хука, allow пуст, deny — ровно список ТЗ, потолок Bash — час. Гейты, разрешения
-    push/forge, switch, bash_allow, sandbox_exclude, network, deny_edit — не попадают."""
+    """1.2.2 целиком: нет песочницы и хука, deny — ровно список ТЗ, потолок Bash — час. allow — только помощник по
+    выданным разрешениям (ТЗ WSH-3.16, 1.1.2); гейты, switch, bash_allow, sandbox_exclude, network, deny_edit — не
+    попадают."""
     s = _settings("task", bash_allow=("docker compose *",), sandbox_exclude=("docker",), network=("pypi.org",),
                   claude_md_excludes=("vendor/**",))
     assert {"Read(//home/u/.ssh)", "Edit(//home/u/.config/wshub/**)"} <= set(PATH_RULES)
-    assert s == {"permissions": {"allow": [], "deny": AUTO_DENY}, "env": {"BASH_MAX_TIMEOUT_MS": "3600000"},
-                 "claudeMdExcludes": ["vendor/**"], "apiKeyHelper": "KH"}
-    assert "sandbox" not in s and "hooks" not in s and "Bash(wshub" not in json.dumps(s)
+    assert s == {"permissions": {"allow": [ALLOW_PUSH, ALLOW_FORGE], "deny": AUTO_DENY},
+                 "env": {"BASH_MAX_TIMEOUT_MS": "3600000"}, "claudeMdExcludes": ["vendor/**"], "apiKeyHelper": "KH"}
+    assert "sandbox" not in s and "hooks" not in s
+    assert "wshub gate" not in json.dumps(s) and "wshub switch" not in json.dumps(s)
+
+
+@pytest.mark.parametrize("grants,allow", [
+    ({"push": True, "forge": False}, [ALLOW_PUSH]),
+    ({"push": False, "forge": True}, [ALLOW_FORGE]),
+    ({"push": False, "forge": False}, []),
+    (None, []),
+])
+def test_auto_settings_allow_only_granted(grants, allow):
+    """ТЗ WSH-3.16, 1.1.2–1.1.3: в allow — только выданное; ничего не выдано — allow пуст; deny прежний."""
+    proj = ProjectCode(enabled=True, dirs=(".",), prompts="p", deny_edit=("docker-compose*.yml",))
+    protected = [Path("/home/u/.config/wshub"), Path("/home/u/.local/state/wshub")]
+    s = claude_cli.settings("task", "org/TASK.md", CodeGlobal(), proj, protected, protected,
+                            ["/py", "-m", "wshub.hook"], Path("/home/u"), Path("/home/u/proj"), grants=grants,
+                            gates=GATES, switch=True, mode="auto")
+    assert s["permissions"] == {"allow": allow, "deny": AUTO_DENY}
 
 
 def test_auto_settings_project_deny_read():
@@ -195,29 +224,33 @@ def test_sandbox_control(code, hub_wshub):
 
 
 def test_auto_task_start(code, hub_wshub, monkeypatch, capsys):
-    """Задача task в auto: argv, settings, помощника нет, блок «От хаба» — замечание и концы строк, видимость."""
+    """Задача task в auto: argv, settings, помощник — только wshub push (push = always; ТЗ WSH-3.16, 1.1), блок
+    «От хаба» — замечание, пуш и концы строк, видимость."""
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
     _project_files(code)
     _write(code, mode='"auto"')
     p = code.jobs.plan("proj", code.taskfile(), note="проверь миграции")
     assert p.mode == "auto" and p.permission_mode == "auto" and p.phase is None
     assert p.gates == () and p.switch_helper is False and p.sandbox_hidden == []
-    assert p.grants == {"push": False, "forge": False, "reason": None}
-    assert p.warnings.count(jobs_mod.AUTO_NO_GRANTS) == 1
+    assert p.grants == {"push": True, "forge": False, "reason": None, "auto": ["push"]}
+    assert not [w for w in p.warnings if "auto" in w]  # строки «не выдаются» больше нет
     assert p.eol_mixed == ["docs/mixed.txt"]
-    assert _block(p.prompt) == NOTE + EOL_LINE  # без строк wshub switch, гейтов и скрытых файлов
+    # без строк wshub switch, гейтов, скрытых файлов и составных команд песочницы
+    assert _block(p.prompt) == NOTE + PUSH_LINE + EOL_LINE
     d = code.jobs.start(p)
     jid = d["id"]
     argv, settings, env = _job_files(code, jid)
     assert _opt(argv, "--permission-mode") == "auto" and "dontAsk" not in argv
     assert "sandbox" not in settings and "hooks" not in settings
-    assert settings["permissions"]["allow"] == [] and "Bash(wshub" not in json.dumps(settings)
+    assert settings["permissions"]["allow"] == [ALLOW_PUSH]
+    assert "wshub gate" not in json.dumps(settings) and "wshub switch" not in json.dumps(settings)
     assert settings["permissions"]["deny"][:2] == ["Bash(git push)", "Bash(git push *)"]
     assert settings["env"] == {"BASH_MAX_TIMEOUT_MS": "3600000"}
-    assert str(hub_wshub.parent) not in env["PATH"].split(":")  # helper_env не применялся
-    assert not (code.jobs.job_dir(jid) / "ssh_auth_sock").exists()
+    assert env["PATH"].split(":")[0] == str(hub_wshub.parent)  # helper_env, как в sandbox
+    assert env["WSHUB_JOB"] == jid and env["WSHUB_CONFIG"] == str(code.cfg) and env["WSHUB_STATE"] == str(code.state)
+    assert (code.jobs.job_dir(jid) / "ssh_auth_sock").read_text() == "/tmp/agent.sock"
     job = code.jobs.read(jid)
-    assert job["mode"] == "auto" and job["grants"] == {"push": False, "forge": False, "reason": None}
+    assert job["mode"] == "auto" and job["grants"] == p.grants
     assert job["sandbox_hidden"] == [] and job["eol_mixed"] == ["docs/mixed.txt"]
     wait_terminal(code.jobs, jid)
     assert code.jobs.result_view(jid)["mode"] == "режим: auto"
@@ -228,16 +261,39 @@ def test_auto_task_start(code, hub_wshub, monkeypatch, capsys):
     assert code_server.card_data(code.jobs, jid, 0)["mode"] == "auto"
 
 
-def test_auto_grants_requested(code):
-    """Пуш по просьбе при регламенте task: регламент проверяется, но в auto разрешение не пишется — предупреждение."""
+def test_auto_grants_requested(code, hub_wshub):
+    """ТЗ WSH-3.16, 1.1: пуш по просьбе при регламенте task — как в sandbox: reason обязателен, разрешение пишется,
+    allow — wshub push, PATH с хабом, deny с git push, строка пуша в блоке. Без просьбы — ничего не выдано."""
     code.write(mode='"auto"', push='"task"')
     t = code.taskfile()
     with pytest.raises(jobs_mod.JobError, match="reason"):
         code.jobs.plan("proj", t, push=True)
     p = code.jobs.plan("proj", t, push=True, reason=REASON)
-    assert p.grants == {"push": False, "forge": False, "reason": None} and jobs_mod.AUTO_NO_GRANTS in p.warnings
-    q = code.jobs.plan("proj", t)  # ничего не выдано — строки нет
-    assert q.grants == {"push": False, "forge": False, "reason": None} and jobs_mod.AUTO_NO_GRANTS not in q.warnings
+    assert p.grants == {"push": True, "forge": False, "reason": REASON} and p.mode == "auto"
+    assert PUSH_LINE in _block(p.prompt) and FORGE_LINE not in p.prompt and SPLIT_LINE not in p.prompt
+    d = code.jobs.start(p)
+    _argv, settings, env = _job_files(code, d["id"])
+    assert settings["permissions"]["allow"] == [ALLOW_PUSH]
+    assert {"Bash(git push)", "Bash(git push *)"} <= set(settings["permissions"]["deny"])
+    assert env["PATH"].split(":")[0] == str(hub_wshub.parent)
+    wait_terminal(code.jobs, d["id"])
+    q = code.jobs.plan("proj", t)  # ничего не выдано
+    assert q.grants == {"push": False, "forge": False, "reason": None} and PUSH_LINE not in q.prompt
+
+
+def test_auto_nothing_granted(code, hub_wshub, monkeypatch):
+    """ТЗ WSH-3.16, 1.1.3: регламент без пуша и API — allow пуст, PATH без хаба, ssh_auth_sock нет, строк помощника
+    в блоке нет."""
+    monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/agent.sock")
+    code.write(mode='"auto"')
+    p = code.jobs.plan("proj", code.taskfile(), note="проверь миграции")
+    assert p.grants == {"push": False, "forge": False, "reason": None} and _block(p.prompt) == NOTE
+    d = code.jobs.start(p)
+    _argv, settings, env = _job_files(code, d["id"])
+    assert settings["permissions"]["allow"] == [] and "Bash(wshub" not in json.dumps(settings)
+    assert str(hub_wshub.parent) not in env["PATH"].split(":")
+    assert not (code.jobs.job_dir(d["id"]) / "ssh_auth_sock").exists()
+    wait_terminal(code.jobs, d["id"])
 
 
 def _token(tmp_path) -> str:
@@ -248,38 +304,43 @@ def _token(tmp_path) -> str:
     return str(p)
 
 
-@pytest.mark.parametrize("push", ['"no"', '"always"'])
-def test_auto_forge_not_granted(code, tmp_path, hub_wshub, push):
-    """API хостинга (always) в auto не выдаётся — ни в grants, ни помощником; с пушем — та же одна строка."""
-    code.write(mode='"auto"', push=push, forge='"github"', forge_access='"always"', forge_token=f'"{_token(tmp_path)}"')
+@pytest.mark.parametrize("push,allow,block", [
+    ('"no"', [ALLOW_FORGE], FORGE_LINE),
+    ('"always"', [ALLOW_PUSH, ALLOW_FORGE], PUSH_LINE + FORGE_LINE),
+])
+def test_auto_forge_granted(code, tmp_path, hub_wshub, push, allow, block):
+    """ТЗ WSH-3.16, 1.1: API хостинга (always) в auto выдаётся — grants, allow, PATH с хабом, строка о wshub forge и
+    ожидании пайплайна в блоке; с пушем — обе строки. gate и switch не выдаются."""
+    code.write(mode='"auto"', push=push, forge='"github"', forge_access='"always"', forge_token=f'"{_token(tmp_path)}"',
+               gates='{ check = "scripts/check.sh" }')
     p = code.jobs.plan("proj", code.taskfile())
-    assert p.grants == {"push": False, "forge": False, "reason": None}
-    assert p.warnings.count(jobs_mod.AUTO_NO_GRANTS) == 1
+    assert p.grants["forge"] is True and p.grants["push"] is (push == '"always"')
+    assert _block(p.prompt) == block
     d = code.jobs.start(p)
     _argv, settings, env = _job_files(code, d["id"])
-    assert d["grants"] == {"push": False, "forge": False, "reason": None} and "Bash(wshub" not in json.dumps(settings)
-    assert str(hub_wshub.parent) not in env["PATH"].split(":")
+    assert d["grants"] == p.grants and settings["permissions"]["allow"] == allow
+    assert env["PATH"].split(":")[0] == str(hub_wshub.parent)
     wait_terminal(code.jobs, d["id"])
-    code.write(push=push, forge='"github"', forge_access='"always"', forge_token=f'"{_token(tmp_path / "s")}"')
-    assert code.jobs.plan("proj", code.taskfile()).grants["forge"] is True  # контроль: в sandbox выдаётся
 
 
 def test_auto_resume(code, hub_wshub):
-    """code_resume задачи task в auto — снова auto: argv, settings без песочницы, mode в job.json."""
+    """code_resume задачи task в auto — снова auto: argv, settings без песочницы, mode в job.json; пуш по просьбе
+    (push = task, reason) наследуется (ТЗ WSH-3.16, 1.1): allow, PATH с хабом, строка пуша."""
     _project_files(code)
-    _write(code, mode='"auto"')
-    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile()))["id"]
+    _write(code, mode='"auto"', push='"task"')
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile(), push=True, reason=REASON))["id"]
     wait_terminal(code.jobs, jid)
     child = code.jobs.resume(jid, "cont", note="продолжи")
     argv, settings, env = _job_files(code, child["id"])
     assert _opt(argv, "--permission-mode") == "auto" and _opt(argv, "--resume")
-    assert "sandbox" not in settings and "hooks" not in settings and settings["permissions"]["allow"] == []
-    assert str(hub_wshub.parent) not in env["PATH"].split(":")
+    assert "sandbox" not in settings and "hooks" not in settings
+    assert settings["permissions"]["allow"] == [ALLOW_PUSH]
+    assert env["PATH"].split(":")[0] == str(hub_wshub.parent)
     assert child["mode"] == "auto" and child["sandbox_hidden"] == []
-    assert child["grants"] == {"push": False, "forge": False, "reason": None}
-    assert jobs_mod.AUTO_NO_GRANTS in child["warnings"]
+    assert child["grants"] == {"push": True, "forge": False, "reason": REASON}
     prompt = (code.jobs.job_dir(child["id"]) / "prompt.txt").read_text()
     assert "wshub switch" not in prompt and "Гейты" not in prompt and "Песочница" not in prompt
+    assert PUSH_LINE in prompt and SPLIT_LINE not in prompt
     wait_terminal(code.jobs, child["id"])
 
 
@@ -330,13 +391,15 @@ def test_auto_python_m_no_helper_warnings(code, monkeypatch):
 
 def test_auto_plan_chain(code, hub_wshub):
     """Фаза плана auto-проекта — plan и прежний settings фазы плана (песочница, скрытые файлы), без строки «Гейты
-    будут…»; исполнение после утверждения — auto."""
+    будут…»; исполнение после утверждения — auto. ТЗ WSH-3.16: в блоке фазы плана — строки фазы плана auto-проекта и
+    составных команд, без строки пуша; пуш по просьбе наследует исполнение (allow, PATH, строка пуша)."""
     _project_files(code)
-    _write(code, mode='"auto"')
-    p = code.jobs.plan("proj", code.taskfile(size="L"))
+    _write(code, mode='"auto"', push='"task"')
+    p = code.jobs.plan("proj", code.taskfile(size="L"), push=True, reason=REASON)
     assert p.phase == "plan" and p.permission_mode == "plan" and p.mode == "sandbox"
     assert p.sandbox_hidden == [".env.example", "secret/key.txt"]
     assert "Гейты" not in p.prompt and "Песочница скрывает" in _block(p.prompt)
+    assert _block(p.prompt).startswith(PLAN_LINE + SPLIT_LINE) and PUSH_LINE not in p.prompt
     root = code.jobs.start(p)["id"]
     argv, settings, _env = _job_files(code, root)
     assert _opt(argv, "--permission-mode") == "plan"
@@ -349,16 +412,20 @@ def test_auto_plan_chain(code, hub_wshub):
     argv, settings, _env = _job_files(code, re_plan["id"])
     assert _opt(argv, "--permission-mode") == "plan" and settings["sandbox"]["enabled"] is True
     assert re_plan["mode"] == "sandbox" and re_plan["sandbox_hidden"] == [".env.example", "secret/key.txt"]
-    assert "Песочница скрывает" in (code.jobs.job_dir(re_plan["id"]) / "prompt.txt").read_text()
+    re_block = _block((code.jobs.job_dir(re_plan["id"]) / "prompt.txt").read_text())
+    assert "Песочница скрывает" in re_block and PLAN_LINE in re_block and SPLIT_LINE in re_block
+    assert PUSH_LINE not in re_block
     _wait_state(code.jobs, re_plan["id"], ("plan_ready",))
     child = code.jobs.approve(re_plan["id"], "учти ревью")
     argv, settings, env = _job_files(code, child["id"])
     assert _opt(argv, "--permission-mode") == "auto" and _opt(argv, "--resume")
-    assert "sandbox" not in settings and "hooks" not in settings and settings["permissions"]["allow"] == []
-    assert str(hub_wshub.parent) not in env["PATH"].split(":")
+    assert "sandbox" not in settings and "hooks" not in settings
+    assert settings["permissions"]["allow"] == [ALLOW_PUSH]
+    assert env["PATH"].split(":")[0] == str(hub_wshub.parent)
     assert child["mode"] == "auto" and child["sandbox_hidden"] == []
+    assert child["grants"] == {"push": True, "forge": False, "reason": REASON}
     prompt = (code.jobs.job_dir(child["id"]) / "prompt.txt").read_text()
-    assert _block(prompt) == "- Замечание оператора: учти ревью\n" + EOL_LINE
+    assert _block(prompt) == "- Замечание оператора: учти ревью\n" + PUSH_LINE + EOL_LINE
     wait_terminal(code.jobs, child["id"])
     assert code.jobs.result_view(root)["mode"] == "режим: auto"
     assert code_server.card_data(code.jobs, root, 0)["mode"] == "auto"

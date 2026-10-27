@@ -607,7 +607,8 @@ def test_python_m_warns_no_rules(code, monkeypatch):
 
 def test_hub_block_switch_line(code):
     task = code.jobs.plan("proj", code.taskfile()).prompt
-    assert task.endswith(jobs_mod.HUB_SWITCH["task"] + "\n")
+    # за строкой switch — строка звена в песочнице (ТЗ WSH-3.16, 1.3.2)
+    assert task.endswith(jobs_mod.HUB_SWITCH["task"] + "\n" + jobs_mod.HUB_SANDBOX_SPLIT + "\n")
     tail = (" целиком. `git switch` и `git checkout <ветка>` в задаче запрещены: в песочнице на файлах, которые она "
             "монтирует, они меняют ветку наполовину и возвращают успех; файлы восстанавливай `git checkout -- <путь>`.")
     assert jobs_mod.HUB_SWITCH["task"] == (

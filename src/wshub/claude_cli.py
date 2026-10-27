@@ -44,6 +44,9 @@ HELPER_GATE = "wshub gate *"  # гейты проекта (ТЗ WSH-3.5, Г2): �
 HELPER_SWITCH = "wshub switch *"  # смена ветки вне песочницы (ТЗ WSH-3.8, В4): профили task и review, исполнение
 BASH_MAX_TIMEOUT_MS = 600000  # потолок таймаута Bash у claude по умолчанию (документация, env-vars)
 AUTO_BASH_MAX_TIMEOUT_MS = 3600000  # режим auto (ТЗ WSH-3.15): долгие прогоны проекта не уходят в фон
+# attribution = false проекта (ТЗ WSH-3.16, 1.2): пустая строка скрывает атрибуцию коммита и PR; includeCoAuthoredBy
+# устарел и не используется. Форма — документация Claude Code, settings → attribution (сверил архитектор 27.10)
+ATTRIBUTION_OFF = {"commit": "", "pr": ""}
 ENV_PASS = ("HOME", "USER", "LOGNAME", "PATH", "LANG", "TZ", "DOCKER_HOST", "DOCKER_CONFIG")
 # исполняемая часть git: Code её не меняет — иначе git хаба (вне песочницы) запустит его программу
 GIT_PROTECTED = (".git/config", ".git/hooks", ".git/info", ".git/modules")
@@ -118,11 +121,12 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
     key_helper — команда apiKeyHelper задачи на ключе (ТЗ WSH-4.6, п. 2.3): сама команда, ключа в settings.json нет.
     switch — wshub switch в allow и excludedCommands профилям task и review в фазе исполнения (ТЗ WSH-3.8, В4).
     mode="auto" — у профиля task в фазе исполнения settings режима auto (auto_settings, ТЗ WSH-3.15); фаза плана
-    и читающие профили — как в sandbox."""
+    и читающие профили — как в sandbox. attribution = false проекта — ключ attribution во всех settings
+    (ТЗ WSH-3.16)."""
     if RULE_UNSAFE.search(task_rel):
         raise CliError(f"путь к ТЗ {task_rel!r} содержит символы шаблона (*?[]{{}}()\\) — переименуй файл")
     if mode == "auto" and profile == "task" and phase is None:
-        return auto_settings(glob, proj, protected, home, cwd, key_helper)
+        return auto_settings(glob, proj, protected, home, cwd, key_helper, grants)
     allow = ["Read(./**)", *_read_extra_rules(read_extra), f"Edit(./{task_rel})",
              *(f"Bash({c})" for c in (*READ_BASH, *FILTER_BASH))]
     if profile == "task":
@@ -182,7 +186,14 @@ def settings(profile: str, task_rel: str, glob: CodeGlobal, proj: ProjectCode, p
         plan_overrides(data, read_extra)
     elif phase is not None:
         raise CliError(f"неизвестная фаза {phase}")
+    _attribution(data, proj)
     return data
+
+
+def _attribution(data: dict, proj: ProjectCode) -> None:
+    """attribution = false проекта (ТЗ WSH-3.16, 1.2): трейлер коммита и строка PR скрыты; true — settings прежний."""
+    if not proj.attribution:
+        data["attribution"] = dict(ATTRIBUTION_OFF)
 
 
 def _deny_path_rules(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home: Path, cwd: Path) -> list[str]:
@@ -195,18 +206,21 @@ def _deny_path_rules(glob: CodeGlobal, proj: ProjectCode, protected: list[Path],
 
 
 def auto_settings(glob: CodeGlobal, proj: ProjectCode, protected: list[Path], home: Path, cwd: Path,
-                  key_helper: str | None = None) -> dict:
-    """settings.json задачи task в режиме auto, фаза исполнения (ТЗ WSH-3.15, п. 1.2.2): без песочницы и хука, allow
-    пуст — решает классификатор auto; deny — только git push, служебные каталоги wshub и deny_read, настройки claude
-    рабочего каталога (страж оплаты WSH-4.1), .env, WebFetch и WebSearch."""
+                  key_helper: str | None = None, grants: dict | None = None) -> dict:
+    """settings.json задачи task в режиме auto, фаза исполнения (ТЗ WSH-3.15, п. 1.2.2): без песочницы и хука; allow —
+    только помощник хаба по выданным разрешениям (wshub push, wshub forge — ТЗ WSH-3.16, 1.1; gate и switch не
+    выдаются), остальное решает классификатор auto; deny — только git push, служебные каталоги wshub и deny_read,
+    настройки claude рабочего каталога (страж оплаты WSH-4.1), .env, WebFetch и WebSearch."""
     deny = ["Bash(git push)", "Bash(git push *)", *_deny_path_rules(glob, proj, protected, home, cwd),
             *(f"Edit(./{s})" for s in CLAUDE_SETTINGS), "Read(**/.env*)", "WebFetch", "WebSearch"]
-    data: dict = {"permissions": {"allow": [], "deny": list(dict.fromkeys(deny))},
+    allow = [f"Bash({c})" for c in helper_commands("task", grants)]
+    data: dict = {"permissions": {"allow": allow, "deny": list(dict.fromkeys(deny))},
                   "env": {"BASH_MAX_TIMEOUT_MS": str(AUTO_BASH_MAX_TIMEOUT_MS)}}
     if proj.claude_md_excludes:
         data["claudeMdExcludes"] = list(proj.claude_md_excludes)
     if key_helper:
         data["apiKeyHelper"] = key_helper
+    _attribution(data, proj)
     return data
 
 

@@ -69,7 +69,6 @@ HUB_BLOCK_EOL = 20  # путей со смешанными концами стр
 EOL_JOB_MAX = 200  # путей eol_mixed в job.json
 EOL_SHOWN = 20  # путей eol_mixed в code_result и карточке
 GATES_PYTHON_M = "гейты недоступны: хаб запущен как python -m wshub"
-AUTO_NO_GRANTS = "режим auto: пуш и API хостинга задаче не выдаются"  # ТЗ WSH-3.15, решение архитектора по плану
 AUTO_LINE = "режим: auto"  # строка итога и карточки (ТЗ WSH-3.15, п. 1.2.6)
 # смена ветки (ТЗ WSH-3.8, часть В): ключ switch: шапки и помощник wshub switch
 SWITCH_FORMS = "<ветка> | -c <ветка> <база> | --detach <ссылка>"
@@ -85,6 +84,15 @@ HUB_SWITCH = {"task": "- Ветку меняй командой `wshub switch <�
                       "`wshub switch --detach <ссылка>`" + HUB_SWITCH_TAIL + HUB_SWITCH_RESTORE + ".",
               "review": "- Ветку меняй командой `wshub switch <ветка>` | `wshub switch --detach <ссылка>`"
                         + HUB_SWITCH_TAIL + "."}
+# строки блока по отзыву rt (ТЗ WSH-3.16, 1.1.4 и 1.3): помощник в auto, фаза плана auto-проекта, звенья в песочнице
+HUB_AUTO_PUSH = "- Пуш — только `wshub push <remote> <ветка>` (голый `git push` запрещён)."
+HUB_AUTO_FORGE = ("- API хостинга — `wshub forge <метод> <путь>`. Ждать пайплайн — в одном вызове Bash: цикл `sleep` + "
+                  f"`wshub forge GET …` с таймаутом Bash до {claude_cli.AUTO_BASH_MAX_TIMEOUT_MS} мс.")
+HUB_AUTO_PLAN = ("- Фаза плана идёт в песочнице: docker, сборки и сеть недоступны — они будут в фазе исполнения. "
+                 "Не ставь BLOCKED из-за них: впиши в план, что проверишь при исполнении.")
+# хук отклоняет команду целиком при запрещённом звене, allow Claude Code — при неразрешённой части
+HUB_SANDBOX_SPLIT = ("- Отказ одной команды не значит, что Bash закрыт: составные команды (`;`, `&&`, `|` с "
+                     "неразрешённой частью) отклоняются целиком — разбей на отдельные вызовы.")
 # гейт (ТЗ WSH-3.5, Г3): pid, pgid и proc_start идущего гейта — в каталоге звена; SIGTERM группе → пауза → SIGKILL
 GATE_PID = "gate.pid"
 GATE_KILL_AFTER = 10
@@ -391,8 +399,8 @@ class Jobs:
         if channel not in ("cli", "mcp"):
             raise JobError(f"канал выбора {channel!r} не поддерживается")
 
-        grants, gwarn = auto_grants(proj, profile, *task_grants(project, proj, profile, push, forge, reason,
-                                                                (inherit or {}).get("grants")))
+        # в auto — как в sandbox (ТЗ WSH-3.16, 1.1): регламент проекта, reason, наследование звеньями
+        grants, gwarn = task_grants(project, proj, profile, push, forge, reason, (inherit or {}).get("grants"))
         mode = self._billing(billing, inherit, channel, reason)
         lim = effective_limits(proj, mode)
         explicit = channel == "cli"  # флаги терминала — ручной выбор оператора (ТЗ WSH-4.6, п. 2.6.1)
@@ -419,7 +427,9 @@ class Jobs:
         hidden = [] if auto_exec else self._hidden(dir_abs, glob, proj, warnings)
         mixed = self._mixed(dir_abs, warnings)
         prompt += hub_block(note_left, gates, "plan" if choice.plan != "no" else None, hidden, prompt,
-                            switch=profile if switch_helper and choice.plan == "no" else None, mixed=mixed)
+                            switch=profile if switch_helper and choice.plan == "no" else None, mixed=mixed,
+                            grants=grants if auto_exec else None, sandbox=not auto_exec,
+                            auto_plan=auto_task(proj, profile) and choice.plan != "no")
         out = Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, choice.model, choice.effort,
                    max_turns, budget_usd, prompt, warnings + gwarn + limit_warn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
@@ -1145,11 +1155,13 @@ class Jobs:
         auto_exec = auto_task(proj, d["profile"]) and phase != "plan"  # без песочницы (ТЗ WSH-3.15, п. 1.2.4)
         hidden = [] if auto_exec else self._hidden(dir_abs, glob, proj, warnings)
         mixed = self._mixed(dir_abs, warnings)
+        # разрешения — у звеньев цепочки те же (А2.2), регламент проекта перепроверяется на старте звена; в auto —
+        # так же (ТЗ WSH-3.16, 1.1)
+        grants, gwarn = task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants"))
         prompt += hub_block(note_left, gates, phase, hidden, prompt,
-                            switch=d["profile"] if switch_helper and phase != "plan" else None, mixed=mixed)
-        # разрешения — у звеньев цепочки те же (А2.2), регламент проекта перепроверяется на старте звена
-        grants, gwarn = auto_grants(proj, d["profile"],
-                                    *task_grants(d["project"], proj, d["profile"], False, False, None, d.get("grants")))
+                            switch=d["profile"] if switch_helper and phase != "plan" else None, mixed=mixed,
+                            grants=grants if auto_exec else None, sandbox=not auto_exec,
+                            auto_plan=auto_task(proj, d["profile"]) and phase == "plan")
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
                     effort, turns, budget, prompt, warnings + gwarn, proj, ticket=d.get("ticket") or "",
                     size=d.get("size"), risk=d.get("risk"), choice=choice, phase=phase,
@@ -1387,16 +1399,6 @@ def auto_task(proj: ProjectCode, profile: str) -> bool:
     return proj.mode == "auto" and profile == "task"
 
 
-def auto_grants(proj: ProjectCode, profile: str, grants: dict, warnings: list[str]) -> tuple[dict, list[str]]:
-    """В режиме auto помощника хаба нет (ТЗ WSH-3.15, п. 1.2.3): разрешения push и forge в задачу не пишутся, а
-    выданные регламентом или просьбой — одна строка AUTO_NO_GRANTS. Ответ — как у task_grants."""
-    if not auto_task(proj, profile):
-        return grants, warnings
-    if grants.get("push") or grants.get("forge"):
-        warnings = [*warnings, AUTO_NO_GRANTS]
-    return {"push": False, "forge": False, "reason": None}, warnings
-
-
 def link_gates(proj: ProjectCode, profile: str, warnings: list[str]) -> tuple:
     """Гейты задачи (ТЗ WSH-3.5, Г1–Г2): только профилю task, в режиме auto — нет (ТЗ WSH-3.15, п. 1.2.3). Хаб
     запущен как python -m wshub — правило Bash(wshub gate *) выпустило бы из песочницы первый wshub из PATH: гейтов
@@ -1590,10 +1592,13 @@ def eol_mixed(workdir: Path, environ: dict) -> tuple[list[str], str | None]:
 
 
 def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[str] | None, prompt: str = "",
-              switch: str | None = None, mixed: list[str] | None = None) -> str:
+              switch: str | None = None, mixed: list[str] | None = None, grants: dict | None = None,
+              sandbox: bool = False, auto_plan: bool = False) -> str:
     """Блок «От хаба» в конце промпта (ТЗ WSH-3.5, П1): замечание оператора, если шаблон его не подставил; гейты
     (у фазы плана — какие будут в исполнении); смена ветки помощником (switch — профиль task или review, если правила
-    выданы; ТЗ WSH-3.8, В5 — строка не сокращается); скрытые песочницей файлы; файлы со смешанными концами строк
+    выданы; ТЗ WSH-3.8, В5 — строка не сокращается); помощник в auto (grants — разрешения звена в режиме auto, в
+    sandbox — None), фаза плана auto-проекта (auto_plan), звено в песочнице (sandbox) — ТЗ WSH-3.16, строки не
+    сокращаются; скрытые песочницей файлы; файлы со смешанными концами строк
     (ТЗ WSH-3.8, Э1 — сокращается вместе со скрытыми). Только непустые строки, весь блок ≤ 2 КБ: лишнее — «и ещё N».
     Ответ — текст, который дописать к промпту (prompt — чтобы начать с новой строки), или ""."""
     hidden = hidden or []
@@ -1612,6 +1617,14 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
                          f"не меньше указанного: {listed}. Полный вывод — `--out <файл>`.")
         if switch in HUB_SWITCH:
             lines.append(HUB_SWITCH[switch])
+        if (grants or {}).get("push"):
+            lines.append(HUB_AUTO_PUSH)
+        if (grants or {}).get("forge"):
+            lines.append(HUB_AUTO_FORGE)
+        if auto_plan:
+            lines.append(HUB_AUTO_PLAN)
+        if sandbox:
+            lines.append(HUB_SANDBOX_SPLIT)
         if hidden:
             shown = ", ".join(_shown_path(h) for h in hidden[:nh]) + \
                 (f" (и ещё {len(hidden) - nh})" if len(hidden) > nh else "") if nh else \

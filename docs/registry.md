@@ -77,6 +77,7 @@ prompts = ".agents/templates/code-prompts"
 profiles = ["recon", "task", "review"]
 model_max = "opus"                # потолок модели
 # mode = "auto"                   # sandbox (по умолчанию) | auto — task без песочницы, как в терминале оператора
+# attribution = false             # true (по умолчанию) | false — без трейлера Co-Authored-By и строки PR
 # на подписке по умолчанию лимитов расхода нет; задаются оператором в реестре — раскомментируй нужные
 # max_turns = 150                 # ходы задачи
 # max_budget_usd = 20             # бюджет задачи

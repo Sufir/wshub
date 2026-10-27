@@ -49,7 +49,7 @@ WS_CODE_KEYS = {"enabled", "dirs", "prompts", "profiles", "model_min", "model_ma
                 "max_budget_usd", "daily_budget_usd", "max_parallel", "max_hours", "prefetch", "status_regex",
                 "policy", "plan_budget_share", "plan_max_turns", "execute_prompt", *WS_CODE_LISTS,
                 *("push", "push_protect", "forge", "forge_access", "forge_write", "forge_url", "forge_token"),
-                "gates", "mode"}
+                "gates", "mode", "attribution"}
 # режим проекта (ТЗ WSH-3.15): sandbox — песочница, хук и закрытый allow; auto — задача task в фазе исполнения идёт
 # в --permission-mode auto без песочницы, как Code в терминале оператора
 CODE_MODES = ("sandbox", "auto")
@@ -196,6 +196,7 @@ class ProjectCode:
     forge_token: str | None = None  # путь к файлу токена, как в реестре (~ раскрывается при чтении)
     gates: tuple[Gate, ...] = ()  # гейты проекта (ТЗ WSH-3.5)
     mode: str = "sandbox"  # sandbox | auto (ТЗ WSH-3.15)
+    attribution: bool = True  # false — хаб скрывает трейлер коммита и строку PR в settings задачи (ТЗ WSH-3.16)
 
 
 @dataclass(frozen=True)
@@ -458,7 +459,7 @@ def _ws_code(name: str, t, warnings: list[str]) -> ProjectCode:
     t = _table(t, where)
     warnings += [unknown_key(f"workspace.{name}.code.{k}") for k in t if k not in WS_CODE_KEYS]
     vals: dict = {}
-    for k in ("enabled", "prefetch"):
+    for k in ("enabled", "prefetch", "attribution"):
         if k in t:
             if not isinstance(t[k], bool):
                 raise RegistryError(f"{where} {k}: true или false")

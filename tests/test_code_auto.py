@@ -323,6 +323,30 @@ def test_auto_forge_granted(code, tmp_path, hub_wshub, push, allow, block):
     wait_terminal(code.jobs, d["id"])
 
 
+def test_auto_forge_task_reason_inherited(code, tmp_path, hub_wshub):
+    """ТЗ WSH-3.16, 1.1, forge — то же, что пуш (ревью субагента, п. 5): forge_access = task — только с reason;
+    выданный API наследуют code_resume и code_approve: allow, PATH с хабом, строка о wshub forge."""
+    code.write(mode='"auto"', forge='"github"', forge_access='"task"', forge_token=f'"{_token(tmp_path)}"')
+    with pytest.raises(jobs_mod.JobError, match="reason"):
+        code.jobs.plan("proj", code.taskfile(), forge=True)
+    jid = code.jobs.start(code.jobs.plan("proj", code.taskfile(), forge=True, reason=REASON))["id"]
+    wait_terminal(code.jobs, jid)
+    child = code.jobs.resume(jid, "cont", note="продолжи")
+    _argv, settings, env = _job_files(code, child["id"])
+    assert child["grants"] == {"push": False, "forge": True, "reason": REASON}
+    assert settings["permissions"]["allow"] == [ALLOW_FORGE] and env["PATH"].split(":")[0] == str(hub_wshub.parent)
+    assert FORGE_LINE in (code.jobs.job_dir(child["id"]) / "prompt.txt").read_text()
+    wait_terminal(code.jobs, child["id"])
+    root = code.jobs.start(code.jobs.plan("proj", code.taskfile(size="L"), forge=True, reason=REASON))["id"]
+    _wait_state(code.jobs, root, ("plan_ready",))
+    exe = code.jobs.approve(root)
+    _argv, settings, env = _job_files(code, exe["id"])
+    assert exe["mode"] == "auto" and exe["grants"] == {"push": False, "forge": True, "reason": REASON}
+    assert settings["permissions"]["allow"] == [ALLOW_FORGE] and env["PATH"].split(":")[0] == str(hub_wshub.parent)
+    assert FORGE_LINE in (code.jobs.job_dir(exe["id"]) / "prompt.txt").read_text()
+    wait_terminal(code.jobs, exe["id"])
+
+
 def test_auto_resume(code, hub_wshub):
     """code_resume задачи task в auto — снова auto: argv, settings без песочницы, mode в job.json; пуш по просьбе
     (push = task, reason) наследуется (ТЗ WSH-3.16, 1.1): allow, PATH с хабом, строка пуша."""

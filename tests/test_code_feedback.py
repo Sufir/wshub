@@ -185,7 +185,9 @@ def test_helper_lines_only_in_auto(code, tmp_path):
     block = _block(code.jobs.plan("proj", code.taskfile()).prompt)
     assert block == PUSH + "\n" + FORGE + "\n"
     assert PUSH not in code.jobs.plan("proj", code.taskfile(size="L")).prompt  # фаза плана — не исполнение
-    assert PUSH not in code.jobs.plan("proj", code.taskfile(profile="recon")).prompt
+    for profile in ("recon", "review"):  # API выдан и читающим профилям, но они в песочнице (ревью субагента, п. 2)
+        p = code.jobs.plan("proj", code.taskfile(profile=profile))
+        assert p.grants["forge"] and PUSH not in p.prompt and FORGE not in p.prompt
 
 
 def test_block_limit_with_new_lines():
@@ -258,6 +260,19 @@ def test_open_out_creates_only_listed(code):
     assert (code.root / "n" / "m" / "x.log").is_file()
 
 
+def test_open_out_created_dir_swapped_for_symlink(code, tmp_path, monkeypatch):
+    """Гонка: на месте создаваемого каталога появился симлинк наружу (подменяем mkdir) — открытие с O_NOFOLLOW
+    отказывает, снаружи ничего не пишется (ревью субагента, п. 3)."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    real_symlink = os.symlink
+    monkeypatch.setattr(helper.os, "mkdir", lambda part, mode=0o777, *, dir_fd=None: real_symlink(
+        str(outside), part, dir_fd=dir_fd))
+    with pytest.raises(OSError):
+        helper.open_out(code.root, "n/x.log", ("n",))
+    assert list(outside.iterdir()) == []
+
+
 def test_gate_out_creates_dirs_and_refuses(code, capsys):
     _gates(code, ok=json.dumps(["sh", "-c", "echo full"]))
     jid = _gate_job(code)
@@ -269,3 +284,17 @@ def test_gate_out_creates_dirs_and_refuses(code, capsys):
     assert rc == 1 and "в .git" in out.err and not (code.root / ".git" / "x").exists()
     rc, out = _helper(code, "gate", ["ok", "--out", ".claude/x/y.log"], jid, capsys=capsys)
     assert rc == 1 and "защищённый путь песочницы" in out.err and not (code.root / ".claude" / "x").exists()
+
+
+def test_gate_out_dirs_deny_edit_and_symlink(code, tmp_path, capsys):
+    """У гейта — те же проверки создаваемых каталогов, что у forge: deny_edit каталога, симлинк наружу (ревью
+    субагента, п. 4)."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (code.root / "lnk").symlink_to(outside)
+    code.write(gates="{ ok = " + json.dumps(["sh", "-c", "echo full"]) + " }", deny_edit='["gen"]')
+    jid = _gate_job(code)
+    rc, out = _helper(code, "gate", ["ok", "--out", "gen/x/y.log"], jid, capsys=capsys)
+    assert rc == 1 and "каталог gen закрыт deny_edit" in out.err and not (code.root / "gen").exists()
+    rc, out = _helper(code, "gate", ["ok", "--out", "lnk/x/y.log"], jid, capsys=capsys)
+    assert rc == 1 and "только внутри рабочего каталога" in out.err and list(outside.iterdir()) == []

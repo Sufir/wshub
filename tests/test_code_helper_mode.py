@@ -20,6 +20,7 @@ from wshub import helper
 GATE_REASON = "в режиме auto гейты не выдаются: запусти проверку проекта сам обычной командой"
 SWITCH_REASON = "в режиме auto wshub switch не выдаётся: смени ветку сам — git switch"
 REASON = {"gate": GATE_REASON, "switch": SWITCH_REASON}
+ABSENT = object()  # ключа mode в job.json нет
 
 
 @pytest.fixture
@@ -35,12 +36,12 @@ def _registry(code, tmp_path, mode: str | None = '"auto"', **over) -> Path:
     return marker
 
 
-def _job(code, mode: str | None, profile="task", phase=None) -> str:
-    """Живое звено; mode None — ключа в job.json нет (звено до WSH-3.15)."""
+def _job(code, mode, profile="task", phase=None) -> str:
+    """Живое звено; mode ABSENT — ключа в job.json нет (звено до WSH-3.15), иначе значение пишется как есть."""
     jid = _gate_job(code, profile=profile, phase=phase)
     d = code.jobs.read(jid)
     d.pop("mode", None)
-    if mode is not None:
+    if mode is not ABSENT:
         d["mode"] = mode
     code.jobs.write(jid, d)
     return jid
@@ -82,6 +83,9 @@ def test_auto_switch_refused(code, tmp_path, capsys, monkeypatch, args):
     row = _external(code, jid)[-1]
     assert (row["cmd"], row["exit"], row["error"]) == ("switch", 1, SWITCH_REASON)
     assert _branch(code.root) == main and _head(code.root) == head
+    audit = [json.loads(x) for x in code.hub.audit_path.read_text().splitlines()]
+    assert any(a.get("tool") == "wshub_switch" and a.get("status") == "error" and a.get("error") == SWITCH_REASON
+               for a in audit)
     assert _out(code.root, "rev-parse", "--verify", "--quiet", "refs/heads/n1").returncode != 0
     assert calls == []  # ни одного вызова git — отказ до prepare и run
 
@@ -96,6 +100,18 @@ def test_auto_bad_args_refused_with_auto_reason(code, tmp_path, capsys, cmd, arg
     rc, out = _helper(code, cmd, args, jid, capsys=capsys)
     assert rc == 1 and out.err == f"wshub {cmd}: отказ: {REASON[cmd]}\n"
     assert _external(code, jid)[-1]["error"] == REASON[cmd]
+    _no_gate_traces(code, jid, marker)
+
+
+@pytest.mark.parametrize("cmd,args", [("gate", ["ok"]), ("switch", ["feat"])])
+def test_auto_link_in_sandbox_project_refused(code, tmp_path, capsys, cmd, args):
+    """Режим — из job.json звена: проект уже вернули в sandbox, а звено ещё в auto — отказ остаётся."""
+    marker = _registry(code, tmp_path, mode=None)
+    main = _diverged(code)
+    jid = _job(code, "auto")
+    rc, out = _helper(code, cmd, args, jid, capsys=capsys)
+    assert rc == 1 and out.err == f"wshub {cmd}: отказ: {REASON[cmd]}\n"
+    assert _branch(code.root) == main
     _no_gate_traces(code, jid, marker)
 
 
@@ -116,7 +132,7 @@ def test_auto_python_m_refused(code, tmp_path, cmd, args):
 
 # ---------- прежнее поведение ----------
 
-@pytest.mark.parametrize("mode", ["sandbox", None])
+@pytest.mark.parametrize("mode", ["sandbox", ABSENT, None, "Auto", "AUTO", "auto ", "", ["auto"], True])
 def test_not_auto_switch_and_gate_work(code, tmp_path, capsys, mode):
     marker = _registry(code, tmp_path, mode=None)
     _diverged(code)

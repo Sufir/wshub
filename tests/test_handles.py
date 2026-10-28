@@ -42,11 +42,15 @@ def test_handle_dropped_when_workspace_removed_or_moved(env, tmp_path):
         env.hub.ls(ws, ".")
 
 
-def test_handles_are_per_process(env):
+def test_handle_survives_restart(env):
+    """ТЗ WSH-3.7, В: хэндл — в handles.json каталога состояния; другой хаб (свой каталог) его не знает."""
     ws = env.open()
-    other = Hub(env.cfg, env.state)  # «перезапуск сервера»
+    other = Hub(env.cfg, env.state)  # «перезапуск сервера» или другой процесс того же хаба
+    assert "a.txt" in other.ls(ws, ".")
+    assert ws in other.handles  # восстановлен в память — виден в run-файле этого процесса
+    stranger = Hub(env.cfg, env.tmp / "state2")
     with pytest.raises(WsError, match=REOPEN):
-        other.ls(ws, ".")
+        stranger.ls(ws, ".")
 
 
 REPO = Path(wshub.__file__).resolve().parents[2]  # корень репозитория — только открыть и прочитать

@@ -496,7 +496,9 @@ class Panel:
             name = found[1]["name"] if found else self.hub.handles[mine[0]].name
             rec["ws"] = name
             rec["hid"] = hid
-            self.hub.runtime.revoke(hid)
+            err = self.hub.runtime.revoke(hid)
+            if err:  # отзыв записан, а запись в handles.json осталась (ТЗ WSH-3.7, В2.4)
+                rec["handles_file_error"] = err
             for t in mine:
                 del self.hub.handles[t]
             pid = found[0] if found else os.getpid()

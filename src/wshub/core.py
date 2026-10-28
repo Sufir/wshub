@@ -23,7 +23,7 @@ from . import housekeeping, outbox
 from .extract import EXTRACTABLE
 from .policy import Policy, glob_match
 from .registry import MODES, Limits, Outbox, RegistryError, RegistryFile, Workspace
-from .runtime import Runtime, handle_id
+from .runtime import Runtime, handle_id, handle_key
 
 HOME = Path.home()
 DEFAULT_CONFIG = HOME / ".config/wshub/workspaces.toml"
@@ -231,22 +231,39 @@ class Hub:
     def publish(self) -> None:
         self.runtime.publish(self.handles_info())
 
+    def _restore(self, token: str) -> Handle | None:
+        """Хэндл другого процесса или до перезапуска — из handles.json по sha256 токена (ТЗ WSH-3.7, В3.1). Дальше
+        его проверяет _session, как любой другой."""
+        r = self.runtime.saved_handle(handle_key(token))
+        if r is None:
+            return None
+        h = Handle(r["name"], r["mode"], Path(r["root"]), float(r["expires"]), r["hid"], float(r["opened"]))
+        self.handles[token] = h
+        return h
+
+    def _forget(self, token: str) -> None:
+        """Сбросить хэндл — в памяти и в handles.json (В2.2)."""
+        self.handles.pop(token, None)
+        self.runtime.drop_handle(handle_key(token))
+
     def _session(self, token: str) -> Session:
-        h = self.handles.get(token) if isinstance(token, str) else None
+        h = None
+        if isinstance(token, str):
+            h = self.handles.get(token) or (self._restore(token) if token else None)
         if h is None:
             raise WsError(REOPEN)
         if self.clock() >= h.expires:
-            del self.handles[token]
+            self._forget(token)
             raise WsError(REOPEN)
         if h.hid in self.runtime.revoked():
-            del self.handles[token]
+            self._forget(token)
             raise WsError(REVOKED)
         self._check_blocked(h.name, token)
         reg = self.registry.get()
         ws = reg.workspaces.get(h.name)
         # проект убрали из реестра или сменили ему путь — старый хэндл больше не действует
         if ws is None or ws.path.resolve() != h.root:
-            del self.handles[token]
+            self._forget(token)
             raise WsError(REOPEN)
         mode = "rw" if h.mode == "rw" and ws.mode == "rw" else "ro"
         return Session(ws, h.root, mode, Policy(ws.deny), reg.max_read_kb * 1024)
@@ -259,7 +276,7 @@ class Hub:
                           "пока пользователь его не исправит")
         if name in blocked:
             if token is not None:
-                self.handles.pop(token, None)
+                self._forget(token)
             raise WsError(BLOCKED)
 
     def _rel(self, s: Session, p: Path) -> str:
@@ -448,6 +465,7 @@ class Hub:
             token = secrets.token_urlsafe(18)
             h = Handle(name, mode, root, now + reg.ttl_hours * 3600, handle_id(token), now)
             self.handles[token] = h
+            saved = self._save_handle(token, h, rec, now)
             s = Session(ws, root, mode, Policy(ws.deny), reg.max_read_kb * 1024)
             until = datetime.fromtimestamp(h.expires).strftime("%Y-%m-%d %H:%M")
             write = (f"разрешена (write, edit), кроме .git; копии перед изменением — в {self.backup_dir / name}"
@@ -456,6 +474,7 @@ class Hub:
                 f"ws: {token}",
                 f"проект: {name} ({mode}), корень {root}",
                 f"хэндл действует до {until} ({reg.ttl_hours:g} ч); пути — от корня проекта",
+                *([saved] if saved else []),
                 f"запись: {write}",
                 f"deny (без учёта регистра; ls/find имена показывают, read/extract/write/edit отказывают, "
                 f"grep пропускает): {', '.join(ws.deny) or '(нет)'}",
@@ -465,6 +484,19 @@ class Hub:
                 self._brief(s),
             ]
             return "\n".join(lines)
+
+    def _save_handle(self, token: str, h: Handle, rec: dict, now: float) -> str | None:
+        """Хэндл — в handles.json (ТЗ WSH-3.7, В2). Сбой — не отказ: хэндл работает в этом процессе, ответ — строка
+        для чата, причина — в журнал вызова (В2.3). Битый файл заменён — пометка в журнал (В3.3)."""
+        try:
+            if self.runtime.save_handle(handle_key(token), {
+                    "name": h.name, "mode": h.mode, "root": str(h.root), "expires": h.expires, "hid": h.hid,
+                    "prefix": token[:4], "opened": h.opened}, now):
+                rec["handles_file"] = "был повреждён — заменён"
+        except OSError as e:
+            rec["handle_not_saved"] = str(e)[:500]
+            return f"хэндл не сохранён на диск ({e}): после перезапуска сервера открой проект заново"
+        return None
 
     def _brief(self, s: Session) -> str:
         b = s.ws.brief

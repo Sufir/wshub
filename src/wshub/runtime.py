@@ -4,6 +4,8 @@
 (без токенов: первые 4 символа и hid — хэш токена) и последний вызов. Мёртвые pid читатели пропускают.
 Отзыв хэндла — строка с hid в файле revoked; его проверяет каждый процесс на каждом вызове.
 Запрет проекта — запись в blocked.json: пока она есть, workspace_open и старые хэндлы проекта отказывают.
+Хэндлы — в handles.json под ключом sha256 токена (самого токена там нет): хэндл переживает перезапуск сервера и
+действует в любом процессе хаба (ТЗ WSH-3.7, В).
 """
 from __future__ import annotations
 
@@ -17,11 +19,24 @@ import time
 from pathlib import Path
 
 REVOKED_KEEP = 7 * 24 * 3600  # строки revoked старше — удаляются при следующем отзыве: хэндлы живут меньше
+HANDLE_STR = ("name", "mode", "root", "hid", "prefix")  # поля записи handles.json: строки
+HANDLE_NUM = ("expires", "opened")  # и числа
+
+
+def handle_key(token: str) -> str:
+    """Ключ хэндла в handles.json — полный sha256 токена: по нему токен не восстановить."""
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 def handle_id(token: str) -> str:
     """Идентификатор хэндла для панели и отзыва: по нему токен не восстановить."""
-    return hashlib.sha256(token.encode()).hexdigest()[:16]
+    return handle_key(token)[:16]
+
+
+def _handle_ok(r) -> bool:
+    """Запись handles.json со всеми полями нужного типа; иначе её нет (ТЗ WSH-3.7, В3.3)."""
+    return isinstance(r, dict) and all(isinstance(r.get(k), str) for k in HANDLE_STR) \
+        and all(isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool) for k in HANDLE_NUM)
 
 
 def repo_dir() -> Path | None:
@@ -159,6 +174,7 @@ class Runtime:
         self.run_dir = self.state_dir / "run"
         self.revoked_path = self.state_dir / "revoked"
         self.blocked_path = self.state_dir / "blocked.json"
+        self.handles_path = self.state_dir / "handles.json"
         self.clock = clock
         self.pid = pid or os.getpid()
         self.started = clock()
@@ -171,6 +187,8 @@ class Runtime:
         self._blk_stamp = None
         self._blocked: dict[str, dict] = {}
         self.blocked_broken = False
+        self._hdl_stamp = None
+        self._hdl: dict[str, dict] = {}
 
     @property
     def run_file(self) -> Path:
@@ -236,11 +254,19 @@ class Runtime:
                 continue
         return rows
 
-    def revoke(self, hid: str) -> None:
+    def revoke(self, hid: str) -> str | None:
+        """Отзыв — строка в revoked и удаление записей хэндла из handles.json (ТЗ WSH-3.7, В2.4: строки revoked
+        чистятся через REVOKED_KEEP, а срок хэндла сверху не ограничен). Ответ — причина, если запись из
+        handles.json не удалена (отзыв при этом уже записан), иначе None."""
         now = self.clock()
         rows = [r for r in self._revoked_rows() if now - r.get("ts", now) < REVOKED_KEEP and r["hid"] != hid]
         rows.append({"hid": hid, "ts": now})
         atomic_write_text(self.revoked_path, "".join(json.dumps(r) + "\n" for r in rows))
+        try:
+            self._drop_handles(lambda k, r: r["hid"] == hid)
+        except OSError as e:
+            return str(e)[:500]
+        return None
 
     # ---------- запрет проектов ----------
 
@@ -272,16 +298,20 @@ class Runtime:
         return {k: v if isinstance(v, dict) else {} for k, v in projects.items() if isinstance(k, str)}
 
     @contextlib.contextmanager
-    def _blocked_lock(self):
-        """Чтение-изменение-запись blocked.json под flock: панели в разных процессах не затирают друг друга."""
+    def _flock(self, name: str):
+        """Чтение-изменение-запись файла состояния под flock на <state>/<name>: процессы не затирают друг друга."""
         self.state_dir.mkdir(parents=True, exist_ok=True)
-        with open(self.state_dir / "blocked.lock", "a") as fh:
+        with open(self.state_dir / name, "a") as fh:
             try:
                 import fcntl
                 fcntl.flock(fh, fcntl.LOCK_EX)
             except ImportError:  # pragma: no cover — не POSIX
                 pass
             yield
+
+    def _blocked_lock(self):
+        """blocked.json — под flock: панели в разных процессах не затирают друг друга."""
+        return self._flock("blocked.lock")
 
     def _set_blocked(self, name: str, on: bool) -> bool:
         """True, если состояние изменилось."""
@@ -304,3 +334,64 @@ class Runtime:
 
     def unblock(self, name: str) -> bool:
         return self._set_blocked(name, False)
+
+    # ---------- хэндлы на диске (ТЗ WSH-3.7, В) ----------
+
+    def _handle_rows(self) -> dict[str, dict] | None:
+        """Валидные записи handles.json; None — файл есть, но не разбирается (не JSON, не объект, handles не объект).
+        Файла нет — {}."""
+        try:
+            data = json.loads(self.handles_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError):
+            return None
+        rows = data.get("handles") if isinstance(data, dict) else None
+        if not isinstance(rows, dict):
+            return None
+        return {k: v for k, v in rows.items() if isinstance(k, str) and _handle_ok(v)}
+
+    def saved_handle(self, key: str) -> dict | None:
+        """Запись хэндла по ключу (handle_key) или None; файл перечитывается, только если изменился."""
+        try:
+            st = self.handles_path.stat()
+        except OSError:
+            self._hdl_stamp, self._hdl = None, {}
+            return None
+        stamp = (st.st_mtime_ns, st.st_size, st.st_ino)
+        if stamp != self._hdl_stamp:
+            self._hdl, self._hdl_stamp = self._handle_rows() or {}, stamp
+        return self._hdl.get(key)
+
+    def _write_handles(self, rows: dict[str, dict]) -> None:
+        # mkstemp в atomic_write_text создаёт файл 0600, os.replace подменяет inode: и новый файл, и перезапись
+        # прежнего с другими правами — 0600 (В1.3)
+        atomic_write_text(self.handles_path, json.dumps({"handles": rows}, ensure_ascii=False, indent=1) + "\n")
+
+    def save_handle(self, key: str, rec: dict, now: float) -> bool:
+        """Дописать хэндл и убрать истёкшие записи (В2.1). True — прежний файл был битым и заменён целиком."""
+        with self._flock("handles.lock"):
+            rows = self._handle_rows()
+            broken = rows is None
+            rows = {k: r for k, r in (rows or {}).items() if r["expires"] > now}
+            rows[key] = rec
+            self._write_handles(rows)
+        return broken
+
+    def _drop_handles(self, match) -> None:
+        """Удалить записи, для которых match(ключ, запись); битый файл и файл без таких записей не трогаем."""
+        with self._flock("handles.lock"):
+            rows = self._handle_rows()
+            if not rows:
+                return
+            keep = {k: r for k, r in rows.items() if not match(k, r)}
+            if len(keep) != len(rows):
+                self._write_handles(keep)
+
+    def drop_handle(self, key: str) -> None:
+        """Хэндл сброшен (истёк, отозван, запрет, смена реестра) — и из файла (В2.2). Сбой — молча: файл не главный,
+        следующая запись уберёт истёкшее, а отзыв и запрет проверяются при каждом восстановлении."""
+        try:
+            self._drop_handles(lambda k, r: k == key)
+        except OSError:
+            pass

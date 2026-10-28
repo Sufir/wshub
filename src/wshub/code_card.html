@@ -329,7 +329,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && jo
 async function maybeNotify(d) {
   if (d.notify !== "card") return;
   let text = null;
-  if (d.state === "plan_ready" && d.plan_mode === "review") {
+  if (d.state === "plan_ready" && (d.plan_mode === "review" || d.plan_questions)) {
     text = "wshub-code: план задачи " + job + " готов и ждёт решения. Прочитай: code_plan(\"" + job + "\").";
   } else if (FINAL.includes(d.state)) {
     text = "wshub-code: задача " + job + " — " + d.state + (d.reason ? ", " + d.reason : "") +

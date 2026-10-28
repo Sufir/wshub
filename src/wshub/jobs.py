@@ -90,6 +90,15 @@ HUB_AUTO_FORGE = ("- API хостинга — `wshub forge <метод> <пут�
                   f"`wshub forge GET …` с таймаутом Bash до {claude_cli.AUTO_BASH_MAX_TIMEOUT_MS} мс.")
 HUB_AUTO_PLAN = ("- Фаза плана идёт в песочнице: docker, сборки и сеть недоступны — они будут в фазе исполнения. "
                  "Не ставь BLOCKED из-за них: впиши в план, что проверишь при исполнении.")
+# вопрос оператору в плане при plan = auto (ТЗ WSH-3.7, Б): признак — строка-заголовок вне блоков кода; строка блока
+# «От хаба» у фазы плана с plan = auto не сокращается (Б4.2)
+PLAN_QUESTIONS = "## Вопросы оператору"
+HUB_PLAN_QUESTIONS = ("- План утверждается без оператора (plan = auto). Нужен ответ оператора — добавь в план раздел "
+                      "`## Вопросы оператору`: тогда исполнение подождёт ответа.")
+PLAN_QUESTIONS_NOTE = ("в плане есть «Вопросы оператору» — утверди с ответом в note (≤ 300 символов; длинный ответ — "
+                       "разделом в ТЗ, в note — ссылка) или переделай план: code_replan")
+PLAN_QUESTIONS_NEXT = ("план задаёт вопросы оператору: code_plan({job}), затем code_approve({job}, note=<ответ>) или "
+                       "code_replan({job}, note)")
 # хук отклоняет команду целиком при запрещённом звене, allow Claude Code — при неразрешённой части; текст и порядок
 # сокращения (строка уходит из блока первой) — решение архитектора по ревью WSH-3.16
 HUB_SANDBOX_SPLIT = "- Отказ составной команды (`;`, `&&`, `|`) — не закрытый Bash: разбей на отдельные вызовы."
@@ -429,7 +438,8 @@ class Jobs:
         prompt += hub_block(note_left, gates, "plan" if choice.plan != "no" else None, hidden, prompt,
                             switch=profile if switch_helper and choice.plan == "no" else None, mixed=mixed,
                             grants=grants if auto_exec else None, sandbox=not auto_exec,
-                            auto_plan=auto_task(proj, profile) and choice.plan != "no")
+                            auto_plan=auto_task(proj, profile) and choice.plan != "no",
+                            plan_auto=choice.plan == "auto")
         out = Plan(project, root, dir_abs, task_abs, task_rel, profile, prompt_name, choice.model, choice.effort,
                    max_turns, budget_usd, prompt, warnings + gwarn + limit_warn, proj, ticket=header["ticket"],
                    size=header.get("size"), risk=header.get("risk"), choice=choice, plan_mode=choice.plan,
@@ -910,6 +920,12 @@ class Jobs:
                     snap.pop("reason_hint", None)
                     if active.get("reason") in REASON_HINT:
                         snap["reason_hint"] = REASON_HINT[active["reason"]]
+            else:
+                active = d
+            if active.get("phase") == "plan" and active.get("plan_questions") and not active.get("next") \
+                    and snap["state"] == "plan_ready":
+                # план ждёт ответа оператора (ТЗ WSH-3.7, Б3.5): подсказка — в next_step, next остаётся id звена
+                snap.update(plan_questions=True, next_step=PLAN_QUESTIONS_NEXT.format(job=jid))
         return snap
 
     def _link_row(self, d: dict) -> dict:
@@ -921,7 +937,7 @@ class Jobs:
     def _chain_state(self, active: dict) -> str:
         st = self.effective_state(active)
         if st == "plan_ready" and active.get("plan_mode") == "auto" and not active.get("chain_error") \
-                and _alive(active.get("sup_pid"), active.get("sup_start")):
+                and not active.get("plan_questions") and _alive(active.get("sup_pid"), active.get("sup_start")):
             return "starting"  # план готов, живой надзиратель сам запускает исполнение
         if st == "completed" and active.get("next"):
             return "starting"  # звено утверждено, следующее ещё не записано
@@ -1100,6 +1116,8 @@ class Jobs:
             return
         if rd.get("plan_mode") != "auto":
             return
+        if d.get("phase") == "plan" and d.get("plan_questions"):  # план ждёт ответа оператора (ТЗ WSH-3.7, Б3.2)
+            return
         done = next((x for x in reversed(self.chain(root)) if x.get("phase") == "plan" and x.get("reason") == "auto"
                      and x.get("next")), None)
         waiting = d.get("phase") == "plan" and self.effective_state(d) == "plan_ready" and not d.get("next") \
@@ -1161,7 +1179,8 @@ class Jobs:
         prompt += hub_block(note_left, gates, phase, hidden, prompt,
                             switch=d["profile"] if switch_helper and phase != "plan" else None, mixed=mixed,
                             grants=grants if auto_exec else None, sandbox=not auto_exec,
-                            auto_plan=auto_task(proj, d["profile"]) and phase == "plan")
+                            auto_plan=auto_task(proj, d["profile"]) and phase == "plan",
+                            plan_auto=phase == "plan" and d.get("plan_mode") == "auto")
         return Plan(d["project"], root, dir_abs, Path(d["task"]), d["task_rel"], d["profile"], template, model,
                     effort, turns, budget, prompt, warnings + gwarn, proj, ticket=d.get("ticket") or "",
                     size=d.get("size"), risk=d.get("risk"), choice=choice, phase=phase,
@@ -1176,6 +1195,8 @@ class Jobs:
         """Запуск фазы исполнения после plan_ready: --resume той же сессии, dontAsk (режим проекта auto — auto),
         модель исполнения, остаток бюджета. auto=True — переход сам, из надзирателя фазы плана (plan = auto)."""
         d = self._plan_ready(jid, auto=auto)
+        if d.get("plan_questions") and not (note or "").strip():  # ответ оператора обязателен (ТЗ WSH-3.7, Б3.3)
+            raise JobError(PLAN_QUESTIONS_NOTE)
         plan = self._link_plan(d, "execute", note)
         return self.start(plan, parent=d["id"], resume=d["session_id"], chain_root=d.get("chain_root") or d["id"],
                           link=(d["id"], "auto" if auto else "approved"))
@@ -1236,6 +1257,8 @@ class Jobs:
         if snap.get("chain"):
             out.update(phase=snap.get("phase"), active=snap.get("active"), chain=snap["chain"],
                        cost_usd=snap.get("cost_usd"))
+        if snap.get("plan_questions"):  # план ждёт ответа оператора (ТЗ WSH-3.7, Б3.5)
+            out.update(plan_questions=True, next_step=snap["next_step"])
         plan_md = next((self.job_dir(x["id"]) / "plan.md" for x in reversed(snap.get("chain") or [d])
                         if (self.job_dir(x["id"]) / "plan.md").is_file()), None)
         if plan_md:
@@ -1591,13 +1614,31 @@ def eol_mixed(workdir: Path, environ: dict) -> tuple[list[str], str | None]:
     return out, None
 
 
+def plan_questions(text: str) -> bool:
+    """В плане есть строка PLAN_QUESTIONS (после обрезки пробелов по краям) вне блоков кода (ТЗ WSH-3.7, Б1.1).
+    Блок кода — от ограды ``` или ~~~ до ограды той же литерой не короче открывающей."""
+    fence = ""
+    for line in text.splitlines():
+        s = line.strip()
+        run = s[:len(s) - len(s.lstrip(s[:1]))] if s[:1] in ("`", "~") else ""  # ведущие ` или ~ подряд
+        if not fence:
+            if len(run) >= 3:
+                fence = run
+            elif s == PLAN_QUESTIONS:
+                return True
+        elif s == run and run[0] == fence[0] and len(run) >= len(fence):  # закрывающая ограда — без хвоста
+            fence = ""
+    return False
+
+
 def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[str] | None, prompt: str = "",
               switch: str | None = None, mixed: list[str] | None = None, grants: dict | None = None,
-              sandbox: bool = False, auto_plan: bool = False) -> str:
+              sandbox: bool = False, auto_plan: bool = False, plan_auto: bool = False) -> str:
     """Блок «От хаба» в конце промпта (ТЗ WSH-3.5, П1): замечание оператора, если шаблон его не подставил; гейты
     (у фазы плана — какие будут в исполнении); смена ветки помощником (switch — профиль task или review, если правила
     выданы; ТЗ WSH-3.8, В5 — строка не сокращается); помощник в auto (grants — разрешения звена в режиме auto, в
-    sandbox — None), фаза плана auto-проекта (auto_plan) — ТЗ WSH-3.16, строки не сокращаются; звено в песочнице
+    sandbox — None), фаза плана auto-проекта (auto_plan) — ТЗ WSH-3.16, фаза плана с plan = auto (plan_auto) — подсказка
+    о разделе «Вопросы оператору», ТЗ WSH-3.7, Б4; эти строки не сокращаются; звено в песочнице
     (sandbox) — строка о составных командах, при переполнении уходит из блока первой; скрытые песочницей файлы;
     файлы со смешанными концами строк
     (ТЗ WSH-3.8, Э1 — сокращается вместе со скрытыми). Только непустые строки, весь блок ≤ 2 КБ: лишнее — «и ещё N».
@@ -1624,6 +1665,8 @@ def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[st
             lines.append(HUB_AUTO_FORGE)
         if auto_plan:
             lines.append(HUB_AUTO_PLAN)
+        if plan_auto:
+            lines.append(HUB_PLAN_QUESTIONS)
         if sandbox:
             lines.append(HUB_SANDBOX_SPLIT)
         if hidden:

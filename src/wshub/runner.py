@@ -44,6 +44,7 @@ from .jobs import (
     meta_changes,
     parse_switch,
     phase_cost,
+    plan_questions,
     start_snapshot,
     switch_commit,
     switch_prepare,
@@ -908,7 +909,11 @@ class Supervisor:
         self._journal()
         self.jobs.write(self.jid, self.d)
         if state == "plan_ready" and self.d.get("plan_mode") == "auto":
-            self._auto_execute()
+            if self.d.get("plan_questions"):  # план ждёт ответа оператора: code_approve с note или code_replan
+                self.hub._audit_code("code_approve", self.d.get("project"), self.jid, status="skipped",
+                                     params={"auto": True, "reason": "plan_questions"})
+            else:
+                self._auto_execute()
 
     def _phase_cost(self, total) -> float | None:
         """Стоимость звена (решение 6): после --resume total_cost_usd накопительный за сессию (факт PoC 0.3.3),
@@ -974,8 +979,12 @@ class Supervisor:
         if len(data) > PLAN_MAX:
             data = data[:PLAN_MAX]
             self.d.setdefault("warnings", []).append("план длиннее 200 КБ — в plan.md обрезан")
-        atomic_write_text(self.jdir / "plan.md", data.decode("utf-8", "ignore"))
+        text = data.decode("utf-8", "ignore")
+        atomic_write_text(self.jdir / "plan.md", text)
         result.update(plan_file=str(src), plan_bytes=len(data))
+        if self.d.get("plan_mode") == "auto" and plan_questions(text):
+            # вопрос оператору (ТЗ WSH-3.7, Б2): флаг пишется в job.json вместе с plan_ready — автоперехода не будет
+            self.d["plan_questions"] = True
         return "plan_ready", None
 
     def _auto_execute(self) -> None:

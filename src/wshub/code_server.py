@@ -308,7 +308,7 @@ def build_code_server(hub) -> FastMCP:
         План обязателен по политике для task M/L и S/high (size: S — один слой ≤ 3 файлов, M — несколько, L —
         контракты/схема/сервисы; risk: high — безопасность, деньги, данные, миграции). Модель исполнения не
         меняется здесь: отступление от политики — только в code_start с reason; выбор оператора — как есть.
-        code_approve при plan = auto не нужен — хаб утверждает сам."""
+        code_approve при plan = auto не нужен — хаб утверждает сам — кроме плана с разделом «Вопросы оператору»."""
         try:
             d = jobs.approve(job, note or None)
         except USER_ERR as e:
@@ -322,7 +322,7 @@ def build_code_server(hub) -> FastMCP:
     def code_replan(job: str, note: str) -> str:
         """Переделать план в plan_ready: новая фаза плана в той же сессии с замечанием note (обязательно,
         одна строка ≤ 300 символов); прежний план остаётся в истории сессии. code_replan
-        при plan = auto не нужен — хаб утверждает сам."""
+        при plan = auto не нужен — хаб утверждает сам — кроме плана с разделом «Вопросы оператору»."""
         try:
             d = jobs.replan(job, note)
         except USER_ERR as e:
@@ -482,6 +482,8 @@ def card_data(jobs: Jobs, job: str, offset: int, log: bool = False) -> dict:
            "actions": [_card_action(a, t0) for a in acts[-LOG_MAX:]], "marks": marks, "offset": new_offset}
     if any(x.get("mode") == "auto" for x in links):  # звено в режиме auto (ТЗ WSH-3.15, п. 1.2.6)
         out["mode"] = "auto"
+    if state == "plan_ready" and active.get("phase") == "plan" and active.get("plan_questions"):
+        out["plan_questions"] = True  # план ждёт ответа оператора: сообщение в чат — как у review (ТЗ WSH-3.7, Б3.6)
     costs = [phase_cost(x) for x in links]
     if (cost_shown(d) or cost_shown(active)) and any(c is not None for c in costs):
         out["cost_usd"] = _sum(costs)  # сумма — на ключе и при остановке стражем оплаты (ТЗ WSH-4.6, п. 2.6.2)

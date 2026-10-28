@@ -35,7 +35,8 @@ def handle_id(token: str) -> str:
 
 
 def _finite(v) -> bool:
-    """Число, не bool, конечное: NaN и Infinity из JSON и целое вне float — не срок (ревью субагента WSH-3.7, п. 5–6)."""
+    """Число, не bool, конечное: NaN и Infinity из JSON и целое вне float — не срок (ревью субагента WSH-3.7,
+    п. 5–6)."""
     if not isinstance(v, (int, float)) or isinstance(v, bool):
         return False
     try:

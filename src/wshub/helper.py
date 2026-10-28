@@ -8,7 +8,7 @@ Code вызывает его из Bash; помощник идёт вне пес�
 проекта в реестре его не закрыл. Токен хостинга читается из файла и не попадает ни в argv, ни в окружение,
 ни в вывод, ни в файлы. Гейт — проверка проекта из реестра: argv из реестра без оболочки, окружение — белый список
 задачи (env.json) без WSHUB_*, таймаут, полный лог. Каждый вызов — строка в <каталог задачи>/external.jsonl и в
-журнале хаба.
+журнале хаба. Звену в режиме auto (mode в job.json) gate и switch отказывают при любых аргументах (ТЗ WSH-3.17).
 """
 from __future__ import annotations
 
@@ -71,6 +71,8 @@ USAGE = {"push": "wshub push <remote> <ветка> [-o ключ=значение
          "forge": "wshub forge <GET|POST|PUT|PATCH> <путь> [--data <json-файл>] [--out <файл>]",
          "gate": "wshub gate <имя> [--out <файл>]",
          "switch": "wshub switch <ветка> | wshub switch -c <ветка> <база> | wshub switch --detach <ссылка>"}
+AUTO_REFUSE = {"gate": "в режиме auto гейты не выдаются: запусти проверку проекта сам обычной командой",
+               "switch": "в режиме auto wshub switch не выдаётся: смени ветку сам — git switch"}
 # гейт (ТЗ WSH-3.5, Г3.6): полный лог и --out — не больше GATE_LOG_MAX байт; в stdout — хвост GATE_TAIL символов.
 # Claude показывает модели около 10000 символов вывода неуспешной команды и около 30000 успешной: хвост с итогом
 # виден целиком в обоих случаях
@@ -153,10 +155,17 @@ def context(hub, environ: dict, cwd: str) -> Ctx:
     return Ctx(hub, jobs, jid, d)
 
 
+def check_mode(ctx: Ctx, kind: str) -> None:
+    """gate и switch звену в режиме auto — отказ (ТЗ WSH-3.17). Режим — из job.json звена, а не из реестра проекта;
+    ключа нет (звено до WSH-3.15) или не auto — как раньше."""
+    if ctx.d.get("mode") == "auto":
+        raise HelperError(AUTO_REFUSE[kind])
+
+
 def check(ctx: Ctx, cwd: str, kind: str) -> None:
     """Задача идёт, cwd внутри её каталога, разрешение kind (push | forge) есть и регламент его не закрыл; gate —
     профиль task в фазе исполнения (гейты проекта — из перечитанного реестра, ctx.proj); switch — профиль task или
-    review в фазе исполнения."""
+    review в фазе исполнения. В режиме auto gate и switch отклоняет check_mode, раньше check."""
     from .jobs import JobError
     state = ctx.jobs.effective_state(ctx.d)
     if state != "running":
@@ -750,6 +759,7 @@ def gate(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
     оболочки, в рабочем каталоге задачи, со своим сеансом, таймаутом, полным логом и строкой учёта."""
     shown = list(args[:3])
     try:
+        check_mode(ctx, "gate")
         name, out_arg = _parse_gate(args)
         shown = [name, *(["--out", out_arg] if out_arg is not None else [])]
         check(ctx, cwd, "gate")
@@ -894,6 +904,7 @@ def switch(ctx: Ctx, args: list[str], environ: dict, cwd: str) -> int:
     шапки (jobs.switch_prepare); stdout и stderr git — в stdout помощника как есть, код выхода — код git."""
     shown = [a[:200] for a in args[:4]]
     try:
+        check_mode(ctx, "switch")
         check(ctx, cwd, "switch")
         try:
             sw = parse_switch(args, ctx.d.get("profile"))

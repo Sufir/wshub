@@ -13,6 +13,7 @@ import atexit
 import contextlib
 import hashlib
 import json
+import math
 import os
 import tempfile
 import time
@@ -33,10 +34,20 @@ def handle_id(token: str) -> str:
     return handle_key(token)[:16]
 
 
+def _finite(v) -> bool:
+    """Число, не bool, конечное: NaN и Infinity из JSON и целое вне float — не срок (ревью субагента WSH-3.7, п. 5–6)."""
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        return False
+    try:
+        return math.isfinite(v)
+    except OverflowError:
+        return False
+
+
 def _handle_ok(r) -> bool:
     """Запись handles.json со всеми полями нужного типа; иначе её нет (ТЗ WSH-3.7, В3.3)."""
     return isinstance(r, dict) and all(isinstance(r.get(k), str) for k in HANDLE_STR) \
-        and all(isinstance(r.get(k), (int, float)) and not isinstance(r.get(k), bool) for k in HANDLE_NUM)
+        and all(_finite(r.get(k)) for k in HANDLE_NUM)
 
 
 def repo_dir() -> Path | None:
@@ -264,7 +275,7 @@ class Runtime:
         atomic_write_text(self.revoked_path, "".join(json.dumps(r) + "\n" for r in rows))
         try:
             self._drop_handles(lambda k, r: r["hid"] == hid)
-        except OSError as e:
+        except (OSError, ValueError) as e:  # ValueError — строка из файла, которая не кодируется в UTF-8
             return str(e)[:500]
         return None
 
@@ -344,7 +355,7 @@ class Runtime:
             data = json.loads(self.handles_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):  # RecursionError — слишком глубокая вложенность JSON
             return None
         rows = data.get("handles") if isinstance(data, dict) else None
         if not isinstance(rows, dict):
@@ -393,5 +404,5 @@ class Runtime:
         следующая запись уберёт истёкшее, а отзыв и запрет проверяются при каждом восстановлении."""
         try:
             self._drop_handles(lambda k, r: k == key)
-        except OSError:
+        except (OSError, ValueError):
             pass

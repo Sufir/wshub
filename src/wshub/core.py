@@ -235,9 +235,11 @@ class Hub:
         """Хэндл другого процесса или до перезапуска — из handles.json по sha256 токена (ТЗ WSH-3.7, В3.1). Дальше
         его проверяет _session, как любой другой."""
         r = self.runtime.saved_handle(handle_key(token))
-        if r is None:
+        # служебные каталоги у каждого процесса свои (пакет, venv): хэндл, который этот процесс сам бы не выдал, —
+        # не восстанавливаем (ревью субагента WSH-3.7, п. 3)
+        if r is None or self.workspace_conflict(Path(r["root"]), r["mode"]) is not None:
             return None
-        h = Handle(r["name"], r["mode"], Path(r["root"]), float(r["expires"]), r["hid"], float(r["opened"]))
+        h = Handle(r["name"], r["mode"], Path(r["root"]), float(r["expires"]), handle_id(token), float(r["opened"]))
         self.handles[token] = h
         return h
 
@@ -493,7 +495,7 @@ class Hub:
                     "name": h.name, "mode": h.mode, "root": str(h.root), "expires": h.expires, "hid": h.hid,
                     "prefix": token[:4], "opened": h.opened}, now):
                 rec["handles_file"] = "был повреждён — заменён"
-        except OSError as e:
+        except (OSError, ValueError) as e:  # ValueError — путь, который не кодируется в UTF-8
             rec["handle_not_saved"] = str(e)[:500]
             return f"хэндл не сохранён на диск ({e}): после перезапуска сервера открой проект заново"
         return None

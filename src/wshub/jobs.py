@@ -1616,19 +1616,23 @@ def eol_mixed(workdir: Path, environ: dict) -> tuple[list[str], str | None]:
 
 def plan_questions(text: str) -> bool:
     """В плане есть строка PLAN_QUESTIONS (после обрезки пробелов по краям) вне блоков кода (ТЗ WSH-3.7, Б1.1).
-    Блок кода — от ограды ``` или ~~~ до ограды той же литерой не короче открывающей."""
-    fence = ""
+    Блок кода — от ограды ``` или ~~~ до ограды той же литерой не короче открывающей; строка с ``` и ` дальше
+    (как ```код```) оградой не считается. Блок не закрыт до конца плана — заголовок в нём считается: сомнение —
+    в пользу ожидания оператора."""
+    fence, inside = "", False
     for line in text.splitlines():
         s = line.strip()
         run = s[:len(s) - len(s.lstrip(s[:1]))] if s[:1] in ("`", "~") else ""  # ведущие ` или ~ подряд
         if not fence:
-            if len(run) >= 3:
-                fence = run
+            if len(run) >= 3 and not (run[0] == "`" and "`" in s[len(run):]):
+                fence, inside = run, False
             elif s == PLAN_QUESTIONS:
                 return True
-        elif s == run and run[0] == fence[0] and len(run) >= len(fence):  # закрывающая ограда — без хвоста
+        elif run and s == run and run[0] == fence[0] and len(run) >= len(fence):  # закрывающая ограда — без хвоста
             fence = ""
-    return False
+        elif s == PLAN_QUESTIONS:
+            inside = True
+    return bool(fence) and inside
 
 
 def hub_block(note: str | None, gates: tuple, phase: str | None, hidden: list[str] | None, prompt: str = "",

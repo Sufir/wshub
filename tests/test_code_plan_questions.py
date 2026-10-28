@@ -80,6 +80,12 @@ def _asking(code, monkeypatch, plan=ASK, size="M") -> str:
     ("## Вопросы оператору:\n", False),
     ("## вопросы оператору\n", False),
     ("Текст ## Вопросы оператору\n", False),
+    # ревью субагента, п. 1–2: пустые строки в блоке, ``` с ` в хвосте, незакрытый блок
+    ("```python\nx = 1\n\n   \ny = 2\n```\n## Вопросы оператору\n", True),
+    ("```\n\n## Вопросы оператору\n\n```\n", False),
+    ("```wshub gate test``` — гейт\n## Вопросы оператору\n", True),
+    ("```bash\nls\n## Вопросы оператору\n", True),  # блок не закрыт — сомнение в пользу ожидания
+    ("```\n## Вопросы оператору\n```\n```\nls\n", False),  # незакрыт другой блок, без заголовка
 ])
 def test_marker(text, want):
     assert plan_questions(text) is want
@@ -87,9 +93,10 @@ def test_marker(text, want):
 
 # ---------- Б2. надзиратель ----------
 
-def test_auto_plan_with_questions_waits(code, monkeypatch):
+@pytest.mark.parametrize("plan", [ASK, "# План\n```py\nx = 1\n\ny = 2\n```\n" + ASK])
+def test_auto_plan_with_questions_waits(code, monkeypatch, plan):
     """Тест 1: план auto с заголовком — plan_ready, plan_questions в job.json, исполнения нет, skipped в журнале."""
-    root = _asking(code, monkeypatch)
+    root = _asking(code, monkeypatch, plan=plan)
     rec = _wait_skipped(code, root)
     assert rec["params"] == {"auto": True, "reason": "plan_questions"} and rec["ws"] == "proj"
     d = code.jobs.read(root)
@@ -112,6 +119,7 @@ def test_auto_plan_without_questions_runs(code, monkeypatch):
     "# План\n```\n## Вопросы оператору\n```\n",
     "# План\n### Вопросы оператору\n- вопрос\n",
     "# План\n## Вопросы оператору:\n- вопрос\n",
+    "# План\n```py\nx = 1\n\ny = 2\n```\n",  # пустая строка в блоке не роняет надзирателя (ревью, п. 1)
 ])
 def test_marker_lookalikes_run(code, monkeypatch, plan):
     """Тест 3: заголовок в блоке кода или не ровно строка Б1.1 — автопереход."""

@@ -40,7 +40,10 @@ def test_file_has_hash_not_token(env, monkeypatch):
     assert r == {"name": "payload", "mode": "rw", "root": str(env.proj.resolve()), "expires": r["expires"],
                  "hid": key[:16], "prefix": TOKEN[:4], "opened": r["opened"]}
     assert r["expires"] - r["opened"] == 8 * 3600
-    for path in (env.state / "handles.json", env.state / "audit.jsonl"):
+    Hub(env.cfg, env.state).ls(TOKEN, ".")  # восстановление и вызов тоже ничего с токеном не пишут
+    files = [f for f in env.state.rglob("*") if f.is_file()]
+    assert env.state / "handles.json" in files and env.state / "audit.jsonl" in files
+    for path in files:  # весь каталог состояния (ревью субагента: не только два файла)
         data = path.read_bytes()
         assert all(TOKEN[i:i + 5].encode() not in data for i in range(len(TOKEN) - 4)), path
 
@@ -153,7 +156,8 @@ def test_rw_not_above_registry(env):
 
 # ---------- битый файл, сбой записи ----------
 
-@pytest.mark.parametrize("bad", ["not json", "array", "no_root", "expires_str"])
+@pytest.mark.parametrize("bad", ["not json", "array", "no_root", "expires_str", "nan", "infinity", "huge_int",
+                                 "deep"])
 def test_broken_file(env, bad):
     """Тест 15: битый файл или запись — REOPEN без исключения; следующий workspace_open заменяет файл, хэндлы этого
     процесса работают."""
@@ -162,7 +166,13 @@ def test_broken_file(env, bad):
     good = _rows(env)[handle_key(ws)]
     text = {"not json": "{oops", "array": "[1, 2]",
             "no_root": json.dumps({"handles": {handle_key(ws): {k: v for k, v in good.items() if k != "root"}}}),
-            "expires_str": json.dumps({"handles": {handle_key(ws): {**good, "expires": "завтра"}}})}[bad]
+            "expires_str": json.dumps({"handles": {handle_key(ws): {**good, "expires": "завтра"}}}),
+            # ревью субагента, п. 4–6: NaN и Infinity из JSON, целое вне float, вложенность глубже рекурсии
+            "nan": json.dumps({"handles": {handle_key(ws): {**good, "expires": float("nan")}}}),
+            "infinity": json.dumps({"handles": {handle_key(ws): {**good, "expires": float("inf")}}}),
+            "huge_int": json.dumps({"handles": {handle_key(ws): good}}).replace(
+                json.dumps(good["expires"]), "1" + "0" * 400),
+            "deep": "[" * 100_000 + "]" * 100_000}[bad]
     f.write_text(text)
     b = Hub(env.cfg, env.state)
     with pytest.raises(WsError, match=REOPEN):
@@ -171,13 +181,15 @@ def test_broken_file(env, bad):
     assert list(_rows(env)) == [handle_key(ws2)]  # файл переписан целиком, негодная запись выброшена
     assert env.hub.ls(ws, ".") and Hub(env.cfg, env.state).ls(ws2, ".")
     rec = [x for x in _journal(env) if x["tool"] == "workspace_open"][-1]
-    assert (rec.get("handles_file") == "был повреждён — заменён") is (bad in ("not json", "array"))
+    assert (rec.get("handles_file") == "был повреждён — заменён") is (bad in ("not json", "array", "deep"))
 
 
-def test_write_failure_keeps_handle(env, monkeypatch):
-    """Тест 16: сбой записи — хэндл выдан и работает в этом процессе, строка в ответе, причина в журнале."""
+@pytest.mark.parametrize("exc", [OSError, ValueError])
+def test_write_failure_keeps_handle(env, monkeypatch, exc):
+    """Тест 16: сбой записи — хэндл выдан и работает в этом процессе, строка в ответе, причина в журнале.
+    ValueError — путь, который не кодируется в UTF-8 (ревью субагента, п. 4)."""
     def fail(path, text):
-        raise OSError("нет места на диске")
+        raise exc("нет места на диске")
 
     monkeypatch.setattr(runtime, "atomic_write_text", fail)
     out = env.hub.workspace_open("payload")
@@ -220,3 +232,56 @@ def test_concurrent_opens_all_saved(env):
         t.join()
     assert not errors
     assert set(_rows(env)) == {handle_key(w) for w in got[0] + got[1]} and len(_rows(env)) == 60
+
+
+# ---------- по ревью субагента ----------
+
+def test_restore_respects_self_protection(env, code_dir):
+    """П. 3: служебные каталоги у процессов свои — запись rw на код wshub этот процесс не восстанавливает
+    (workspace_open он бы такой не выдал); ro на тот же каталог — восстанавливает, как и выдал бы."""
+    env.workspaces["code"] = {"path": str(code_dir), "mode": "rw"}
+    env.write_registry()
+    now = env.hub.clock()
+    for tok, mode in (("RwCodeTokenAbcdefghijklm", "rw"), ("RoCodeTokenAbcdefghijklm", "ro")):
+        env.hub.runtime.save_handle(handle_key(tok), {
+            "name": "code", "mode": mode, "root": str(code_dir.resolve()), "expires": now + 3600,
+            "hid": handle_key(tok)[:16], "prefix": tok[:4], "opened": now}, now)
+    with pytest.raises(WsError, match=REOPEN):
+        env.hub.ls("RwCodeTokenAbcdefghijklm", ".")
+    assert "x.txt" in env.hub.ls("RoCodeTokenAbcdefghijklm", ".")
+
+
+def test_restored_hid_from_token(env):
+    """П. 6: hid восстановленного хэндла — из токена, не из записи: отзыв по настоящему hid действует."""
+    ws = env.open()
+    f = env.state / "handles.json"
+    rows = _rows(env)
+    rows[handle_key(ws)]["hid"] = "0" * 16
+    f.write_text(json.dumps({"handles": rows}))
+    b = Hub(env.cfg, env.state)
+    assert b.ls(ws, ".") and b.handles[ws].hid == handle_key(ws)[:16]
+    b.runtime.revoke(handle_key(ws)[:16])
+    with pytest.raises(WsError, match=REVOKED):
+        b.ls(ws, ".")
+
+
+def test_file_reread_only_when_changed(env, monkeypatch):
+    """В3.2: handles.json перечитывается, только если изменился."""
+    calls = []
+    real = Runtime._handle_rows
+
+    def counted(self):
+        calls.append(1)
+        return real(self)
+
+    env.open()
+    b = Hub(env.cfg, env.state)
+    monkeypatch.setattr(Runtime, "_handle_rows", counted)
+    for _ in range(3):
+        with pytest.raises(WsError, match=REOPEN):
+            b.ls("unknownTokenAbcdefghijkl", ".")
+    assert len(calls) == 1
+    ws = env.hub.workspace_open("rt").splitlines()[0].removeprefix("ws: ")  # запись — тоже чтение под локом
+    n = len(calls)
+    assert b.ls(ws, ".") and len(calls) == n + 1
+
